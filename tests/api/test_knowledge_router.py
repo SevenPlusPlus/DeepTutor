@@ -226,6 +226,8 @@ class _FakeKBManager:
         knowledge_base_id: str,
         *,
         description: str = "",
+        knowledge_base_type: str = "",
+        capabilities: dict[str, bool] | None = None,
     ) -> dict:
         if name in self.config.get("knowledge_bases", {}):
             raise ValueError(f"A knowledge base named '{name}' already exists.")
@@ -236,6 +238,8 @@ class _FakeKBManager:
             "server_url": server_url,
             "api_key": api_key,
             "knowledge_base_id": knowledge_base_id,
+            "remote_kb_type": knowledge_base_type,
+            "weknora_capabilities": capabilities or {},
             "status": "ready",
         }
         self.config.setdefault("knowledge_bases", {})[name] = entry
@@ -2335,6 +2339,12 @@ def _patch_weknora_probe(monkeypatch, *, ok: bool, error: str | None = None) -> 
         result.credentials_ok = ok
         result.knowledge_base_found = ok
         result.knowledge_base_name = "Research" if ok else None
+        result.knowledge_base_type = "document" if ok else None
+        result.capabilities = (
+            {"vector": False, "keyword": False, "wiki": True, "graph": False, "faq": False}
+            if ok
+            else {}
+        )
         result.error = error
         return result
 
@@ -2371,9 +2381,11 @@ def test_weknora_probe_and_connect_endpoints(monkeypatch, tmp_path: Path) -> Non
     assert connected.status_code == 200
     body = connected.json()
     assert body["rag_provider"] == "weknora"
+    assert body["capabilities"]["wiki"] is True
     entry = manager.config["knowledge_bases"]["weknora-kb"]
     assert entry["server_url"] == "http://localhost:8080"
     assert entry["knowledge_base_id"] == "kb-1"
+    assert entry["weknora_capabilities"]["wiki"] is True
 
 
 def test_weknora_connection_routes_are_admin_gated() -> None:

@@ -1117,6 +1117,8 @@ class KnowledgeBaseManager:
         knowledge_base_id: str,
         *,
         description: str = "",
+        knowledge_base_type: str = "",
+        capabilities: dict[str, bool] | None = None,
     ) -> dict:
         """Register a self-hosted WeKnora knowledge base as a pointer KB."""
         name = validate_knowledge_base_name(name)
@@ -1142,6 +1144,12 @@ class KnowledgeBaseManager:
             "server_url": server_url,
             "api_key": api_key,
             "knowledge_base_id": knowledge_base_id,
+            "remote_kb_type": (knowledge_base_type or "").strip(),
+            "weknora_capabilities": {
+                str(key): bool(value)
+                for key, value in (capabilities or {}).items()
+                if isinstance(key, str) and isinstance(value, bool)
+            },
             "description": description or f"WeKnora knowledge base: {name}",
             "status": "ready",
             "needs_reindex": False,
@@ -1356,6 +1364,8 @@ class KnowledgeBaseManager:
                 # base this KB reads; the client id and API key are credentials
                 # and are deliberately absent from this allowlist.
                 "knowledge_base_id": kb_config.get("knowledge_base_id"),
+                "remote_kb_type": kb_config.get("remote_kb_type"),
+                "weknora_capabilities": kb_config.get("weknora_capabilities"),
                 # Subagent connection fields (None for non-subagent KBs).
                 "agent_kind": kb_config.get("agent_kind"),
                 "cwd": kb_config.get("cwd"),
@@ -1514,6 +1524,10 @@ class KnowledgeBaseManager:
         # Same split for IMA: the library id is shown, the credentials are not.
         if kb_config.get("knowledge_base_id"):
             metadata["knowledge_base_id"] = kb_config.get("knowledge_base_id")
+        if kb_config.get("remote_kb_type"):
+            metadata["remote_kb_type"] = kb_config.get("remote_kb_type")
+        if isinstance(kb_config.get("weknora_capabilities"), dict):
+            metadata["weknora_capabilities"] = dict(kb_config["weknora_capabilities"])
         if kb_config.get("zim_name"):
             metadata["zim_name"] = kb_config.get("zim_name")
             metadata["zim_title"] = kb_config.get("zim_title") or ""

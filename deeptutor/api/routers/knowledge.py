@@ -2456,6 +2456,8 @@ async def connect_weknora_route(payload: ConnectWeKnoraRequest):
             result.base_url,
             payload.api_key or "",
             result.knowledge_base_id,
+            knowledge_base_type=result.knowledge_base_type or "",
+            capabilities=result.capabilities,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -2470,6 +2472,8 @@ async def connect_weknora_route(payload: ConnectWeKnoraRequest):
         "name": name,
         "server_url": entry["server_url"],
         "knowledge_base_id": entry["knowledge_base_id"],
+        "knowledge_base_type": entry.get("remote_kb_type") or None,
+        "capabilities": entry.get("weknora_capabilities") or {},
         "rag_provider": entry["rag_provider"],
     }
 

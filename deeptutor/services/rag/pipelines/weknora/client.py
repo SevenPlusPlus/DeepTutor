@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 from typing import Any, Optional
+from urllib.parse import quote
 
 import httpx
 
@@ -86,6 +87,16 @@ class WeKnoraClient:
             raise WeKnoraAPIError("WeKnora returned an unexpected knowledge-base list.")
         return data
 
+    async def get_knowledge_base(self) -> dict[str, Any]:
+        """Return the configured KB from the caller-visible inventory."""
+
+        for item in await self.list_knowledge_bases():
+            if str(item.get("id") or "") == self._config.knowledge_base_id:
+                return item
+        raise WeKnoraAPIError(
+            f"Knowledge base {self._config.knowledge_base_id} is not visible to this API key."
+        )
+
     async def search(self, query: str) -> list[dict[str, Any]]:
         data = (
             await self._request_json(
@@ -101,6 +112,39 @@ class WeKnoraClient:
         if not isinstance(data, list) or not all(isinstance(item, dict) for item in data):
             raise WeKnoraAPIError("WeKnora returned unexpected search results.")
         return data
+
+    async def search_wiki(self, query: str, *, limit: int = 5) -> list[dict[str, Any]]:
+        """Search authored/generated Wiki pages, not the source-document index."""
+
+        data = (
+            await self._request_json(
+                "POST",
+                "/api/v1/wiki-search",
+                json={
+                    "query": query,
+                    "knowledge_base_id": self._config.knowledge_base_id,
+                    "limit": limit,
+                },
+            )
+        ).get("data")
+        if not isinstance(data, list) or not all(isinstance(item, dict) for item in data):
+            raise WeKnoraAPIError("WeKnora returned unexpected Wiki search results.")
+        return data
+
+    async def get_wiki_page(self, slug: str) -> dict[str, Any]:
+        """Read one complete Wiki page returned by :meth:`search_wiki`."""
+
+        normalized = str(slug or "").strip().strip("/")
+        if not normalized:
+            raise WeKnoraAPIError("WeKnora Wiki page slug is empty.")
+        kb_id = quote(self._config.knowledge_base_id, safe="")
+        encoded_slug = "/".join(quote(part, safe="") for part in normalized.split("/"))
+        page = await self._request_json(
+            "GET", f"/api/v1/knowledgebase/{kb_id}/wiki/pages/{encoded_slug}"
+        )
+        if not str(page.get("slug") or "").strip():
+            raise WeKnoraAPIError("WeKnora returned an unexpected Wiki page.")
+        return page
 
 
 __all__ = ["MAX_RESPONSE_BYTES", "WeKnoraAPIError", "WeKnoraClient"]

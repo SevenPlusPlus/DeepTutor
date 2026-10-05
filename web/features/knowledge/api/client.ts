@@ -1118,6 +1118,14 @@ export interface WeKnoraProbe {
   credentials_ok: boolean;
   knowledge_base_found: boolean;
   knowledge_base_name: string | null;
+  knowledge_base_type: string | null;
+  capabilities: {
+    vector?: boolean;
+    keyword?: boolean;
+    wiki?: boolean;
+    graph?: boolean;
+    faq?: boolean;
+  };
   error: string | null;
 }
 
@@ -1318,6 +1326,8 @@ export async function connectWeKnora(payload: {
   name: string;
   server_url: string;
   knowledge_base_id: string;
+  knowledge_base_type: string | null;
+  capabilities: WeKnoraProbe["capabilities"];
   rag_provider: string;
 }> {
   const res = await apiFetch(apiUrl("/api/knowledge-bases/connect-weknora"), {
@@ -1339,6 +1349,8 @@ export async function connectWeKnora(payload: {
     name: string;
     server_url: string;
     knowledge_base_id: string;
+    knowledge_base_type: string | null;
+    capabilities: WeKnoraProbe["capabilities"];
     rag_provider: string;
   };
 }

@@ -188,6 +188,15 @@ export interface KnowledgeBase {
     db_path?: string;
     /** Connected Kiwix archive; article bytes remain on the configured server. */
     server_url?: string;
+    /** WeKnora's own KB classification and computed retrieval capabilities. */
+    remote_kb_type?: string;
+    weknora_capabilities?: {
+      vector?: boolean;
+      keyword?: boolean;
+      wiki?: boolean;
+      graph?: boolean;
+      faq?: boolean;
+    };
     zim_name?: string;
     zim_title?: string;
     /** Backend of a connected subagent (when type === "subagent"): "claude_code" | "codex" | "antigravity" | "kimi" | "opencode" | "mimo" | "hermes" | "openclaw" | "deepseek_harness" | "partner". */

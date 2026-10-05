@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any, Optional
 
 from .client import WeKnoraClient
-from .config import WeKnoraConfig, normalize_base_url
+from .config import WeKnoraConfig, capabilities_from_knowledge_base, normalize_base_url
 
 
 @dataclass
@@ -18,6 +18,8 @@ class WeKnoraProbe:
     credentials_ok: bool = False
     knowledge_base_found: bool = False
     knowledge_base_name: Optional[str] = None
+    knowledge_base_type: Optional[str] = None
+    capabilities: dict[str, bool] = field(default_factory=dict)
     error: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -73,6 +75,9 @@ async def probe_weknora(
     probe.knowledge_base_found = True
     name = str(matches[0].get("name") or "").strip()
     probe.knowledge_base_name = name or None
+    kb_type = str(matches[0].get("type") or "").strip()
+    probe.knowledge_base_type = kb_type or None
+    probe.capabilities = capabilities_from_knowledge_base(matches[0])
     probe.ok = True
     return probe
 

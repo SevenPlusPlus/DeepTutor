@@ -17,7 +17,10 @@ from deeptutor.services.rag.pipelines.weknora.client import (
     WeKnoraAPIError,
     WeKnoraClient,
 )
-from deeptutor.services.rag.pipelines.weknora.config import config_from_entry
+from deeptutor.services.rag.pipelines.weknora.config import (
+    capabilities_from_knowledge_base,
+    config_from_entry,
+)
 from deeptutor.services.rag.pipelines.weknora.pipeline import WeKnoraPipeline
 from deeptutor.services.rag.pipelines.weknora.probe import probe_weknora
 
@@ -72,6 +75,54 @@ def _config() -> object:
     )
 
 
+def _wiki_transport() -> httpx.MockTransport:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["X-API-Key"] == "secret"
+        if request.url.path == "/api/v1/wiki-search":
+            assert json.loads(request.content) == {
+                "query": "what is AI?",
+                "knowledge_base_id": "kb-1",
+                "limit": 5,
+            }
+            return httpx.Response(
+                200,
+                json={
+                    "success": True,
+                    "data": [
+                        {
+                            "id": "page-1",
+                            "knowledge_base_id": "kb-1",
+                            "slug": "concept/artificial-intelligence",
+                            "title": "Artificial intelligence",
+                            "page_type": "concept",
+                            "summary": "A field of computer science.",
+                            "match_snippet": "AI builds intelligent systems.",
+                        }
+                    ],
+                },
+            )
+        if request.url.path == (
+            "/api/v1/knowledgebase/kb-1/wiki/pages/concept/artificial-intelligence"
+        ):
+            return httpx.Response(
+                200,
+                json={
+                    "id": "page-1",
+                    "knowledge_base_id": "kb-1",
+                    "slug": "concept/artificial-intelligence",
+                    "title": "Artificial intelligence",
+                    "page_type": "concept",
+                    "content": "# Artificial intelligence\n\nAI builds intelligent systems.",
+                    "summary": "A field of computer science.",
+                    "source_refs": ["doc-1|AI Guide"],
+                    "chunk_refs": ["chunk-1"],
+                },
+            )
+        return httpx.Response(404, json={"success": False})
+
+    return httpx.MockTransport(handler)
+
+
 def test_config_requires_complete_binding() -> None:
     config = _config()
     assert config.base_url == "http://localhost:8080"
@@ -99,9 +150,37 @@ def test_config_requires_complete_binding() -> None:
         )
 
 
+def test_capabilities_detect_wiki_only_knowledge_base() -> None:
+    assert capabilities_from_knowledge_base(
+        {
+            "type": "document",
+            "indexing_strategy": {
+                "vector_enabled": False,
+                "keyword_enabled": False,
+                "wiki_enabled": True,
+                "graph_enabled": False,
+            },
+        }
+    ) == {
+        "vector": False,
+        "keyword": False,
+        "wiki": True,
+        "graph": False,
+        "faq": False,
+    }
+
+
 def test_client_search_uses_official_endpoint() -> None:
     result = asyncio.run(WeKnoraClient(_config(), transport=_transport()).search("what is AI?"))
     assert [item["id"] for item in result] == ["chunk-1", "chunk-2"]
+
+
+def test_client_searches_and_reads_native_wiki_pages() -> None:
+    client = WeKnoraClient(_config(), transport=_wiki_transport())
+    hits = asyncio.run(client.search_wiki("what is AI?"))
+    assert hits[0]["slug"] == "concept/artificial-intelligence"
+    page = asyncio.run(client.get_wiki_page(hits[0]["slug"]))
+    assert page["content"].startswith("# Artificial intelligence")
 
 
 def test_client_bounds_external_response_bodies() -> None:
@@ -202,6 +281,53 @@ def test_pipeline_returns_chunks_and_sources(tmp_path: Path) -> None:
     assert result["sources"][0]["knowledge_title"] == "Guide"
 
 
+def test_pipeline_uses_native_wiki_for_wiki_only_kb(tmp_path: Path) -> None:
+    base = _kb_base(
+        tmp_path,
+        {
+            "type": WEKNORA_KB_TYPE,
+            "rag_provider": "weknora",
+            "server_url": "http://localhost:8080",
+            "api_key": "secret",
+            "knowledge_base_id": "kb-1",
+            "weknora_capabilities": {
+                "vector": False,
+                "keyword": False,
+                "wiki": True,
+                "graph": False,
+                "faq": False,
+            },
+        },
+    )
+    result = asyncio.run(
+        WeKnoraPipeline(
+            base,
+            client_factory=lambda config: WeKnoraClient(config, transport=_wiki_transport()),
+        ).search("what is AI?", "remote")
+    )
+
+    assert result["provider"] == "weknora"
+    assert result["weknora_capabilities"]["wiki"] is True
+    assert "# Artificial intelligence" in result["content"]
+    assert result["sources"] == [
+        {
+            "id": "page-1",
+            "chunk_id": "wiki:page-1",
+            "title": "Artificial intelligence",
+            "content": "# Artificial intelligence\n\nAI builds intelligent systems.",
+            "source": "WeKnora Wiki / Artificial intelligence",
+            "knowledge_base_id": "kb-1",
+            "slug": "concept/artificial-intelligence",
+            "page_type": "concept",
+            "summary": "A field of computer science.",
+            "aliases": [],
+            "source_refs": ["doc-1|AI Guide"],
+            "chunk_refs": ["chunk-1"],
+            "weknora_source_type": "wiki_page",
+        }
+    ]
+
+
 def test_pipeline_reports_not_configured_and_retrieval_errors(tmp_path: Path) -> None:
     pipeline = WeKnoraPipeline(
         _kb_base(tmp_path, {"type": WEKNORA_KB_TYPE, "rag_provider": "weknora"}),
@@ -243,12 +369,20 @@ def test_factory_routes_weknora() -> None:
 
 def test_manager_pointer_hides_api_key(tmp_path: Path) -> None:
     manager = KnowledgeBaseManager(base_dir=str(tmp_path))
-    entry = manager.register_weknora_kb("Remote", "http://localhost:8080/", "secret", "kb-1")
+    entry = manager.register_weknora_kb(
+        "Remote",
+        "http://localhost:8080/",
+        "secret",
+        "kb-1",
+        knowledge_base_type="document",
+        capabilities={"wiki": True, "vector": False, "keyword": False},
+    )
     assert WEKNORA_KB_TYPE in CONNECTED_KB_TYPES
     assert entry["server_url"] == "http://localhost:8080"
     assert not (tmp_path / "Remote").exists()
 
     metadata = manager.get_metadata("Remote")
     assert metadata["knowledge_base_id"] == "kb-1"
+    assert metadata["weknora_capabilities"]["wiki"] is True
     assert "api_key" not in metadata
     assert "secret" not in str(metadata)
