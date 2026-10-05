@@ -86,9 +86,11 @@ class WeKnoraPipeline:
 
     @staticmethod
     async def _capabilities(client, saved: dict[str, bool] | None) -> dict[str, bool]:
-        if saved is not None:
-            return saved
-        return capabilities_from_knowledge_base(await client.get_knowledge_base())
+        current = capabilities_from_knowledge_base(await client.get_knowledge_base())
+        # Old WeKnora versions did not advertise feature flags.  Keep the
+        # connection-time snapshot in that case; current servers remain live
+        # with configuration changes made after the KB was connected.
+        return current or saved or {}
 
     @staticmethod
     def _top_k(kwargs: dict[str, Any]) -> int:

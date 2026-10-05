@@ -26,6 +26,7 @@ import {
   DEFAULT_CODE_BLOCK_SHOW_LINE_NUMBERS,
   DEFAULT_CODE_BLOCK_THEME,
   DEFAULT_CODE_BLOCK_WRAP_LONG_LINES,
+  DEFAULT_APP_LANGUAGE,
   LANGUAGE_EVENT,
   LANGUAGE_STORAGE_KEY,
   hasStoredLanguage,
@@ -78,8 +79,9 @@ export function AppShellProvider({ children }: { children: React.ReactNode }) {
   const [theme, setThemeState] = useState<Theme>(() => {
     return getStoredTheme() ?? getSystemTheme();
   });
-  // Always start with "en" to match SSR; hydrate from localStorage after mount
-  const [language, setLanguageState] = useState<AppLanguage>("en");
+  // Start with the product default to match SSR; hydrate after mount.
+  const [language, setLanguageState] =
+    useState<AppLanguage>(DEFAULT_APP_LANGUAGE);
   const [languageReady, setLanguageReady] = useState(false);
   const [activeSessionId, setActiveSessionIdState] = useState<string | null>(
     () => readStoredActiveSessionId(),

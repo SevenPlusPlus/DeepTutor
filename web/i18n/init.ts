@@ -4,7 +4,12 @@ import { initReactI18next } from "react-i18next";
 import enApp from "@/locales/en/app.json";
 import { normalizeLanguage, type AppLanguage } from "./languages";
 
-export { APP_LANGUAGES, isAppLanguage, normalizeLanguage } from "./languages";
+export {
+  APP_LANGUAGES,
+  DEFAULT_APP_LANGUAGE,
+  isAppLanguage,
+  normalizeLanguage,
+} from "./languages";
 export type { AppLanguage } from "./languages";
 
 let _initialized = false;

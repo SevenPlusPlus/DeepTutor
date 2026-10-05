@@ -172,8 +172,8 @@ class SidebarNavOrder(BaseModel):
 
 class UISettings(BaseModel):
     theme: Literal["light", "dark", "glass", "snow"] = "snow"
-    language: UiLanguage = "en"
-    response_language: ResponseLanguage = "en"
+    language: UiLanguage = "zh"
+    response_language: ResponseLanguage = "zh"
     sidebar_description: Optional[str] = None
     sidebar_nav_order: Optional[SidebarNavOrder] = None
     code_block_theme: Optional[str] = None

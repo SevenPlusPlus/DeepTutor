@@ -192,8 +192,8 @@ def _static_choices(
 
 
 def _interface_specs() -> list[SettingSpec]:
-    language_read = _read_ui("language", "en")
-    response_read = _read_ui("response_language", "en")
+    language_read = _read_ui("language", "zh")
+    response_read = _read_ui("response_language", "zh")
     theme_read = _read_ui("theme", "snow")
     return [
         SettingSpec(

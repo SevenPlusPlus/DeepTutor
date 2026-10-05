@@ -1857,7 +1857,7 @@ async def test_ui_endpoints_do_not_freeze_defaults_into_the_file(
     stored = json.loads(settings_file.read_text(encoding="utf-8"))
     assert stored == {"theme": "dark"}, f"only the changed field belongs on disk: {stored}"
     # The read path still reports the full picture.
-    assert settings_router.load_ui_settings()["language"] == "en"
+    assert settings_router.load_ui_settings()["language"] == "zh"
 
 
 @pytest.mark.asyncio

@@ -3,10 +3,12 @@
 import { browserStorage } from "@/shared/storage";
 import { activeWorkspaceId } from "@/lib/workspace-scope";
 import {
+  DEFAULT_APP_LANGUAGE,
   normalizeLanguage as normalizeAppLanguage,
   type AppLanguage,
 } from "@/i18n/languages";
 
+export { DEFAULT_APP_LANGUAGE } from "@/i18n/languages";
 export type { AppLanguage } from "@/i18n/languages";
 
 /** Model output can use more languages than the app UI locale supports. */
@@ -26,6 +28,8 @@ export type ResponseLanguage =
   | "pl"
   | "uk"
   | "ms";
+
+export const DEFAULT_RESPONSE_LANGUAGE: ResponseLanguage = "zh";
 
 const SUPPORTED_RESPONSE_LANGUAGE_CODES: readonly ResponseLanguage[] = [
   "en",
@@ -141,7 +145,7 @@ export function normalizeLanguage(
 
 export function resolveResponseLanguage(
   value: string | null | undefined,
-  legacyLanguage: string | null | undefined = "en",
+  legacyLanguage: string | null | undefined = DEFAULT_RESPONSE_LANGUAGE,
 ): ResponseLanguage {
   const code = value?.trim().toLowerCase();
   if ((SUPPORTED_RESPONSE_LANGUAGE_CODES as readonly string[]).includes(code ?? "")) {
@@ -155,13 +159,13 @@ export function resolveResponseLanguage(
 }
 
 export function readStoredLanguage(): AppLanguage {
-  if (typeof window === "undefined") return "en";
+  if (typeof window === "undefined") return DEFAULT_APP_LANGUAGE;
   try {
     return normalizeLanguage(
       browserStorage.readRaw("local", LANGUAGE_STORAGE_KEY),
     );
   } catch {
-    return "en";
+    return DEFAULT_APP_LANGUAGE;
   }
 }
 
@@ -215,14 +219,17 @@ export function hasStoredResponseLanguage(): boolean {
 }
 
 export function readStoredResponseLanguage(): ResponseLanguage {
-  if (typeof window === "undefined") return "en";
+  if (typeof window === "undefined") return DEFAULT_RESPONSE_LANGUAGE;
   try {
+    const legacyLanguage =
+      browserStorage.readRaw("local", LANGUAGE_STORAGE_KEY) ??
+      DEFAULT_RESPONSE_LANGUAGE;
     return resolveResponseLanguage(
       browserStorage.readRaw("local", RESPONSE_LANGUAGE_STORAGE_KEY),
-      browserStorage.readRaw("local", LANGUAGE_STORAGE_KEY),
+      legacyLanguage,
     );
   } catch {
-    return "en";
+    return DEFAULT_RESPONSE_LANGUAGE;
   }
 }
 

@@ -23,6 +23,7 @@ import React, {
 } from "react";
 import type { ClientCommand } from "@/contracts/generated/turn-protocol";
 import {
+  DEFAULT_RESPONSE_LANGUAGE,
   RESPONSE_LANGUAGE_EVENT,
   RESPONSE_LANGUAGE_STORAGE_KEY,
   isResponseLanguage,
@@ -497,7 +498,9 @@ function createSessionEntry(
     isStreaming: false,
     currentStage: "",
     language:
-      typeof window === "undefined" ? "en" : readStoredResponseLanguage(),
+      typeof window === "undefined"
+        ? DEFAULT_RESPONSE_LANGUAGE
+        : readStoredResponseLanguage(),
     replyLanguageOverride: null,
     status: "idle",
     activeTurnId: null,

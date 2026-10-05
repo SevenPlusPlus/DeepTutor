@@ -22,6 +22,10 @@ MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 class WeKnoraAPIError(RuntimeError):
     """Raised when WeKnora returns an error or unexpected payload."""
 
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
 
 class WeKnoraClient:
     def __init__(
@@ -72,7 +76,10 @@ class WeKnoraClient:
 
         if resp.status_code >= 400:
             preview = bytes(body[:300]).decode("utf-8", errors="replace")
-            raise WeKnoraAPIError(f"WeKnora returned {resp.status_code}: {preview}")
+            raise WeKnoraAPIError(
+                f"WeKnora returned {resp.status_code}: {preview}",
+                status_code=resp.status_code,
+            )
         try:
             data = json.loads(body)
         except Exception as exc:
@@ -116,8 +123,8 @@ class WeKnoraClient:
     async def search_wiki(self, query: str, *, limit: int = 5) -> list[dict[str, Any]]:
         """Search authored/generated Wiki pages, not the source-document index."""
 
-        data = (
-            await self._request_json(
+        try:
+            payload = await self._request_json(
                 "POST",
                 "/api/v1/wiki-search",
                 json={
@@ -126,7 +133,20 @@ class WeKnoraClient:
                     "limit": limit,
                 },
             )
-        ).get("data")
+            data = payload.get("data")
+        except WeKnoraAPIError as exc:
+            if exc.status_code != 404:
+                raise
+            # WeKnora v0.8.2 predates the cross-KB POST endpoint but exposes
+            # the equivalent single-KB Wiki search.  Connected pointers always
+            # target one KB, so this is lossless for DeepTutor.
+            kb_id = quote(self._config.knowledge_base_id, safe="")
+            payload = await self._request_json(
+                "GET",
+                f"/api/v1/knowledgebase/{kb_id}/wiki/search",
+                params={"q": query, "limit": limit},
+            )
+            data = payload.get("pages")
         if not isinstance(data, list) or not all(isinstance(item, dict) for item in data):
             raise WeKnoraAPIError("WeKnora returned unexpected Wiki search results.")
         return data

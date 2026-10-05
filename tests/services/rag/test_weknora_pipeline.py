@@ -170,6 +170,10 @@ def test_capabilities_detect_wiki_only_knowledge_base() -> None:
     }
 
 
+def test_capabilities_preserve_legacy_document_search_without_feature_flags() -> None:
+    assert capabilities_from_knowledge_base({"type": "document"}) == {}
+
+
 def test_client_search_uses_official_endpoint() -> None:
     result = asyncio.run(WeKnoraClient(_config(), transport=_transport()).search("what is AI?"))
     assert [item["id"] for item in result] == ["chunk-1", "chunk-2"]
@@ -181,6 +185,35 @@ def test_client_searches_and_reads_native_wiki_pages() -> None:
     assert hits[0]["slug"] == "concept/artificial-intelligence"
     page = asyncio.run(client.get_wiki_page(hits[0]["slug"]))
     assert page["content"].startswith("# Artificial intelligence")
+
+
+def test_client_falls_back_to_v082_single_kb_wiki_search() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["X-API-Key"] == "secret"
+        if request.url.path == "/api/v1/wiki-search":
+            return httpx.Response(404, text="404 page not found")
+        if request.url.path == "/api/v1/knowledgebase/kb-1/wiki/search":
+            assert request.url.params["q"] == "what is AI?"
+            assert request.url.params["limit"] == "5"
+            return httpx.Response(
+                200,
+                json={
+                    "pages": [
+                        {
+                            "id": "page-1",
+                            "knowledge_base_id": "kb-1",
+                            "slug": "concept/artificial-intelligence",
+                            "title": "Artificial intelligence",
+                            "content": "# Artificial intelligence",
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(404, text="unexpected route")
+
+    client = WeKnoraClient(_config(), transport=httpx.MockTransport(handler))
+    hits = asyncio.run(client.search_wiki("what is AI?"))
+    assert hits[0]["slug"] == "concept/artificial-intelligence"
 
 
 def test_client_bounds_external_response_bodies() -> None:
@@ -326,6 +359,117 @@ def test_pipeline_uses_native_wiki_for_wiki_only_kb(tmp_path: Path) -> None:
             "weknora_source_type": "wiki_page",
         }
     ]
+
+
+def test_pipeline_refreshes_saved_capabilities_from_weknora(tmp_path: Path) -> None:
+    wiki_transport = _wiki_transport()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/knowledge-bases":
+            return httpx.Response(
+                200,
+                json={
+                    "success": True,
+                    "data": [
+                        {
+                            "id": "kb-1",
+                            "name": "Research",
+                            "type": "document",
+                            "capabilities": {
+                                "vector": False,
+                                "keyword": False,
+                                "wiki": True,
+                                "graph": False,
+                                "faq": False,
+                            },
+                        }
+                    ],
+                },
+            )
+        return wiki_transport.handle_request(request)
+
+    base = _kb_base(
+        tmp_path,
+        {
+            "type": WEKNORA_KB_TYPE,
+            "rag_provider": "weknora",
+            "server_url": "http://localhost:8080",
+            "api_key": "secret",
+            "knowledge_base_id": "kb-1",
+            "weknora_capabilities": {
+                "vector": True,
+                "keyword": True,
+                "wiki": False,
+                "graph": False,
+                "faq": False,
+            },
+        },
+    )
+    result = asyncio.run(
+        WeKnoraPipeline(
+            base,
+            client_factory=lambda config: WeKnoraClient(
+                config, transport=httpx.MockTransport(handler)
+            ),
+        ).search("what is AI?", "remote")
+    )
+
+    assert result["weknora_capabilities"]["wiki"] is True
+    assert result["sources"][0]["weknora_source_type"] == "wiki_page"
+
+
+def test_pipeline_combines_wiki_and_document_retrieval(tmp_path: Path) -> None:
+    class HybridClient:
+        async def get_knowledge_base(self) -> dict:
+            return {
+                "id": "kb-1",
+                "capabilities": {
+                    "vector": True,
+                    "keyword": True,
+                    "wiki": True,
+                    "graph": False,
+                    "faq": False,
+                },
+            }
+
+        async def search_wiki(self, _query: str, *, limit: int) -> list[dict]:
+            assert limit == 5
+            return [{"id": "page-1", "slug": "concept/ai", "title": "AI"}]
+
+        async def get_wiki_page(self, _slug: str) -> dict:
+            return {
+                "id": "page-1",
+                "knowledge_base_id": "kb-1",
+                "slug": "concept/ai",
+                "title": "AI",
+                "content": "Wiki explanation",
+            }
+
+        async def search(self, _query: str) -> list[dict]:
+            return [{"id": "chunk-1", "content": "Source document", "title": "Manual"}]
+
+    base = _kb_base(
+        tmp_path,
+        {
+            "type": WEKNORA_KB_TYPE,
+            "rag_provider": "weknora",
+            "server_url": "http://localhost:8080",
+            "api_key": "secret",
+            "knowledge_base_id": "kb-1",
+        },
+    )
+    result = asyncio.run(
+        WeKnoraPipeline(base, client_factory=lambda _config: HybridClient()).search(
+            "what is AI?", "remote"
+        )
+    )
+
+    assert [source["weknora_source_type"] for source in result["sources"]] == [
+        "wiki_page",
+        "document_chunk",
+    ]
+    assert "Wiki explanation" in result["content"]
+    assert "Source document" in result["content"]
 
 
 def test_pipeline_reports_not_configured_and_retrieval_errors(tmp_path: Path) -> None:

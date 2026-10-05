@@ -48,13 +48,14 @@ def capabilities_from_knowledge_base(item: dict[str, Any]) -> dict[str, bool]:
             return value
         return name == "wiki" and legacy_type == "wiki"
 
+    faq = advertised.get("faq")
+
     return {
         "vector": enabled("vector"),
         "keyword": enabled("keyword"),
         "wiki": enabled("wiki"),
         "graph": enabled("graph"),
-        "faq": bool(advertised.get("faq"))
-        or legacy_type == "faq",
+        "faq": faq if isinstance(faq, bool) else legacy_type == "faq",
     }
 
 

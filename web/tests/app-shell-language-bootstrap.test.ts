@@ -7,6 +7,7 @@ import {
   hasStoredLanguage,
   hasStoredResponseLanguage,
   readStoredLanguage,
+  readStoredResponseLanguage,
 } from "../context/app-shell-storage";
 
 /** Minimal localStorage stand-in — the helpers only need get/set. */
@@ -28,16 +29,23 @@ function withLocalStorage(entries: Record<string, string>, run: () => void) {
 }
 
 test("an absent choice is distinguishable from an explicit English one", () => {
-  // readStoredLanguage normalizes both to "en", so the bootstrap cannot use it
-  // to decide whether the server-side preference may be adopted.
+  // A missing choice gets the Chinese product default, while an explicit
+  // English selection remains English. Presence is still tracked separately
+  // so the bootstrap knows whether it may adopt the server preference.
   withLocalStorage({}, () => {
     assert.equal(hasStoredLanguage(), false);
-    assert.equal(readStoredLanguage(), "en");
+    assert.equal(readStoredLanguage(), "zh");
   });
 
   withLocalStorage({ [LANGUAGE_STORAGE_KEY]: "en" }, () => {
     assert.equal(hasStoredLanguage(), true);
     assert.equal(readStoredLanguage(), "en");
+  });
+});
+
+test("model output defaults to Simplified Chinese when no browser choice exists", () => {
+  withLocalStorage({}, () => {
+    assert.equal(readStoredResponseLanguage(), "zh");
   });
 });
 
@@ -56,10 +64,10 @@ test("a stored choice is reported for every supported language", () => {
   });
 });
 
-test("an unusable value still counts as a choice and normalizes to English", () => {
+test("an unusable value still counts as a choice and normalizes to the default", () => {
   withLocalStorage({ [LANGUAGE_STORAGE_KEY]: "xx" }, () => {
     assert.equal(hasStoredLanguage(), true);
-    assert.equal(readStoredLanguage(), "en");
+    assert.equal(readStoredLanguage(), "zh");
   });
 });
 
@@ -68,7 +76,7 @@ test("server-side rendering reports no stored choice instead of throwing", () =>
   (globalThis as { window?: unknown }).window = undefined;
   try {
     assert.equal(hasStoredLanguage(), false);
-    assert.equal(readStoredLanguage(), "en");
+    assert.equal(readStoredLanguage(), "zh");
   } finally {
     (globalThis as { window?: unknown }).window = original;
   }

@@ -15,6 +15,8 @@ import { useTranslation } from "react-i18next";
 
 import type { CodeBlockThemeId } from "@/components/common/code-block-themes";
 import {
+  DEFAULT_APP_LANGUAGE,
+  DEFAULT_RESPONSE_LANGUAGE,
   normalizeCodeBlockTheme,
   writeStoredCodeBlockShowLineNumbers,
   writeStoredCodeBlockTheme,
@@ -637,9 +639,10 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
 
   const [status, setStatus] = useState<SystemStatus | null>(null);
   const [theme, setTheme] = useState<UiSettings["theme"]>("snow");
-  const [language, setLanguage] = useState<UiSettings["language"]>("en");
+  const [language, setLanguage] =
+    useState<UiSettings["language"]>(DEFAULT_APP_LANGUAGE);
   const [responseLanguage, setResponseLanguage] =
-    useState<UiSettings["response_language"]>("en");
+    useState<UiSettings["response_language"]>(DEFAULT_RESPONSE_LANGUAGE);
   const [catalog, setCatalog] = useState<Catalog>(defaultCatalog());
   const [draft, setDraft] = useState<Catalog>(defaultCatalog());
   const [catalogEditable, setCatalogEditable] = useState<boolean | null>(null);

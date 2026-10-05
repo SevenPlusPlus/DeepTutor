@@ -9,6 +9,8 @@ export const APP_LANGUAGES = [
 
 export type AppLanguage = (typeof APP_LANGUAGES)[number]["code"];
 
+export const DEFAULT_APP_LANGUAGE: AppLanguage = "zh";
+
 const SUPPORTED_CODES: ReadonlySet<string> = new Set(
   APP_LANGUAGES.map(({ code }) => code),
 );
@@ -18,12 +20,13 @@ export function isAppLanguage(value: unknown): value is AppLanguage {
 }
 
 export function normalizeLanguage(value: unknown): AppLanguage {
-  if (typeof value !== "string") return "en";
+  if (typeof value !== "string") return DEFAULT_APP_LANGUAGE;
   const code = value.trim().toLowerCase().replaceAll("_", "-");
   const base = code.split("-", 1)[0];
+  if (base === "en" || code === "english") return "en";
   if (base === "zh" || base === "cn" || code === "chinese") return "zh";
   if (base === "fr" || code === "french") return "fr";
   if (base === "de" || code === "german" || code === "deutsch") return "de";
   if (base === "uk" || base === "ua" || code === "ukrainian") return "uk";
-  return "en";
+  return DEFAULT_APP_LANGUAGE;
 }
