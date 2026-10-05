@@ -7,6 +7,25 @@ from typing import Any, Protocol
 
 from deeptutor.core.context import UnifiedContext
 
+# ── Legacy completion keys ──────────────────────────────────────────────────────────
+#
+# New capabilities use the typed ``interaction`` and ``capability_output``
+# fields. These names remain for one-version compatibility with extensions that
+# still publish completion values through serializable metadata.
+
+#: Set truthy during ``on_user_resume`` to end the turn without another LLM
+#: round — the capability owns the final message from that point on. The user's
+#: reply still reaches the transcript; only feeding it back to the model stops.
+END_LOOP = "end_loop"
+
+#: The body to publish as ``agent_output`` on the turn's CAPABILITY_COMPLETE
+#: event.
+AGENT_OUTPUT = "agent_output"
+
+#: A dict of extras to publish alongside it. Only this sub-dict is forwarded,
+#: so a capability states exactly what may leave the turn.
+EVENT_METADATA = "event_metadata"
+
 
 @dataclass(frozen=True, slots=True)
 class PromptBlock:
@@ -16,7 +35,7 @@ class PromptBlock:
     content: str
 
 
-class LoopCapability(Protocol):
+class LoopExtension(Protocol):
     """Optional per-turn extension point for the chat agent loop.
 
     A loop capability reuses the *full* chat tool surface — every built-in,
@@ -52,6 +71,30 @@ class LoopCapability(Protocol):
     (mirroring :attr:`exclusive_tools`), so plain capabilities that omit it are
     unaffected. ``usage`` is the turn's token tracker, passed so a pre-pass can
     fold its own LLM cost into the turn total.
+
+    Capabilities that own a durable user interaction MAY also define async
+    ``on_user_pause(context, ask_user)`` and ``on_user_resume(context,
+    ask_user, *, reply_text, answers)`` hooks.  The pipeline invokes them on
+    the two sides of an ``ask_user`` wait so state can be committed before a
+    disconnect or another LLM round.
+
+    A capability whose tools can repoint the turn at a different target MAY
+    declare those tool names as ``rebinding_tools: tuple[str, ...]`` (read with
+    a ``getattr`` default, like ``pre_loop``). The dispatcher runs them before
+    the round's other calls and re-binds those calls afterwards, so a switch
+    and a write issued in the same round cannot land on different targets.
+
+    A capability MAY also define ``finish_instruction(context, final_text)``.
+    It is called after a tool-less LLM round and may return a short protocol
+    instruction when that round must not finalize the turn. The answer loop
+    gives the model one additional round with tools still mounted; capability
+    implementations are responsible for keeping the check narrow and bounded.
+
+    A finish-guard capability whose private decision may share a round with a
+    tool call MAY additionally define ``tool_round_output_policy(context,
+    final_text, tool_names)`` (``"publish"`` / ``"discard"``) and
+    ``final_text_override(context, final_text)``. These hooks let it preserve a
+    previously accepted public answer while keeping protocol-only prose private.
     """
 
     name: str
@@ -87,7 +130,7 @@ class LoopCapability(Protocol):
 class KnowledgeCapability:
     """Base for capabilities bound to an agentic knowledge base.
 
-    Unlike a plain :class:`LoopCapability` (which augments chat's full tool
+    Unlike a plain :class:`LoopExtension` (which augments chat's full tool
     surface), a knowledge capability *owns the turn*: when active it replaces
     the surface with its own :attr:`owned_tools` plus the ``ask_user`` floor —
     no chat built-ins, no user composer toggles. Its retrieval/authoring is the
@@ -95,7 +138,7 @@ class KnowledgeCapability:
 
     The exclusivity is decided by **category membership**, not a per-instance
     knob: subclassing this sets :attr:`exclusive_tools`. Subclasses still
-    satisfy :class:`LoopCapability` structurally (``name`` / ``owned_tools`` /
+    satisfy :class:`LoopExtension` structurally (``name`` / ``owned_tools`` /
     ``is_active`` / ``system_block`` / ``augment_kwargs`` / ``pre_loop_seed``).
     """
 
@@ -113,4 +156,24 @@ class KnowledgeCapability:
         return set()
 
 
-__all__ = ["KnowledgeCapability", "LoopCapability", "PromptBlock"]
+__all__ = [
+    "AGENT_OUTPUT",
+    "END_LOOP",
+    "EVENT_METADATA",
+    "KnowledgeCapability",
+    "LoopExtension",
+    "PromptBlock",
+]
+
+
+def __getattr__(name: str):
+    if name == "LoopCapability":
+        import warnings
+
+        warnings.warn(
+            "LoopCapability is deprecated; use LoopExtension. It will be removed in v3.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return LoopExtension
+    raise AttributeError(name)

@@ -4,7 +4,7 @@ from enum import Enum
 import time
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 _KNOWLEDGE_TYPE_LEGACY: dict[str, str] = {
     "记忆型": "memory",
@@ -84,6 +84,11 @@ class KnowledgePoint(BaseModel):
     name: str
     type: KnowledgeType
     module_id: str
+    # Required objectives, not a presentation order. Empty on legacy paths.
+    prerequisite_ids: list[str] = Field(default_factory=list)
+    # Selected non-goal sources that justify this objective. They are curriculum
+    # provenance, not proof of factual correctness or retrieval permission.
+    topic_source_ids: list[str] = Field(default_factory=list)
 
 
 class LearningModule(BaseModel):
@@ -93,6 +98,13 @@ class LearningModule(BaseModel):
     name: str
     order: int
     pass_threshold: float = 0.7
+    # What this module is *for*, in one sentence, written when the outline was
+    # designed. Two things read it: the learner, who otherwise sees a bare noun
+    # where a purpose belongs, and ``mastery_revise``, which may only reshape
+    # knowledge points in ways this sentence still covers. Empty means an
+    # outline built before the field existed — every reader degrades to the
+    # module name, so no migration is needed.
+    objective: str = ""
     knowledge_points: list[KnowledgePoint] = Field(default_factory=list)
 
 
@@ -116,6 +128,10 @@ class QuizAttempt(BaseModel):
     self_attribution: str = ""
     mastery_estimate: float = 0.0
     timestamp: float = Field(default_factory=time.time)
+    # Invalid questions / wrong answer keys are kept for audit, but voided
+    # attempts are excluded from mastery, errors, and spaced repetition.
+    voided: bool = False
+    void_reason: str = ""
 
 
 class RetryAttempt(BaseModel):
@@ -141,6 +157,32 @@ class ErrorRecord(BaseModel):
     created_at: float = Field(default_factory=time.time)
 
 
+class LearningEvidence(BaseModel):
+    """One durable review/assessment event that can recompute retention state.
+
+    Quality is a normalized 0..1 review strength inferred from the outcome
+    (not a learner self-rating). Trusted linked assessments may originate in
+    another learning surface.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    evidence_id: str = ""
+    question_id: str = ""
+    knowledge_point_id: str
+    timestamp: float = Field(default_factory=time.time)
+    source: str = "mastery_path"
+    assessment_type: Literal["quiz", "qualitative", "review"] = "quiz"
+    result: Literal["correct", "incorrect", "partial"] = "incorrect"
+    quality: float | None = None
+    hints_used: int = 0
+    attempt_count: int = 1
+    confidence: float | None = None
+    response_time: float | None = None
+    session_id: str = ""
+    turn_id: str = ""
+
+
 class RepetitionState(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -148,6 +190,21 @@ class RepetitionState(BaseModel):
     consecutive_correct: int = 0
     consecutive_wrong: int = 0
     next_review_at: float
+    # Retention fields. Absent on state written before adaptive SRS; defaults
+    # keep old JSON loadable. ``stability == 0`` means "never hydrated" —
+    # the scheduler fills it from ``interval_index`` without changing due time.
+    difficulty: float = 0.3
+    stability: float = 0.0
+    retrievability: float = 1.0
+    desired_retention: float = 0.9
+    review_count: int = 0
+    lapse_count: int = 0
+    last_review_at: float | None = None
+    # The review (or initial schedule) that set ``next_review_at``. Practice
+    # inside one session updates ``last_review_at`` but keeps this anchor, so
+    # changing the target cannot silently postpone a previously due review.
+    last_scheduled_at: float | None = None
+    scheduled_after_failure: bool = False
 
 
 class ReviewTask(BaseModel):
@@ -159,6 +216,28 @@ class ReviewTask(BaseModel):
     due_at: float
     priority: int
     state: RepetitionState
+    forgetting_risk: float = 0.0
+    reason: str = ""
+    evidence_source: str = ""
+    evidence_id: str = ""
+
+
+class PendingOption(BaseModel):
+    """One choice a mastery question offers: a stable label and its answer text.
+
+    Two fields rather than one ``"A: body"`` string because they are two
+    different things — the learner picks the label, the card renders the body,
+    and grading compares labels. The flat string was inherited from the
+    generic ``ask_user`` card, and it had to be split back apart with a regex
+    on every read: that is how the maths option ``"x - 1 = 0"`` once
+    registered as label ``X`` with the body ``"1 = 0"``. Mastery questions now
+    carry the split the tutor made.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    label: str
+    body: str
 
 
 class PendingQuestion(BaseModel):
@@ -178,14 +257,291 @@ class PendingQuestion(BaseModel):
     prompt: str = ""
     question_type: str = "short"
     expected_answer: str = ""
-    options: list[str] = Field(default_factory=list)
+    options: list[PendingOption] = Field(default_factory=list)
+    # Reference explanation and difficulty, captured when the question is
+    # posed. Server-side like ``expected_answer`` — ``public_pending_question``
+    # never projects them, so an explanation cannot leak the answer into the
+    # card the learner is about to answer. They travel with the attempt into
+    # the question bank, which is what makes a mastery mistake reviewable
+    # later instead of a bare right/wrong.
+    explanation: str = ""
+    difficulty: str = ""
     created_at: float = Field(default_factory=time.time)
+
+    @field_validator("options", mode="before")
+    @classmethod
+    def _read_legacy_option_strings(cls, value: Any) -> Any:
+        """Read the ``["A: body", …]`` rows written before options were split.
+
+        The regex inference lives here, on the way in, so it runs once for a
+        question stored by an older version instead of on every read — and
+        never for a question posed since.
+        """
+        if not isinstance(value, list) or not value:
+            return value
+        if not all(isinstance(entry, str) for entry in value):
+            return value
+        from deeptutor.learning.pending import parse_options
+
+        return [{"label": label, "body": body} for label, body in parse_options(value).items()]
+
+    @property
+    def choice_map(self) -> dict[str, str]:
+        """The ``{label: body}`` form grading and the question bank compare on."""
+        return {option.label: option.body for option in self.options}
+
+
+class InteractionStatus(str, Enum):
+    """Durable lifecycle for one learner-facing mastery interaction.
+
+    The chat runtime may disappear at any point; this state is the source of
+    truth for whether a question still needs an answer or has already been
+    graded.  Terminal interactions are retained for idempotent retries and
+    audit history.
+    """
+
+    REGISTERED = "registered"
+    AWAITING_INPUT = "awaiting_input"
+    ANSWERED = "answered"
+    GRADED = "graded"
+    ABANDONED = "abandoned"
+
+
+class MasteryInteraction(BaseModel):
+    """A persisted question/answer transaction for a mastery path."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    interaction_id: str
+    path_id: str
+    question: PendingQuestion
+    status: InteractionStatus = InteractionStatus.REGISTERED
+    session_id: str = ""
+    turn_id: str = ""
+    user_answer: str = ""
+    result: dict[str, Any] = Field(default_factory=dict)
+    created_at: float = Field(default_factory=time.time)
+    updated_at: float = Field(default_factory=time.time)
+
+
+class MasteryEvent(BaseModel):
+    """Committed path event consumed by recovery and future live UIs."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: int = 0
+    path_id: str
+    revision: int
+    event_type: str
+    payload: dict[str, Any] = Field(default_factory=dict)
+    session_id: str = ""
+    turn_id: str = ""
+    created_at: float = Field(default_factory=time.time)
+
+
+class MasteryPathLease(BaseModel):
+    """The one active mutating turn allowed for a mastery path."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    path_id: str
+    session_id: str
+    turn_id: str
+    acquired_at: float = Field(default_factory=time.time)
+
+
+class TopicSourceKind(str, Enum):
+    """What a learner may point a mastery goal at.
+
+    Everything DeepTutor already holds for them is fair game: their library
+    (``BOOK``), their notes (``NOTEBOOK``), an indexed corpus or one document
+    inside it (``KNOWLEDGE_BASE`` / ``FILE``), and — added with the mastery
+    goal rework — the working history that shows what they have actually been
+    doing: past conversations, their own wrong answers, drafts they are
+    writing, and study partner transcripts.
+    """
+
+    GOAL = "goal"
+    BOOK = "book"
+    NOTEBOOK = "notebook"
+    KNOWLEDGE_BASE = "knowledge_base"
+    FILE = "file"
+    #: One chat session. ``source_id`` is its session id, or a
+    #: ``partner:{pid}:{session_key}`` reference for a study partner's.
+    CHAT = "chat"
+    #: One question-bank entry — a question the learner has already answered.
+    #: ``source_id`` is its numeric entry id.
+    QUESTION_BANK = "question_bank"
+    #: One Co-Writer draft. ``source_id`` is the document id.
+    COWRITER = "cowriter"
+    #: One partner-group conversation, as ``{group_id}:{session_key}``.
+    PARTNER_GROUP = "partner_group"
+
+
+class TopicSource(BaseModel):
+    """One ordered source selected while designing a learning topic."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: str
+    kind: TopicSourceKind
+    source_id: str = ""
+    label: str
+    excerpt: str = ""
+    position: int = 0
+    available: bool = True
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    created_at: float = Field(default_factory=time.time)
+
+
+class TopicMetadata(BaseModel):
+    """Product-level identity around the deterministic learning aggregate."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    path_id: str
+    goal: str = ""
+    description: str = ""
+    emoji: str = "🧭"
+    map_seed: int = 0
+    status: Literal["active", "archived"] = "active"
+    created_at: float = Field(default_factory=time.time)
+    updated_at: float = Field(default_factory=time.time)
+
+
+class MasteryTopic(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    metadata: TopicMetadata
+    sources: list[TopicSource] = Field(default_factory=list)
+
+
+class LearnerMasteryOverride(BaseModel):
+    """Explicit learner claim that bypasses, but never impersonates, evidence."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    knowledge_point_id: str
+    note: str = ""
+    created_at: float = Field(default_factory=time.time)
+
+
+class DeferredObjective(BaseModel):
+    """Learner asked to leave this objective for now without claiming mastery."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    knowledge_point_id: str
+    note: str = ""
+    created_at: float = Field(default_factory=time.time)
+
+
+class LearnerProfile(BaseModel):
+    """Who is learning this goal — collected once, honoured every turn.
+
+    An outline used to be designed from the goal and the materials alone, so
+    the same "I want to learn linear algebra" produced the same route for a
+    second-year undergraduate and for a backend engineer with six evenings.
+    These are the things only the learner knows; the tutor can read the
+    material's own difficulty for itself.
+
+    Intake answers are free text on purpose. The useful answer to "how much time do
+    you have" is "两周，每天晚上一小时", not an enum the learner has to be
+    translated into. Empty means never asked, which is why nothing here is
+    required: a goal created before intake existed reads as a profile with
+    nothing in it, and the tutor simply asks.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    #: What they can already do — where the route should start, and where
+    #: ``probe`` should aim.
+    prior_knowledge: str = ""
+    #: What "done" means to them. "Read papers in the field" and "implement it
+    #: myself" are different routes over the same subject.
+    target_level: str = ""
+    #: How much time they have. Sizes the outline.
+    time_budget: str = ""
+    #: How they want it taught — language, worked examples over prose,
+    #: intuition before formalism.
+    preferences: str = ""
+    #: Explicit sequencing preference. Existing paths keep the diagnostic default.
+    teaching_strategy: Literal["probe_first", "teach_first"] = "probe_first"
+    #: Anything else worth carrying that the four fields above do not hold.
+    notes: str = ""
+    updated_at: float = Field(default_factory=time.time)
+
+    def is_empty(self) -> bool:
+        """Whether intake has produced nothing yet."""
+        return not any(
+            (
+                self.prior_knowledge.strip(),
+                self.target_level.strip(),
+                self.time_budget.strip(),
+                self.preferences.strip(),
+                self.teaching_strategy != "probe_first",
+                self.notes.strip(),
+            )
+        )
+
+
+ReadingExtensionResultType = Literal[
+    "card",
+    "quiz",
+    "feedback",
+    "browser_speech",
+]
+
+
+class ReadingProgressRecord(BaseModel):
+    """One material's Reading progress in an account's learning records."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    material_id: str
+    latest_locator: int = Field(ge=1)
+    latest_percentage: float = Field(ge=0.0, le=1.0)
+    furthest_locator: int = Field(ge=1)
+    furthest_percentage: float = Field(ge=0.0, le=1.0)
+    updated_at: float = Field(default_factory=time.time)
+
+
+class ReadingActivityRecord(BaseModel):
+    """One successful Reading-extension action, without source content."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    activity_id: str
+    material_id: str
+    extension_id: str
+    action: str
+    locator: int = Field(ge=1)
+    result_type: ReadingExtensionResultType
+    created_at: float = Field(default_factory=time.time)
+
+
+class ReadingLearningRecords(BaseModel):
+    """Account-scoped Reading summary for reporting surfaces."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    progress: list[ReadingProgressRecord] = Field(default_factory=list)
+    activities: list[ReadingActivityRecord] = Field(default_factory=list)
 
 
 class LearningProgress(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     book_id: str
+    # Who is learning this goal. Absent on every path created before intake
+    # existed, and on any goal whose learner has not been asked yet — readers
+    # treat both the same way, so no migration is needed.
+    learner_profile: LearnerProfile | None = None
+    # The learner-facing name of this path. Empty means "never named": the
+    # display name is then derived (``policy.path_display_name``), which is how
+    # every path behaved before this field existed — so an aggregate persisted
+    # without it needs no migration.
+    name: str = ""
     diagnostic: DiagnosticResult | None = None
     modules: list[LearningModule] = Field(default_factory=list)
     current_module_id: str = ""
@@ -199,8 +555,21 @@ class LearningProgress(BaseModel):
     knowledge_types: dict[str, KnowledgeType] = Field(default_factory=dict)
     quiz_attempts: list[QuizAttempt] = Field(default_factory=list)
     error_records: list[ErrorRecord] = Field(default_factory=list)
+    # Durable review history used to recompute retention. Distinct from
+    # ``quiz_attempts`` (mastery evidence) so the two can evolve separately.
+    learning_evidence: list[LearningEvidence] = Field(default_factory=list)
+    # One target per learning path; older aggregates load at the baseline 0.9.
+    # It is copied into each repetition state when that state is created.
+    desired_retention: float = Field(default=0.9, ge=0.7, le=0.99, allow_inf_nan=False)
     repetition_states: dict[str, RepetitionState] = Field(default_factory=dict)
     review_queue: list[ReviewTask] = Field(default_factory=list)
+    # A learner may explicitly claim prior mastery.  Policy exposes this as a
+    # separate provenance (``mastery_source=learner``); assessed mastery and
+    # its evidence remain untouched and can take over later.
+    learner_mastery_overrides: dict[str, LearnerMasteryOverride] = Field(default_factory=dict)
+    # Temporarily skipped objectives. These never count as mastered; routing
+    # just prefers any other eligible waypoint until only deferred ones remain.
+    deferred_objectives: dict[str, DeferredObjective] = Field(default_factory=dict)
     # A single outstanding question; grading reads its expected answer so the
     # model never has to recall it across turns.
     pending_question: PendingQuestion | None = None
@@ -214,6 +583,7 @@ class LearningProgress(BaseModel):
 
 
 __all__ = [
+    "LearnerProfile",
     "KnowledgeType",
     "ErrorType",
     "LearningStage",
@@ -223,8 +593,22 @@ __all__ = [
     "QuizAttempt",
     "RetryAttempt",
     "ErrorRecord",
+    "LearningEvidence",
     "RepetitionState",
     "ReviewTask",
     "PendingQuestion",
+    "InteractionStatus",
+    "MasteryInteraction",
+    "MasteryEvent",
+    "MasteryPathLease",
+    "TopicSourceKind",
+    "TopicSource",
+    "TopicMetadata",
+    "MasteryTopic",
+    "LearnerMasteryOverride",
+    "DeferredObjective",
+    "ReadingActivityRecord",
+    "ReadingLearningRecords",
+    "ReadingProgressRecord",
     "LearningProgress",
 ]

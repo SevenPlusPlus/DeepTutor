@@ -1,18 +1,11 @@
 "use client";
 
+import { BOOKS_HOME } from "@/lib/learning-routes";
+
 /**
- * SessionActivityPanel — right-side column of *floating cards* recording
- * the conversation's tools, knowledge bases, Space refs, and attachments.
- *
- * Design notes
- * ────────────
- * • The panel itself has **no background** — cards float over the page so
- *   the chat surface still bleeds through. Each card carries its own border
- *   + faint shadow so it reads as a discrete block.
- * • Clicking an attachment row fires `onOpenAttachment(att)` upward; the
- *   parent routes it into the SessionViewerPanel as a new file tab.
- * • Section content is suppressed entirely when empty — no skeleton cards
- *   for tools/KBs/Space/attachments that never showed up in this session.
+ * The Activity home lists the conversation's tools, references, and files.
+ * Clicking a file opens it as a tab in SessionViewerPanel. Empty groups are
+ * omitted, so the panel remains a short index as a conversation grows.
  */
 
 import { useEffect, useState, type ReactNode } from "react";
@@ -21,146 +14,43 @@ import {
   AtSign,
   BookOpen,
   Brain,
+  ChevronRight,
   ClipboardList,
   Database,
   ExternalLink,
   History,
   NotebookPen,
   Paperclip,
+  Sparkles,
   UserRound,
   Wrench,
   type LucideIcon,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
-import { docIconFor, isSvgFilename } from "@/lib/doc-attachments";
-import type {
-  MessageAttachment,
-  MessageItem,
-  MessageRequestSnapshot,
-} from "@/context/UnifiedChatContext";
-import type { StreamEvent } from "@/lib/unified-ws";
+import { docIconFor, formatBytes, isSvgFilename } from "@/lib/doc-attachments";
+import type { MessageAttachment } from "@/features/chat/ChatStateAdapter";
 import { listSessions, type SessionSummary } from "@/lib/session-api";
 import { listNotebooks, type NotebookSummary } from "@/lib/notebook-api";
 import { bookApi } from "@/lib/book-api";
 import type { Book } from "@/lib/book-types";
+import Tooltip from "@/shared/ui/Tooltip";
 
-/* ------------------------------------------------------------------ */
-/*  Aggregator                                                         */
-/* ------------------------------------------------------------------ */
+import {
+  artifactDiskPath,
+  type AttachmentWithOrigin,
+  type SessionActivity,
+  type SpaceReferenceSummary,
+} from "@/lib/session-activity";
 
-export interface ToolUsage {
-  name: string;
-  count: number;
-}
-
-export interface AttachmentWithOrigin {
-  messageIndex: number;
-  attachment: MessageAttachment;
-}
-
-export interface SpaceReferenceSummary {
-  historySessionIds: string[];
-  bookPageCount: number;
-  bookIds: string[];
-  bookPages: Map<string, string[]>;
-  notebookRecordCount: number;
-  notebookIds: string[];
-  questionEntryIds: number[];
-  personas: string[];
-  memoryKinds: Array<"summary" | "profile">;
-}
-
-export interface SessionActivity {
-  tools: ToolUsage[];
-  knowledgeBases: string[];
-  space: SpaceReferenceSummary;
-  attachments: AttachmentWithOrigin[];
-  isEmpty: boolean;
-}
-
-export function buildSessionActivity(messages: MessageItem[]): SessionActivity {
-  const toolCounts = new Map<string, number>();
-  const kbs = new Set<string>();
-  const historySessionIds = new Set<string>();
-  const bookIds = new Set<string>();
-  const bookPages = new Map<string, string[]>();
-  let bookPageCount = 0;
-  const notebookIds = new Set<string>();
-  let notebookRecordCount = 0;
-  const questionEntryIds = new Set<number>();
-  const personas = new Set<string>();
-  const memoryKinds = new Set<"summary" | "profile">();
-  const attachments: AttachmentWithOrigin[] = [];
-
-  messages.forEach((msg, idx) => {
-    msg.events?.forEach((event: StreamEvent) => {
-      if (event.type !== "tool_call") return;
-      const name =
-        String((event.metadata as { tool?: string } | undefined)?.tool || "") ||
-        event.content?.trim() ||
-        "tool";
-      toolCounts.set(name, (toolCounts.get(name) ?? 0) + 1);
-    });
-
-    msg.attachments?.forEach((a) => {
-      attachments.push({ messageIndex: idx, attachment: a });
-    });
-
-    const snap: MessageRequestSnapshot | undefined = msg.requestSnapshot;
-    if (snap) {
-      snap.knowledgeBases?.forEach((k) => kbs.add(k));
-      snap.historyReferences?.forEach((s) => historySessionIds.add(s));
-      snap.bookReferences?.forEach((b) => {
-        bookIds.add(b.book_id);
-        bookPageCount += b.page_ids?.length ?? 0;
-        const existing = bookPages.get(b.book_id) ?? [];
-        bookPages.set(b.book_id, [...existing, ...(b.page_ids ?? [])]);
-      });
-      snap.notebookReferences?.forEach((n) => {
-        notebookIds.add(n.notebook_id);
-        notebookRecordCount += n.record_ids?.length ?? 0;
-      });
-      snap.questionNotebookReferences?.forEach((q) => questionEntryIds.add(q));
-      if (snap.persona) personas.add(snap.persona);
-      snap.memoryReferences?.forEach((k) => memoryKinds.add(k));
-    }
-  });
-
-  const tools = Array.from(toolCounts.entries())
-    .map(([name, count]) => ({ name, count }))
-    .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
-
-  const space: SpaceReferenceSummary = {
-    historySessionIds: Array.from(historySessionIds),
-    bookPageCount,
-    bookIds: Array.from(bookIds),
-    bookPages,
-    notebookRecordCount,
-    notebookIds: Array.from(notebookIds),
-    questionEntryIds: Array.from(questionEntryIds),
-    personas: Array.from(personas),
-    memoryKinds: Array.from(memoryKinds),
-  };
-
-  const isEmpty =
-    tools.length === 0 &&
-    kbs.size === 0 &&
-    attachments.length === 0 &&
-    space.historySessionIds.length === 0 &&
-    space.bookIds.length === 0 &&
-    space.notebookIds.length === 0 &&
-    space.questionEntryIds.length === 0 &&
-    space.personas.length === 0 &&
-    space.memoryKinds.length === 0;
-
-  return {
-    tools,
-    knowledgeBases: Array.from(kbs),
-    space,
-    attachments,
-    isEmpty,
-  };
-}
+// Re-exported so existing importers (page.tsx, SessionViewerPanel) keep reaching
+// the panel for its own contract while the fold itself lives in lib/.
+export type {
+  AttachmentWithOrigin,
+  SessionActivity,
+  SpaceReferenceSummary,
+  ToolUsage,
+} from "@/lib/session-activity";
+export { buildSessionActivity } from "@/lib/session-activity";
 
 /* ------------------------------------------------------------------ */
 /*  Title resolver — lazy id -> title for Space items                  */
@@ -261,13 +151,13 @@ const SPACE_CATEGORIES: Record<string, SpaceCategoryDef> = {
   },
   books: {
     key: "books",
-    href: "/space/books",
+    href: BOOKS_HOME,
     label: "Books",
     icon: BookOpen,
   },
   notebooks: {
     key: "notebooks",
-    href: "/space/notebooks",
+    href: "/notebooks",
     label: "Notebooks",
     icon: NotebookPen,
   },
@@ -291,6 +181,18 @@ const SPACE_CATEGORIES: Record<string, SpaceCategoryDef> = {
   },
 };
 
+/* Activity home surface, shared with SessionViewerPanel's Open section.
+   Groups are soft filled tiles under a small label — no border, no shadow —
+   so they sit inside the viewer sheet without drawing a frame within a frame.
+   (color-mix rather than `bg-[var(--x)]/NN`: Tailwind 3 emits nothing for an
+   opacity modifier on a hex CSS variable.) */
+export const ACTIVITY_LABEL =
+  "px-1.5 pb-1.5 text-[12px] font-medium text-[var(--muted-foreground)]";
+export const ACTIVITY_TILE =
+  "rounded-xl bg-[color-mix(in_srgb,var(--muted)_45%,transparent)]";
+export const ACTIVITY_ROW_HOVER =
+  "hover:bg-[color-mix(in_srgb,var(--muted)_95%,transparent)]";
+
 export function ActivityBody({
   activity,
   open,
@@ -303,7 +205,7 @@ export function ActivityBody({
   configSection?: ReactNode;
 }) {
   const { t } = useTranslation();
-  const { tools, knowledgeBases, space, attachments } = activity;
+  const { tools, knowledgeBases, space, attachments, artifacts } = activity;
   const { sessions, notebooks, books } = useResolvedTitles(activity, open);
 
   const spaceSubsections: ReactNode[] = [];
@@ -399,77 +301,113 @@ export function ActivityBody({
 
   if (activity.isEmpty && !configSection) {
     return (
-      <SectionCard icon={Wrench} title={t("Session activity")}>
-        <div className="px-3.5 py-5 text-center text-[12px] italic text-[var(--muted-foreground)]/80">
-          {t(
-            "As you chat, the tools, references and attachments you use will appear here.",
-          )}
+      <section>
+        <h2 className={ACTIVITY_LABEL}>{t("Session activity")}</h2>
+        <div className={`${ACTIVITY_TILE} flex items-start gap-3 px-3.5 py-3`}>
+          <Wrench
+            size={15}
+            strokeWidth={1.7}
+            aria-hidden="true"
+            className="mt-[3px] shrink-0 text-[var(--muted-foreground)]"
+          />
+          <p className="min-w-0 text-[12.5px] leading-[1.65] text-[var(--muted-foreground)]">
+            {t(
+              "As you chat, the tools and references you use — and the files the tutor generates — will appear here.",
+            )}
+          </p>
         </div>
-      </SectionCard>
+      </section>
     );
   }
 
   return (
-    <div className="space-y-2.5">
-      {tools.length > 0 ? (
-        <SectionCard icon={Wrench} title={t("Tools used")} count={tools.length}>
-          <ul className="space-y-0.5 p-1.5">
-            {tools.map((tool) => (
-              <li
-                key={tool.name}
-                className="flex items-center justify-between gap-2 rounded-md px-2 py-1.5 text-[12px] text-[var(--foreground)] transition-colors hover:bg-[var(--muted)]/35"
-              >
-                <span className="truncate font-medium">{tool.name}</span>
-                <span className="shrink-0 rounded-full bg-[var(--muted)]/55 px-1.5 py-[1px] text-[10px] font-semibold text-[var(--muted-foreground)]">
-                  ×{tool.count}
-                </span>
-              </li>
-            ))}
-          </ul>
-        </SectionCard>
-      ) : null}
+    <div className="space-y-5">
+      {!activity.isEmpty ? (
+        <section>
+        <h2 className={ACTIVITY_LABEL}>{t("Session activity")}</h2>
+        <div className={`${ACTIVITY_TILE} divide-y divide-[color-mix(in_srgb,var(--border)_55%,transparent)] overflow-hidden`}>
+        {tools.length > 0 ? (
+          <SectionCard icon={Wrench} title={t("Tools used")} count={tools.length}>
+            <ul className="px-2 pb-2">
+              {tools.map((tool) => (
+                <li
+                  key={tool.name}
+                  className="flex min-h-8 items-center justify-between gap-2 rounded-lg px-2.5 py-1.5 text-[12px] text-[var(--foreground)]"
+                >
+                  <span className="truncate font-medium">{tool.name}</span>
+                  <span className="shrink-0 text-[11px] tabular-nums text-[var(--muted-foreground)]">
+                    ×{tool.count}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          </SectionCard>
+        ) : null}
 
-      {knowledgeBases.length > 0 ? (
-        <SectionCard
-          icon={Database}
-          title={t("Knowledge bases")}
-          count={knowledgeBases.length}
-        >
-          <ul className="space-y-0.5 p-1.5">
-            {knowledgeBases.map((kb) => (
-              <li
-                key={kb}
-                className="truncate rounded-md px-2 py-1.5 text-[12px] font-medium text-[var(--foreground)] transition-colors hover:bg-[var(--muted)]/35"
-              >
-                {kb}
-              </li>
-            ))}
-          </ul>
-        </SectionCard>
-      ) : null}
+        {knowledgeBases.length > 0 ? (
+          <SectionCard
+            icon={Database}
+            title={t("Knowledge bases")}
+            count={knowledgeBases.length}
+          >
+            <ul className="px-2 pb-2">
+              {knowledgeBases.map((kb) => (
+                <li
+                  key={kb}
+                  className="min-h-8 truncate rounded-lg px-2.5 py-1.5 text-[12px] font-medium text-[var(--foreground)]"
+                >
+                  {kb}
+                </li>
+              ))}
+            </ul>
+          </SectionCard>
+        ) : null}
 
-      {spaceSubsections.length > 0 ? (
-        <SectionCard icon={AtSign} title={t("Space")}>
-          <div className="space-y-1.5 p-1.5">{spaceSubsections}</div>
-        </SectionCard>
-      ) : null}
+        {spaceSubsections.length > 0 ? (
+          <SectionCard icon={AtSign} title={t("Space")}>
+            <div className="space-y-1 px-2 pb-2">{spaceSubsections}</div>
+          </SectionCard>
+        ) : null}
 
-      {attachments.length > 0 ? (
-        <SectionCard
-          icon={Paperclip}
-          title={t("Attachments")}
-          count={attachments.length}
-        >
-          <ul className="space-y-0.5 p-1.5">
-            {attachments.map(({ attachment, messageIndex }, i) => (
-              <AttachmentRow
-                key={`${attachment.id ?? attachment.filename ?? i}-${messageIndex}`}
-                attachment={attachment}
-                onOpen={() => onOpenAttachment(attachment)}
-              />
-            ))}
-          </ul>
-        </SectionCard>
+        {/* Above Attachments: what this conversation produced is what you come
+            back for, more often than a file you uploaded and already have. */}
+        {artifacts.length > 0 ? (
+          <SectionCard
+            icon={Sparkles}
+            title={t("Generated files")}
+            count={artifacts.length}
+          >
+            <ul className="px-2 pb-2">
+              {artifacts.map(({ attachment, messageIndex }, i) => (
+                <AttachmentRow
+                  key={`${attachment.id ?? attachment.filename ?? i}-${messageIndex}`}
+                  attachment={attachment}
+                  onOpen={() => onOpenAttachment(attachment)}
+                />
+              ))}
+            </ul>
+          </SectionCard>
+        ) : null}
+
+        {attachments.length > 0 ? (
+          <SectionCard
+            icon={Paperclip}
+            title={t("Attachments")}
+            count={attachments.length}
+          >
+            <ul className="px-2 pb-2">
+              {attachments.map(({ attachment, messageIndex }, i) => (
+                <AttachmentRow
+                  key={`${attachment.id ?? attachment.filename ?? i}-${messageIndex}`}
+                  attachment={attachment}
+                  onOpen={() => onOpenAttachment(attachment)}
+                />
+              ))}
+            </ul>
+          </SectionCard>
+        ) : null}
+        </div>
+        </section>
       ) : null}
 
       {configSection}
@@ -478,7 +416,7 @@ export function ActivityBody({
 }
 
 /* ------------------------------------------------------------------ */
-/*  Card primitives                                                    */
+/*  Compact section primitives                                         */
 /* ------------------------------------------------------------------ */
 
 function SectionCard({
@@ -493,18 +431,18 @@ function SectionCard({
   children: ReactNode;
 }) {
   return (
-    <section className="overflow-hidden rounded-xl border border-[var(--border)]/55 bg-[var(--card)] shadow-[0_1px_2px_color-mix(in_srgb,var(--foreground)_5%,transparent),0_4px_14px_color-mix(in_srgb,var(--foreground)_5%,transparent)]">
-      <header className="flex items-center gap-2 border-b border-[var(--border)]/35 px-3.5 py-2.5">
+    <section>
+      <header className="flex items-center gap-2.5 px-3.5 pb-1 pt-3">
         <Icon
-          size={13}
+          size={14}
           strokeWidth={1.8}
           className="shrink-0 text-[var(--muted-foreground)]"
         />
-        <span className="flex-1 text-[12px] font-semibold tracking-[0.005em] text-[var(--foreground)]">
+        <h3 className="flex-1 text-[12.5px] font-semibold text-[var(--foreground)]">
           {title}
-        </span>
+        </h3>
         {count !== undefined && count > 0 ? (
-          <span className="shrink-0 rounded-full bg-[var(--muted)]/55 px-1.5 py-[1px] text-[10px] font-semibold text-[var(--muted-foreground)]">
+          <span className="shrink-0 text-[11px] tabular-nums text-[var(--muted-foreground)]">
             {count}
           </span>
         ) : null}
@@ -524,30 +462,32 @@ function SpaceSubsection({
   children: ReactNode;
 }) {
   const Icon = category.icon;
+  const { t } = useTranslation();
   return (
     <div>
       <Link
         href={category.href}
-        className="group flex items-center gap-2 rounded-md px-2 py-1 transition-colors hover:bg-[var(--muted)]/40"
+        className={`group flex min-h-8 items-center gap-2 rounded-lg px-2.5 py-1 transition-colors ${ACTIVITY_ROW_HOVER} focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-[var(--ring)]`}
       >
         <Icon
           size={12}
           strokeWidth={1.8}
           className="shrink-0 text-[var(--muted-foreground)]"
         />
-        <span className="flex-1 truncate text-[10.5px] font-semibold uppercase tracking-[0.06em] text-[var(--muted-foreground)] transition-colors group-hover:text-[var(--primary)]">
-          {category.label}
+        <span className="flex-1 truncate text-[11.5px] font-medium text-[var(--foreground)] transition-colors group-hover:text-[var(--primary)]">
+          {t(category.label)}
         </span>
-        <span className="rounded-full bg-[var(--muted)]/55 px-1.5 py-[1px] text-[10px] font-semibold text-[var(--muted-foreground)]">
+        <span className="text-[11px] tabular-nums text-[var(--muted-foreground)]">
           {count}
         </span>
         <ExternalLink
           size={10}
           strokeWidth={2}
+          aria-hidden="true"
           className="shrink-0 text-[var(--muted-foreground)] opacity-0 transition-opacity group-hover:opacity-100"
         />
       </Link>
-      <ul className="mt-0.5 space-y-px pl-5">{children}</ul>
+      <ul className="ml-[21px] border-l border-[color-mix(in_srgb,var(--border)_70%,transparent)] pl-2">{children}</ul>
     </div>
   );
 }
@@ -560,7 +500,7 @@ function SpaceItemRow({
   subtitle?: string;
 }) {
   return (
-    <li className="flex items-center gap-2 rounded-md px-2 py-1 text-[12px] transition-colors hover:bg-[var(--muted)]/35">
+    <li className="flex min-h-7 items-center gap-2 rounded-md px-2 py-1 text-[11.5px]">
       <span className="block min-w-0 flex-1 truncate font-medium text-[var(--foreground)]">
         {title}
       </span>
@@ -584,15 +524,26 @@ function AttachmentRow({
   const spec = docIconFor(filename);
   const Icon = spec.Icon;
   const isImage = attachment.type === "image" || isSvgFilename(filename);
+  // Generated files carry a size; showing it distinguishes a real deliverable
+  // from an empty stub without opening it. The hover title answers "where did
+  // this land on disk?" — the question the transcript cannot.
+  const size = attachment.generated
+    ? formatBytes(attachment.size_bytes ?? -1)
+    : "";
+  const detail = [spec.label, size].filter(Boolean).join(" · ");
+  const diskPath = attachment.generated
+    ? artifactDiskPath(attachment.url)
+    : null;
 
   return (
-    <li>
-      <button
-        type="button"
-        onClick={onOpen}
-        className="flex w-full items-center gap-2.5 rounded-md px-2 py-1.5 text-left transition-colors hover:bg-[var(--muted)]/35"
-      >
-        <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-[var(--muted)]/55">
+    <li className="[&>span]:w-full">
+      <Tooltip label={filename} description={diskPath ?? undefined} side="left">
+        <button
+          type="button"
+          onClick={onOpen}
+          className={`group flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left transition-colors ${ACTIVITY_ROW_HOVER} focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-[var(--ring)]`}
+        >
+        <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-[var(--card)]">
           <Icon
             size={13}
             strokeWidth={1.6}
@@ -603,11 +554,18 @@ function AttachmentRow({
           <span className="block truncate text-[12px] font-medium text-[var(--foreground)]">
             {filename}
           </span>
-          <span className="block truncate text-[10px] uppercase tracking-wide text-[var(--muted-foreground)]">
-            {spec.label}
+          <span className="block truncate text-[10.5px] text-[var(--muted-foreground)]">
+            {detail}
           </span>
         </span>
-      </button>
+        <ChevronRight
+          size={14}
+          strokeWidth={1.7}
+          aria-hidden="true"
+          className="shrink-0 text-[var(--muted-foreground)]/65 opacity-0 transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100"
+        />
+        </button>
+      </Tooltip>
     </li>
   );
 }

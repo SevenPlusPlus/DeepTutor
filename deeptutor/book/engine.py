@@ -3,7 +3,7 @@ BookEngine
 ==========
 
 Top-level orchestrator for the Book Engine. Sits **parallel** to
-``ChatOrchestrator`` (i.e. it is **not** a ``BaseCapability``) and is the
+``ChatOrchestrator`` (i.e. it is **not** a ``TurnCapability``) and is the
 single public entry point used by the API router, CLI, and SDK.
 
 Lifecycle
@@ -15,39 +15,56 @@ Lifecycle
     confirm_proposal(...)    → Spine              (Stage 2, requires user confirm)
     confirm_spine(...)       → page shells + queued compilation
     compile_page(book, page) → Page               (Stage 3-4, drives BookCompiler)
-    list_books(), load_book(), delete_book(), resume_book()
+    resume_book(...)         → re-queue unfinished pages, keeping what exists
+    rebuild_book(...)        → discard every page and regenerate from the spine
+    list_books(), load_book(), delete_book()
 
 Compilation queue
 -----------------
 
-For each book a per-book ``asyncio.Queue`` schedules pages with priority:
-- Highest priority: page the user just opened (handled inline).
-- Background: remaining unfinished pages, processed by a single worker.
+Each book gets a ``_BookRuntime``: an ``asyncio.Queue`` of pending pages, one
+background worker, and an **in-flight table** keyed by page id. Every path that
+can compile a page — the reader opening one, the worker reaching one, a forced
+regenerate — goes through :meth:`BookEngine.compile_page`, which consults that
+table so concurrent requests for the same page join a single run instead of
+racing into duplicate generations.
 
-The engine emits all progress over a ``StreamBus`` (wrapped by ``BookStream``)
-which the WebSocket router fans out to clients.
+The worker trips a breaker (``CONSECUTIVE_PAGE_FAILURE_LIMIT``) when pages fail
+for provider-level reasons, pausing the book rather than grinding the remaining
+chapters into half-generated debris.
+
+Progress is published to the book's long-lived stream in :mod:`.event_hub`,
+never to a request-scoped bus — background compilation must keep streaming
+after the call that queued it has returned.
 """
 
 from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+from functools import partial
 import logging
 import time
 from typing import Any
 
-from deeptutor.core.stream_bus import StreamBus
+from deeptutor.runtime.stream_bus import StreamBus
+from deeptutor.services.workspace.activity import workspace_writer
 
+from . import progress as progress_ops
 from .agents.ideation_agent import IdeationAgent
 from .agents.source_explorer import SourceExplorer
 from .agents.spine_synthesizer import SpineSynthesizer
-from .compiler import BookCompiler, CompilerOptions
+from .compiler import BookCompiler, CompilerOptions, systemic_failure_reason
+from .errors import BookPausedError
+from .event_hub import close_book_bus, get_book_bus
 from .inputs import IdeationContext, build_book_inputs
+from .language import resolve_book_language
 from .models import (
     Block,
     BlockStatus,
     BlockType,
     Book,
+    BookDepth,
     BookInputs,
     BookProposal,
     BookStatus,
@@ -58,9 +75,9 @@ from .models import (
     PageLink,
     PageStatus,
     Progress,
-    QuizAttempt,
     Spine,
 )
+from .overview_copy import overview_copy
 from .storage import BookStorage, get_book_storage
 from .streaming import (
     STAGE_COMPILATION,
@@ -81,20 +98,220 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+# A page that fails *entirely* for provider-level reasons (quota exhausted,
+# credentials revoked, provider down) will be followed by more of the same, so
+# the queue trips a breaker instead of grinding the rest of the book into
+# half-generated pages. Ungenerated pages are an asset; half-generated ones are
+# debris the user has to clean up.
+CONSECUTIVE_PAGE_FAILURE_LIMIT = 2
+
+
+# Statuses that mean "this page still has work owed to it". PARTIAL is
+# deliberately absent: the compiler already ran every block and some failed for
+# good, so re-queueing it on each open would re-spend the same model calls
+# forever without changing the outcome. Force-regenerate is the way back in.
+_UNFINISHED_PAGE_STATUSES = frozenset(
+    {
+        PageStatus.PENDING,
+        PageStatus.PLANNING,
+        PageStatus.GENERATING,
+        PageStatus.ERROR,
+    }
+)
+
+
+# Blocks whose content is a single run of prose the reader can correct in
+# place. Everything else carries structured payloads — a section's subsections,
+# a quiz's questions, a figure's source — where a plain text box would either
+# destroy the structure or edit a field nothing renders. Those stay on
+# regenerate.
+_EDITABLE_BLOCK_TYPES = frozenset({BlockType.TEXT, BlockType.USER_NOTE, BlockType.CALLOUT})
+
+
+def _body_key(block: Block) -> str:
+    """Which payload key holds a block's prose.
+
+    ``TEXT`` blocks are inconsistent by history: the generator writes ``body``
+    while the deterministic overview blocks write ``content``. Respect whatever
+    the block already uses so an edit lands where the renderer reads.
+    """
+    if block.type == BlockType.TEXT and "content" in (block.payload or {}):
+        return "content"
+    return "body"
+
+
+def _prune_concept_graph(spine: Spine) -> int:
+    """Drop graph nodes whose chapter no longer exists, and dangling edges.
+
+    The concept graph is built once, before the reader ever opens the spine
+    editor, and is never rebuilt. Deleting a chapter therefore left its concept
+    on the Overview page's map — the book's own front page contradicting its
+    table of contents. Pruning is deterministic and costs no model call; the
+    remaining graph is still the one that was synthesised, just without the
+    parts the reader removed.
+
+    Returns the number of nodes dropped.
+    """
+    graph = spine.concept_graph
+    if not graph.nodes:
+        return 0
+
+    live_chapters = {c.id for c in spine.chapters}
+    kept = [n for n in graph.nodes if not n.chapter_id or n.chapter_id in live_chapters]
+    dropped = len(graph.nodes) - len(kept)
+    if not dropped:
+        return 0
+
+    kept_ids = {n.id for n in kept}
+    graph.nodes = kept
+    graph.edges = [e for e in graph.edges if e.src in kept_ids and e.dst in kept_ids]
+    return dropped
+
+
+def _source_quality_summary(
+    inputs: BookInputs,
+    exploration: ExplorationReport | None,
+    *,
+    error: str = "",
+) -> dict[str, Any]:
+    """Compact, persisted source coverage for management views."""
+
+    requested_kbs = list(dict.fromkeys(inputs.knowledge_bases or []))
+    covered_kbs = sorted(
+        {
+            chunk.kb_name
+            for chunk in (exploration.chunks if exploration else [])
+            if chunk.source == "kb" and chunk.kb_name
+        }
+    )
+    missing_kbs = [name for name in requested_kbs if name not in covered_kbs]
+    requested_non_kb = {
+        "notebook": len(inputs.notebook_refs or []),
+        "chat": len(inputs.chat_selections or []),
+        "questions": len(inputs.question_entries or []) + len(inputs.question_categories or []),
+    }
+    for source in inputs.source_refs:
+        kind = source.get("kind", "")
+        if kind not in {"knowledge_base", "file", "goal"}:
+            requested_non_kb[kind] = requested_non_kb.get(kind, 0) + 1
+    coverage = dict(exploration.coverage) if exploration else {}
+    warnings: list[str] = []
+    if error:
+        warnings.append(f"Source exploration failed: {error[:240]}")
+    if missing_kbs:
+        warnings.append("No retrieved evidence from: " + ", ".join(missing_kbs))
+    requested_any = bool(requested_kbs or any(requested_non_kb.values()))
+    chunk_count = len(exploration.chunks) if exploration else 0
+    if requested_any and chunk_count == 0 and not error:
+        warnings.append("Selected sources produced no reusable evidence chunks.")
+    return {
+        "status": "failed" if error else ("warning" if warnings else "ready"),
+        "requested_kbs": requested_kbs,
+        "covered_kbs": covered_kbs,
+        "missing_kbs": missing_kbs,
+        "requested_non_kb": requested_non_kb,
+        "coverage": coverage,
+        "chunk_count": chunk_count,
+        "warnings": warnings,
+    }
+
+
+def _generation_error_category(message: str) -> str:
+    text = (message or "").lower()
+    if any(token in text for token in ("quota", "insufficient", "credit", "billing")):
+        return "quota"
+    if any(token in text for token in ("unauthorized", "forbidden", "api key", "credential")):
+        return "authentication"
+    if any(token in text for token in ("rate limit", "too many requests", "429")):
+        return "rate_limit"
+    # A block type whose generator needs an optional extra that is not
+    # installed. Distinct from a provider fault: nothing will fix itself on a
+    # retry, and the answer is either to install the extra or to leave that
+    # block type out of the book — so it must not land in "unknown", which is
+    # what the whole animation family was doing.
+    if any(
+        token in text
+        for token in (
+            "requires the optional",
+            "pip install",
+            "modulenotfounderror",
+            "no module named",
+            "not installed",
+        )
+    ):
+        return "missing_dependency"
+    if any(token in text for token in ("timeout", "timed out", "connection", "provider")):
+        return "provider"
+    if any(token in text for token in ("parse", "invalid json", "validation")):
+        return "content"
+    return "unknown"
+
+
+def _is_auto_overview(chapter: Chapter) -> bool:
+    """Whether *chapter* is the engine-injected overview.
+
+    Checks both markers: ``content_type`` survives a round trip through the
+    typed model, while the ``auto_overview`` extra survives a chapter whose
+    content type was changed by hand in the spine editor.
+    """
+    return (
+        chapter.content_type == ContentType.OVERVIEW
+        or (chapter.__pydantic_extra__ or {}).get("auto_overview") is True
+    )
+
+
+def _coerce_depth(value: str | BookDepth | None) -> BookDepth:
+    """Accept anything the API layer might pass; fall back to STANDARD."""
+    if isinstance(value, BookDepth):
+        return value
+    try:
+        return BookDepth(str(value or "").strip().lower())
+    except ValueError:
+        return BookDepth.STANDARD
+
+
 @dataclass
 class _BookRuntime:
-    """In-process per-book scheduling state."""
+    """In-process per-book **scheduling** state.
+
+    Deliberately owns no event stream: streams live in :mod:`.event_hub` and
+    outlive any single request, so background compilation keeps broadcasting
+    after the call that queued it has returned.
+    """
 
     queue: asyncio.Queue[str] = field(default_factory=asyncio.Queue)
     queued: set[str] = field(default_factory=set)
+    # page_id → the task currently compiling it. The single source of truth for
+    # "is this page already being built", shared by the foreground
+    # ``compile_page`` path and the background worker so they can never race
+    # into compiling the same page twice.
+    in_flight: dict[str, asyncio.Task[Page]] = field(default_factory=dict)
     worker: asyncio.Task[None] | None = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    stream: BookStream | None = None  # default stream for background work
+    consecutive_page_failures: int = 0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Engine
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+def _with_book_sources(function):
+    from functools import wraps
+    from inspect import signature
+
+    @wraps(function)
+    async def guarded(self, *args, **kwargs):
+        from deeptutor.services.workspace.knowledge import learning_source_access
+
+        bound = signature(function).bind(self, *args, **kwargs).arguments
+        book_id = bound.get("book_id")
+        book = self.storage.load_book(book_id) if book_id else None
+        refs = book.knowledge_bases if book else bound.get("knowledge_bases") or []
+        with learning_source_access(refs):
+            return await function(self, *args, **kwargs)
+
+    return guarded
 
 
 class BookEngine:
@@ -128,6 +345,39 @@ class BookEngine:
     def load_book(self, book_id: str) -> Book | None:
         return self.storage.load_book(book_id)
 
+    def _require_generation_allowed(self, book_id: str, book: Book | None = None) -> Book:
+        current = book or self.storage.load_book(book_id)
+        if current is None:
+            raise ValueError(f"Book {book_id} not found")
+        if current.status == BookStatus.PAUSED:
+            raise BookPausedError(
+                "Book generation is paused. Resume it explicitly before generating content."
+            )
+        return current
+
+    def reading_summary(self, book: Book) -> dict[str, Any]:
+        """How far the reader has got, cheap enough to compute for a whole shelf.
+
+        Reads only ``progress.json`` and the page count already on the manifest
+        — deliberately no ``list_pages``, which would turn drawing the library
+        into one directory scan per book.
+        """
+        progress = self.storage.load_progress(book.id)
+        total = max(0, book.page_count)
+        if progress is None:
+            return {
+                "current_page_id": "",
+                "visited_pages": 0,
+                "total_pages": total,
+                "percent": 0,
+            }
+        return {
+            "current_page_id": progress.current_page_id,
+            "visited_pages": len(set(progress.visited_page_ids)),
+            "total_pages": total,
+            "percent": round(progress_ops.completion_ratio(progress, total) * 100),
+        }
+
     def load_spine(self, book_id: str) -> Spine | None:
         return self.storage.load_spine(book_id)
 
@@ -146,8 +396,15 @@ class BookEngine:
 
     def delete_book(self, book_id: str) -> bool:
         runtime = self._runtimes.pop(book_id, None)
-        if runtime and runtime.worker and not runtime.worker.done():
-            runtime.worker.cancel()
+        if runtime is not None:
+            if runtime.worker and not runtime.worker.done():
+                runtime.worker.cancel()
+            for task in runtime.in_flight.values():
+                if not task.done():
+                    task.cancel()
+        # The book's event stream is the one thing that outlives its requests,
+        # so deletion is the only place allowed to close it.
+        close_book_bus(book_id)
         return self.storage.delete_book(book_id)
 
     def set_page_chat_session(self, *, book_id: str, page_id: str, session_id: str) -> Book | None:
@@ -176,9 +433,17 @@ class BookEngine:
 
     @staticmethod
     def _reset_page_for_force_compile(page: Page) -> None:
-        """Reset generated block outputs while preserving user-authored notes."""
+        """Reset generated block outputs while preserving anything user-authored.
+
+        Notes and hand-edited prose survive a forced regenerate. A reader who
+        corrected a sentence and then hit "regenerate page" should not silently
+        lose their correction — the two actions have nothing to do with each
+        other from their point of view.
+        """
         for block in page.blocks:
             if block.type == BlockType.USER_NOTE:
+                continue
+            if (block.metadata or {}).get("edited_by_user"):
                 continue
             preserved_metadata = {
                 key: value
@@ -197,10 +462,13 @@ class BookEngine:
 
     # ── Stage 1: Ideation ────────────────────────────────────────────────
 
+    @workspace_writer
+    @_with_book_sources
     async def create_book(
         self,
         *,
         user_intent: str,
+        source_refs: list[dict[str, Any]] | None = None,
         chat_session_id: str = "",
         chat_selections: list[dict[str, Any]] | None = None,
         notebook_refs: list[dict[str, Any]] | None = None,
@@ -208,16 +476,24 @@ class BookEngine:
         question_categories: list[int] | None = None,
         question_entries: list[int] | None = None,
         language: str = "en",
+        fallback_language: str = "en",
+        depth: str = BookDepth.STANDARD.value,
         stream: StreamBus | None = None,
     ) -> tuple[Book, BookProposal]:
         """Capture inputs, run IdeationAgent, persist DRAFT book + proposal."""
         bus = stream or StreamBus()
         bstream = BookStream(bus)
+        language = resolve_book_language(
+            user_intent=user_intent,
+            requested_language=language,
+            fallback_language=fallback_language,
+        )
 
         async with bstream.stage(STAGE_IDEATION):
             await bstream.progress("Capturing inputs…", stage=STAGE_IDEATION)
             book_inputs, ideation_ctx = await build_book_inputs(
                 user_intent=user_intent,
+                source_refs=source_refs,
                 chat_session_id=chat_session_id,
                 chat_selections=chat_selections,
                 notebook_refs=notebook_refs,
@@ -240,6 +516,7 @@ class BookEngine:
                 proposal=proposal,
                 knowledge_bases=book_inputs.knowledge_bases,
                 language=language,
+                depth=_coerce_depth(depth),
                 chapter_count=proposal.estimated_chapters,
             )
             # Capture baseline KB fingerprints immediately so subsequent drift
@@ -278,6 +555,8 @@ class BookEngine:
 
     # ── Stage 2: Spine ───────────────────────────────────────────────────
 
+    @workspace_writer
+    @_with_book_sources
     async def confirm_proposal(
         self,
         *,
@@ -295,7 +574,7 @@ class BookEngine:
             book.title = edited_proposal.title or book.title
             book.description = edited_proposal.description or book.description
 
-        bus = stream or StreamBus()
+        bus = stream or get_book_bus(book_id)
         bstream = BookStream(bus)
 
         proposal = book.proposal or BookProposal(title=book.title)
@@ -319,8 +598,19 @@ class BookEngine:
                         book_id=book.id,
                         proposal=proposal,
                         inputs=inputs,
+                        stream=bus,
                     )
                     self.storage.save_exploration(book.id, exploration)
+                    book.metadata = {
+                        **(book.metadata or {}),
+                        "source_quality": _source_quality_summary(inputs, exploration),
+                    }
+                    if (book.metadata or {}).get("exploration_failed"):
+                        book.metadata = {
+                            k: v
+                            for k, v in book.metadata.items()
+                            if k not in ("exploration_failed", "exploration_error")
+                        }
                     await bstream.book_event(
                         "exploration_ready",
                         {
@@ -335,8 +625,25 @@ class BookEngine:
             except Exception as exc:
                 logger.warning(f"SourceExplorer failed for {book.id}: {exc}")
                 exploration = None
-                await bstream.progress(
-                    "Source exploration unavailable — falling back to proposal-only spine.",
+                book.metadata = {
+                    **(book.metadata or {}),
+                    "exploration_failed": True,
+                    "exploration_error": str(exc)[:400],
+                    "source_quality": _source_quality_summary(
+                        inputs,
+                        None,
+                        error=str(exc),
+                    ),
+                }
+                self.storage.save_book(book)
+                self.storage.append_log(
+                    book_id,
+                    f"source exploration failed, spine built from the proposal alone: {exc}",
+                    op="exploration_failed",
+                )
+                await bstream.book_event(
+                    "exploration_failed",
+                    {"book_id": book.id, "reason": str(exc)[:400]},
                     stage=STAGE_EXPLORATION,
                 )
 
@@ -402,52 +709,45 @@ class BookEngine:
         *,
         stream: StreamBus | None,
     ) -> Spine:
-        """Insert an Overview chapter at position 0 (idempotent)."""
-        # Idempotent guard — already injected?
-        first = spine.chapters[0] if spine.chapters else None
-        already = bool(
-            first
-            and (
-                first.content_type == ContentType.OVERVIEW
-                or (first.__pydantic_extra__ or {}).get("auto_overview") is True
-            )
-        )
-        if already:
+        """Ensure exactly one Overview chapter, first in the spine (idempotent).
+
+        Identity, not position, decides whether one already exists. Keying the
+        guard on ``chapters[0]`` meant any caller that handed the spine back
+        with the overview elsewhere in the list — the spine editor re-appends
+        hidden chapters after the user's own — silently got a second one on
+        every re-confirm, each with its own page.
+        """
+        existing = [c for c in spine.chapters if _is_auto_overview(c)]
+        if existing:
+            keep, *duplicates = existing
+            if duplicates:
+                logger.warning(
+                    f"book {book.id}: dropping {len(duplicates)} duplicate overview chapter(s)"
+                )
+                dropped = {id(c) for c in duplicates}
+                spine.chapters = [c for c in spine.chapters if id(c) not in dropped]
+            # Re-seat it at the front and renumber, so a spine that came back
+            # out of order still reads correctly.
+            spine.chapters = [keep, *[c for c in spine.chapters if c is not keep]]
+            for index, chapter in enumerate(spine.chapters):
+                chapter.order = index
             return spine
 
-        overview_title = "本书导览" if book.language == "zh" else "How to read this book"
-        objectives = (
-            [
-                "了解整本书的章节脉络",
-                "掌握各章之间的概念依赖关系",
-                "选择最合适的阅读顺序",
-            ]
-            if book.language == "zh"
-            else [
-                "See the full chapter map at a glance",
-                "Understand how concepts depend on each other",
-                "Pick the reading path that fits your goals",
-            ]
-        )
+        copy = overview_copy(book.language)
         overview = Chapter(
-            title=overview_title,
-            learning_objectives=objectives,
+            title=copy["chapter_title"],
+            learning_objectives=list(copy["objectives"]),
             content_type=ContentType.OVERVIEW,
-            summary=(
-                "Auto-generated overview of the book's concept graph and chapter index."
-                if book.language != "zh"
-                else "自动生成的概念图与章节索引，作为本书的入口。"
-            ),
+            summary=copy["chapter_summary"],
             order=0,
         )
         # Mark for idempotency on subsequent runs.
         overview.__pydantic_extra__ = overview.__pydantic_extra__ or {}
         overview.__pydantic_extra__["auto_overview"] = True
 
-        # Re-number existing chapters down by one.
-        for ch in spine.chapters:
-            ch.order = ch.order + 1
         spine.chapters = [overview, *spine.chapters]
+        for index, chapter in enumerate(spine.chapters):
+            chapter.order = index
         return spine
 
     async def _materialize_overview_page(
@@ -469,7 +769,7 @@ class BookEngine:
         if overview_page is None or overview_page.status == PageStatus.READY:
             return
 
-        zh = book.language == "zh"
+        copy = overview_copy(book.language)
         chapter_index = [
             {
                 "id": ch.id,
@@ -485,29 +785,17 @@ class BookEngine:
         ]
 
         # 1) Intro text block (pre-rendered, status=READY)
-        intro_md = (
-            (
-                f"# {book.title or '本书'}\n\n"
-                f"{(book.proposal.description if book.proposal else '') or ''}\n\n"
-                f"下方的概念图展示了本书 {len(spine.concept_graph.nodes)} 个核心概念以及"
-                f"它们之间的依赖关系；再下方是 {len(chapter_index)} 个章节的入口。"
-                f"你可以按从上到下的顺序阅读，也可以根据自己的兴趣或先验知识选择切入点。"
-            )
-            if zh
-            else (
-                f"# {book.title or 'This book'}\n\n"
-                f"{(book.proposal.description if book.proposal else '') or ''}\n\n"
-                f"The diagram below maps the {len(spine.concept_graph.nodes)} core "
-                f"concepts in this book and how they depend on each other. The "
-                f"chapter index that follows lists all {len(chapter_index)} "
-                f"chapters — read top-to-bottom for the recommended path, or jump "
-                f"straight to whatever you're most curious about."
-            )
+        description = (book.proposal.description if book.proposal else "") or ""
+        intro_md = f"# {book.title or copy['untitled_book']}\n\n{description}\n\n" + copy[
+            "intro_body"
+        ].format(
+            concepts=len(spine.concept_graph.nodes),
+            chapters=len(chapter_index),
         )
         intro_block = Block(
             type=BlockType.TEXT,
             status=BlockStatus.READY,
-            title=("如何阅读这本书" if zh else "How to read this book"),
+            title=copy["intro_title"],
             params={"role": "overview_intro"},
             payload={"content": intro_md, "format": "markdown"},
         )
@@ -518,7 +806,7 @@ class BookEngine:
         graph_block = Block(
             type=BlockType.CONCEPT_GRAPH,
             status=BlockStatus.READY,
-            title=("概念图" if zh else "Concept map"),
+            title=copy["concept_map_title"],
             params={
                 "concept_graph": spine.concept_graph.model_dump(),
                 "chapter_index": chapter_index,
@@ -550,35 +838,59 @@ class BookEngine:
             if entry.get("summary"):
                 line += f" — {entry['summary']}"
             index_lines.append(line)
-        index_md = ("## 章节索引\n\n" if zh else "## Chapter index\n\n") + "\n".join(index_lines)
+        index_md = copy["chapter_index_heading"] + "\n\n" + "\n".join(index_lines)
         index_block = Block(
             type=BlockType.TEXT,
             status=BlockStatus.READY,
-            title=("章节索引" if zh else "Chapter index"),
+            title=copy["chapter_index_title"],
             params={"role": "chapter_index"},
             payload={"content": index_md, "format": "markdown"},
         )
 
-        overview_page.blocks = [intro_block, graph_block, index_block]
+        # This page is rebuilt from scratch every time the spine changes, which
+        # is the one place ``edited_by_user`` protection cannot reach — the
+        # blocks are replaced wholesale rather than reset. Carry the reader's
+        # own content across: a hand-edited deterministic block wins over its
+        # freshly rendered replacement, and notes are appended.
+        edited_by_role: dict[str, Block] = {}
+        notes: list[Block] = []
+        for existing in overview_page.blocks:
+            if existing.type == BlockType.USER_NOTE:
+                notes.append(existing)
+            elif (existing.metadata or {}).get("edited_by_user"):
+                role = str((existing.params or {}).get("role") or existing.type.value)
+                edited_by_role[role] = existing
+
+        def _keep(block: Block, role: str) -> Block:
+            return edited_by_role.get(role, block)
+
+        overview_page.blocks = [
+            _keep(intro_block, "overview_intro"),
+            _keep(graph_block, BlockType.CONCEPT_GRAPH.value),
+            _keep(index_block, "chapter_index"),
+            *notes,
+        ]
         overview_page.status = PageStatus.READY
         overview_page.content_type = ContentType.OVERVIEW
         self.storage.save_page(overview_page)
 
-        if stream is not None:
-            bstream = BookStream(stream)
-            await bstream.book_event(
-                "overview_ready",
-                {
-                    "book_id": book.id,
-                    "page_id": overview_page.id,
-                    "node_count": len(spine.concept_graph.nodes),
-                    "chapter_count": len(chapter_index),
-                },
-                stage=STAGE_OVERVIEW,
-            )
+        # Publish to the book's own stream. Guarding on ``stream is not None``
+        # silently dropped this event once callers stopped passing a bus.
+        await BookStream(stream or get_book_bus(book.id)).book_event(
+            "overview_ready",
+            {
+                "book_id": book.id,
+                "page_id": overview_page.id,
+                "node_count": len(spine.concept_graph.nodes),
+                "chapter_count": len(chapter_index),
+            },
+            stage=STAGE_OVERVIEW,
+        )
 
     # ── Stage 3: confirm spine + create page shells ─────────────────────
 
+    @workspace_writer
+    @_with_book_sources
     async def confirm_spine(
         self,
         *,
@@ -603,11 +915,18 @@ class BookEngine:
             raise ValueError(f"No spine for book {book_id}")
         if edited_spine is not None:
             spine.book_id = book_id
-            self.storage.save_spine(spine)
+
+        # Chapters the reader deleted must not survive on the concept map.
+        dropped = _prune_concept_graph(spine)
+        if dropped:
+            self.storage.append_log(
+                book_id,
+                f"pruned {dropped} concept-graph node(s) for deleted chapters",
+                op="confirm_spine",
+            )
 
         # ── Inject Overview chapter (idempotent) ─────────────────────
         spine = await self._ensure_overview_chapter(spine, book, stream=stream)
-        self.storage.save_spine(spine)
 
         existing = {p.chapter_id: p for p in self.storage.list_pages(book_id)}
         pages: list[Page] = []
@@ -625,14 +944,44 @@ class BookEngine:
                 )
                 self.storage.save_page(page)
                 chapter.page_ids = [page.id]
-                self.storage.save_spine(spine)
+            elif (
+                page.order != chapter.order
+                or page.title != chapter.title
+                or page.content_type != chapter.content_type
+            ):
+                # A re-confirm after editing the spine has to carry the edits
+                # onto pages that already exist, or reordering and renaming
+                # chapters changes nothing the reader can see: pages are sorted
+                # by ``order`` (storage.list_pages) and titled from the page.
+                page.order = chapter.order
+                page.title = chapter.title
+                page.content_type = chapter.content_type
+                page.learning_objectives = list(chapter.learning_objectives)
+                page.updated_at = time.time()
+                self.storage.save_page(page)
             pages.append(page)
+        pages.sort(key=lambda p: (p.order, p.created_at))
+        # Persist assigned page ids once. Previously the growing spine was
+        # rewritten after every new chapter shell.
+        self.storage.save_spine(spine)
 
         # Build the Overview page eagerly (no LLM, no queue).
         await self._materialize_overview_page(spine, pages, book, stream=stream)
 
         book.page_count = len(pages)
-        book.status = BookStatus.COMPILING if auto_compile else BookStatus.SPINE_READY
+        book.status = BookStatus.COMPILING
+        metadata = {
+            k: v
+            for k, v in (book.metadata or {}).items()
+            if k not in {"pause_reason", "pause_kind"}
+        }
+        metadata["lazy_compile"] = not auto_compile
+        # When this run started, durably. The reader's clock used to count
+        # from the first event *their tab* happened to see, so reloading
+        # mid-compile restarted it at zero — a number that measured how long
+        # the page had been open and claimed to measure the run.
+        metadata["compile_started_at"] = time.time()
+        book.metadata = metadata
         self.storage.save_book(book)
         self.storage.append_log(
             book_id,
@@ -641,8 +990,184 @@ class BookEngine:
         )
 
         if auto_compile:
-            await self._enqueue_pending_pages(book_id, pages, stream=stream)
+            await self._enqueue_pending_pages(book_id, pages)
         return pages
+
+    async def _halt_compilation(self, book_id: str) -> None:
+        """Stop this book's worker and drain its queue, leaving disk untouched."""
+        runtime = self._runtimes.get(book_id)
+        if runtime is None:
+            return
+        current = asyncio.current_task()
+        cancelled: list[asyncio.Task[Any]] = []
+        async with runtime.lock:
+            if (
+                runtime.worker is not None
+                and runtime.worker is not current
+                and not runtime.worker.done()
+            ):
+                runtime.worker.cancel()
+                cancelled.append(runtime.worker)
+            runtime.worker = None
+            for task in runtime.in_flight.values():
+                if task is not current and not task.done():
+                    task.cancel()
+                    cancelled.append(task)
+            runtime.in_flight.clear()
+            runtime.queued.clear()
+            runtime.consecutive_page_failures = 0
+            while not runtime.queue.empty():
+                try:
+                    runtime.queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+        if cancelled:
+            await asyncio.gather(*cancelled, return_exceptions=True)
+        async with self._global_lock:
+            if self._runtimes.get(book_id) is runtime:
+                self._runtimes.pop(book_id, None)
+
+    async def pause_book(
+        self,
+        *,
+        book_id: str,
+        reason: str = "Paused by user.",
+    ) -> list[Page]:
+        """Durably pause generation and cancel all work already in flight.
+
+        The manifest is written first, so even a process termination during
+        cancellation cannot make the next ``deeptutor start`` auto-resume the
+        book. Generated blocks remain intact; only pages stranded in transient
+        in-flight states are reset to ``PENDING`` for an explicit resume.
+        """
+        book = self.storage.load_book(book_id)
+        if book is None:
+            raise ValueError(f"Book {book_id} not found")
+        if self.storage.load_spine(book_id) is None:
+            raise ValueError(f"No spine for book {book_id}")
+
+        book.status = BookStatus.PAUSED
+        book.metadata = {
+            **(book.metadata or {}),
+            "pause_reason": reason,
+            "pause_kind": "user",
+        }
+        book.updated_at = time.time()
+        self.storage.save_book(book)
+
+        await self._halt_compilation(book_id)
+
+        pages = self.storage.list_pages(book_id)
+        for page in pages:
+            if page.status in (PageStatus.PLANNING, PageStatus.GENERATING):
+                page.status = PageStatus.PENDING
+                page.error = ""
+                page.updated_at = time.time()
+                self.storage.save_page(page)
+
+        self.storage.append_log(book_id, "compilation paused by user", op="paused")
+        await BookStream(get_book_bus(book_id)).book_event(
+            "compilation_paused",
+            {"book_id": book_id, "reason": reason, "manual": True},
+            stage=STAGE_COMPILATION,
+        )
+        return self.storage.list_pages(book_id)
+
+    async def resume_book(
+        self,
+        *,
+        book_id: str,
+        stream: StreamBus | None = None,
+    ) -> list[Page]:
+        """Re-queue every page that never finished, keeping what already exists.
+
+        The non-destructive counterpart to :meth:`rebuild_book`. Three things
+        need it and previously had only "delete everything and start over":
+
+        - a process restart (per-book runtimes live in memory only),
+        - a paused book once the user has topped up their quota,
+        - a page stranded in ``PLANNING``/``GENERATING`` by a crash.
+
+        Pages that are already ``READY`` are left exactly as they are, so
+        resuming costs only the work that is genuinely missing.
+        """
+        book = self.storage.load_book(book_id)
+        if book is None:
+            raise ValueError(f"Book {book_id} not found")
+        if self.storage.load_spine(book_id) is None:
+            raise ValueError(f"No spine for book {book_id}")
+
+        # A page left mid-flight by a crash would otherwise be skipped by the
+        # queue's "already generating" checks forever.
+        pages = self.storage.list_pages(book_id)
+        for page in pages:
+            if page.status in (PageStatus.PLANNING, PageStatus.GENERATING):
+                page.status = PageStatus.PENDING
+                page.updated_at = time.time()
+                self.storage.save_page(page)
+
+        pending = [p for p in pages if p.status in _UNFINISHED_PAGE_STATUSES]
+        if not pending:
+            await self._maybe_finalize_book(book_id)
+            return pages
+
+        book.status = BookStatus.COMPILING
+        book.metadata = {
+            k: v
+            for k, v in (book.metadata or {}).items()
+            if k not in {"pause_reason", "pause_kind"}
+        }
+        # Resuming starts a new run: the clock counts this stretch of work,
+        # not the wall time since the book was first confirmed.
+        book.metadata["compile_started_at"] = time.time()
+        book.updated_at = time.time()
+        self.storage.save_book(book)
+        self.storage.append_log(
+            book_id, f"resume requested ({len(pending)} unfinished pages)", op="resume"
+        )
+
+        await self._enqueue_pending_pages(book_id, pending)
+        return self.storage.list_pages(book_id)
+
+    async def maybe_resume_on_open(self, book_id: str) -> bool:
+        """Restart stalled compilation when the reader opens a book.
+
+        ``PathService`` resolves per current user, so a process-wide sweep at
+        startup cannot even enumerate other users' books. Opening a book is the
+        natural, correctly-scoped trigger instead: it runs as that user and
+        only touches the book they actually care about.
+
+        Deliberately does *not* resume a ``PAUSED`` book — that one stopped for
+        a reason the user has to clear first, and silently retrying would burn
+        the quota they just ran out of. Returns whether work was queued.
+        """
+        book = self.storage.load_book(book_id)
+        if book is None or book.status != BookStatus.COMPILING:
+            return False
+
+        if (book.metadata or {}).get("lazy_compile"):
+            # The reader asked for chapters to be built as they open them.
+            # Resuming would queue the whole book and defeat that choice.
+            return False
+
+        runtime = self._runtimes.get(book_id)
+        if runtime is not None:
+            # Liveness, not queue depth. A queue with items in it and no worker
+            # draining them is exactly the state that needs rescuing — reading
+            # ``queued`` as proof of progress left such a book wedged at
+            # COMPILING for the life of the process.
+            if runtime.in_flight:
+                return False
+            if runtime.worker is not None and not runtime.worker.done():
+                return False
+        try:
+            await self.resume_book(book_id=book_id)
+        except ValueError:
+            return False
+        except Exception:  # noqa: BLE001
+            logger.warning(f"auto-resume failed for {book_id}", exc_info=True)
+            return False
+        return True
 
     async def rebuild_book(
         self,
@@ -657,18 +1182,7 @@ class BookEngine:
         if book is None or spine is None:
             raise ValueError(f"Cannot rebuild book – missing book/spine ({book_id})")
 
-        runtime = self._runtimes.get(book_id)
-        if runtime is not None:
-            async with runtime.lock:
-                if runtime.worker is not None and not runtime.worker.done():
-                    runtime.worker.cancel()
-                    runtime.worker = None
-                runtime.queued.clear()
-                while not runtime.queue.empty():
-                    try:
-                        runtime.queue.get_nowait()
-                    except asyncio.QueueEmpty:
-                        break
+        await self._halt_compilation(book_id)
 
         for page in self.storage.list_pages(book_id):
             self.storage.delete_page(book_id, page.id)
@@ -704,12 +1218,80 @@ class BookEngine:
         stream: StreamBus | None = None,
         force: bool = False,
     ) -> Page:
-        """Drive the compiler for one page (used when a user opens it)."""
+        """Compile one page, coalescing concurrent requests for the same page.
+
+        Three call sites can ask for the same page at once — the user opening
+        it, the background worker reaching it, and a forced regenerate. Without
+        coalescing they each run a full plan-and-generate pass, pay for it, and
+        then race to persist, so the loser's output is silently discarded.
+
+        A plain request *joins* the run already in flight. A forced one waits
+        for that run to finish and then starts a clean pass, so a regenerate
+        never interleaves with the generation it is meant to replace.
+        """
+        self._require_generation_allowed(book_id)
+        runtime = await self._get_or_create_runtime(book_id)
+
+        while True:
+            async with runtime.lock:
+                running = runtime.in_flight.get(page_id)
+                if running is None or running.done():
+                    task = asyncio.create_task(
+                        self._compile_page_now(
+                            book_id=book_id,
+                            page_id=page_id,
+                            stream=stream,
+                            force=force,
+                        )
+                    )
+                    runtime.in_flight[page_id] = task
+                    task.add_done_callback(partial(self._release_in_flight, runtime, page_id))
+                    break
+                if not force:
+                    task = running
+                    break
+                joined = running
+            # Outside the lock: let the in-flight pass finish, then loop round
+            # and claim the slot for the forced rebuild. ``asyncio.wait`` never
+            # re-raises, which is what we want — we only care that it ended.
+            await asyncio.wait({joined})
+
+        # Shielded: awaiting a task propagates the awaiter's cancellation *into*
+        # that task, so one caller going away — a closed WebSocket, a client
+        # that navigated on — would otherwise kill a run that other awaiters and
+        # the background worker are relying on. Compilation persists its own
+        # output, so it is always right to let it finish; the ways to genuinely
+        # stop it (``_halt_compilation``, ``delete_book``) cancel the task
+        # directly.
+        return await asyncio.shield(task)
+
+    @staticmethod
+    def _release_in_flight(runtime: _BookRuntime, page_id: str, task: asyncio.Task[Page]) -> None:
+        """Drop *page_id* from the in-flight table once *task* settles.
+
+        Keyed on identity so a task that has already been replaced by a forced
+        rebuild cannot evict its successor.
+        """
+        if runtime.in_flight.get(page_id) is task:
+            runtime.in_flight.pop(page_id, None)
+
+    @workspace_writer
+    @_with_book_sources
+    async def _compile_page_now(
+        self,
+        *,
+        book_id: str,
+        page_id: str,
+        stream: StreamBus | None = None,
+        force: bool = False,
+    ) -> Page:
+        """Drive the compiler for one page. Always run via :meth:`compile_page`."""
         book = self.storage.load_book(book_id)
         spine = self.storage.load_spine(book_id)
         page = self.storage.load_page(book_id, page_id)
         if book is None or spine is None or page is None:
             raise ValueError(f"Cannot compile page – missing book/spine/page ({book_id}/{page_id})")
+        self._require_generation_allowed(book_id, book)
         if page.status == PageStatus.READY and not force:
             return page
 
@@ -735,7 +1317,7 @@ class BookEngine:
         if chapter is None:
             raise ValueError(f"Page {page_id} references unknown chapter {page.chapter_id}")
 
-        bus = stream or StreamBus()
+        bus = stream or get_book_bus(book_id)
         bstream = BookStream(bus)
 
         try:
@@ -747,6 +1329,7 @@ class BookEngine:
                     stream=bstream,
                     knowledge_bases=book.knowledge_bases,
                     language=book.language,
+                    depth=book.depth.value,
                 )
         except Exception as exc:
             self._mark_page_error(page, exc, prefix="Compilation failed")
@@ -770,34 +1353,35 @@ class BookEngine:
 
     # ── Background compilation queue ─────────────────────────────────────
 
-    async def _enqueue_pending_pages(
-        self,
-        book_id: str,
-        pages: list[Page],
-        *,
-        stream: StreamBus | None = None,
-    ) -> None:
-        runtime = await self._get_or_create_runtime(book_id, stream)
-        async with runtime.lock:
-            for page in pages:
-                if page.status == PageStatus.READY:
-                    continue
-                if page.id in runtime.queued:
-                    continue
-                runtime.queued.add(page.id)
-                await runtime.queue.put(page.id)
-            self._ensure_worker(book_id)
+    async def _enqueue_pending_pages(self, book_id: str, pages: list[Page]) -> None:
+        while True:
+            runtime = await self._get_or_create_runtime(book_id)
+            async with runtime.lock:
+                # An idle worker retires its runtime under the same two locks in
+                # the same order. If it did so between our lookup and this
+                # acquisition, we would be queueing into an orphan that nothing
+                # drains — take the live runtime and try again.
+                async with self._global_lock:
+                    if self._runtimes.get(book_id) is not runtime:
+                        continue
 
-    async def _get_or_create_runtime(self, book_id: str, stream: StreamBus | None) -> _BookRuntime:
+                runtime.consecutive_page_failures = 0
+                for page in pages:
+                    if page.status == PageStatus.READY:
+                        continue
+                    if page.id in runtime.queued:
+                        continue
+                    runtime.queued.add(page.id)
+                    await runtime.queue.put(page.id)
+                self._ensure_worker(book_id)
+                return
+
+    async def _get_or_create_runtime(self, book_id: str) -> _BookRuntime:
         async with self._global_lock:
             runtime = self._runtimes.get(book_id)
             if runtime is None:
                 runtime = _BookRuntime()
                 self._runtimes[book_id] = runtime
-            if stream is not None and runtime.stream is None:
-                runtime.stream = BookStream(stream)
-            elif runtime.stream is None:
-                runtime.stream = BookStream(StreamBus())
             return runtime
 
     def _mark_page_error(self, page: Page | None, exc: Exception, *, prefix: str) -> None:
@@ -828,20 +1412,50 @@ class BookEngine:
             return
         if runtime.worker is not None and not runtime.worker.done():
             return
-        runtime.worker = asyncio.create_task(self._worker_loop(book_id))
+        from deeptutor.services.workspace.activity import acquire_activity
+
+        activity = acquire_activity()
+        try:
+            runtime.worker = asyncio.create_task(self._worker_loop(book_id))
+        except BaseException:
+            activity.close()
+            raise
+        runtime.worker.add_done_callback(lambda _done: activity.close())
 
     async def _worker_loop(self, book_id: str) -> None:
+        from deeptutor.services.workspace.activity import data_activity
+
+        with data_activity():
+            await self._worker_loop_active(book_id)
+
+    async def _worker_loop_active(self, book_id: str) -> None:
         runtime = self._runtimes.get(book_id)
         if runtime is None:
             return
-        bstream = runtime.stream or BookStream(StreamBus())
+
+        # A task inherits the context it was created in, and this one is created
+        # inside whichever request happened to enqueue first. That request may
+        # have installed a scoped LLM config (a per-run model pick); without
+        # clearing it, every chapter this worker compiles for the rest of its
+        # life would silently use that one request's model. Background
+        # compilation belongs to the book, not to the call that started it, so
+        # it runs against the user's current configuration.
+        from deeptutor.services.llm.config import set_scoped_llm_config
+
+        set_scoped_llm_config(None)
         while True:
             try:
                 page_id = await asyncio.wait_for(runtime.queue.get(), timeout=2.0)
             except asyncio.TimeoutError:
                 async with runtime.lock:
-                    if runtime.queue.empty():
+                    if runtime.queue.empty() and not runtime.in_flight:
                         runtime.worker = None
+                        async with self._global_lock:
+                            if self._runtimes.get(book_id) is runtime:
+                                self._runtimes.pop(book_id, None)
+                        from deeptutor.runtime.memory_reclaim import schedule_memory_reclaim
+
+                        schedule_memory_reclaim()
                         return
                 continue
 
@@ -850,27 +1464,29 @@ class BookEngine:
             # the UnboundLocalError would kill this worker task) nor stale from
             # a previous iteration (the wrong page would be flipped to ERROR).
             page = None
+            tripped = False
             try:
-                book = self.storage.load_book(book_id)
-                spine = self.storage.load_spine(book_id)
                 page = self.storage.load_page(book_id, page_id)
-                if book is None or spine is None or page is None:
+                if page is None or page.status == PageStatus.READY:
                     continue
-                if page.status == PageStatus.READY:
-                    continue
-                chapter = spine.chapter_by_id(page.chapter_id)
-                if chapter is None:
-                    continue
-                await self.compiler.compile_page(
-                    book_id=book_id,
-                    chapter=chapter,
-                    page=page,
-                    stream=bstream,
-                    knowledge_bases=book.knowledge_bases,
-                    language=book.language,
-                )
+                # Go through the coalescing entry point rather than straight to
+                # the compiler: if the reader just opened this very page, both
+                # requests must land on one run instead of two.
+                compiled = await self.compile_page(book_id=book_id, page_id=page_id)
+                tripped = await self._record_page_outcome(runtime, book_id, compiled)
             except asyncio.CancelledError:
                 raise
+            except BookPausedError:
+                if page is not None and page.status in (
+                    PageStatus.PLANNING,
+                    PageStatus.GENERATING,
+                ):
+                    page.status = PageStatus.PENDING
+                    page.error = ""
+                    page.updated_at = time.time()
+                    self.storage.save_page(page)
+                runtime.worker = None
+                return
             except Exception as exc:
                 logger.warning(
                     f"Background compilation failed for {book_id}/{page_id}: {exc}",
@@ -888,13 +1504,64 @@ class BookEngine:
                     logger.warning(
                         f"Failed to append compile-error log for {book_id}", exc_info=True
                     )
+                tripped = await self._record_page_failure(runtime, book_id, str(exc))
             finally:
                 runtime.queued.discard(page_id)
 
-            try:
-                await self._maybe_finalize_book(book_id)
-            except Exception:
-                logger.warning(f"finalize check failed for {book_id}", exc_info=True)
+            if tripped:
+                runtime.worker = None
+                return
+
+    # ── Compilation breaker ─────────────────────────────────────────────
+
+    async def _record_page_outcome(self, runtime: _BookRuntime, book_id: str, page: Page) -> bool:
+        """Feed a finished background page into the breaker.
+
+        Returns ``True`` when the breaker tripped and the queue was drained.
+        """
+        reason = systemic_failure_reason(page) if page.status == PageStatus.ERROR else ""
+        if not reason:
+            # Any page that produced *something* proves the provider is alive.
+            runtime.consecutive_page_failures = 0
+            return False
+        return await self._record_page_failure(runtime, book_id, reason)
+
+    async def _record_page_failure(self, runtime: _BookRuntime, book_id: str, reason: str) -> bool:
+        runtime.consecutive_page_failures += 1
+        if runtime.consecutive_page_failures < CONSECUTIVE_PAGE_FAILURE_LIMIT:
+            return False
+        await self._pause_compilation(runtime, book_id, reason)
+        return True
+
+    async def _pause_compilation(self, runtime: _BookRuntime, book_id: str, reason: str) -> None:
+        """Stop compiling this book and tell the reader why.
+
+        Whatever is already on disk is kept: pausing leaves untouched pages
+        ``PENDING`` so ``resume_book`` can pick them up verbatim once the user
+        has fixed their quota or credentials.
+        """
+        failure_count = runtime.consecutive_page_failures
+        book = self.storage.load_book(book_id)
+        if book is not None:
+            book.status = BookStatus.PAUSED
+            book.metadata = {
+                **(book.metadata or {}),
+                "pause_reason": reason,
+                "pause_kind": "provider",
+            }
+            book.updated_at = time.time()
+            self.storage.save_book(book)
+        await self._halt_compilation(book_id)
+        self.storage.append_log(
+            book_id,
+            f"compilation paused after {failure_count} consecutive provider failures: {reason}",
+            op="paused",
+        )
+        await BookStream(get_book_bus(book_id)).book_event(
+            "compilation_paused",
+            {"book_id": book_id, "reason": reason},
+            stage=STAGE_COMPILATION,
+        )
 
     async def _maybe_finalize_book(self, book_id: str) -> None:
         book = self.storage.load_book(book_id)
@@ -903,14 +1570,29 @@ class BookEngine:
         pages = self.storage.list_pages(book_id)
         if not pages:
             return
-        if all(p.status == PageStatus.READY for p in pages):
+        if not any(p.status in _UNFINISHED_PAGE_STATUSES for p in pages):
+            # Every page has settled — READY, or PARTIAL with blocks that will
+            # not come back. The book is as done as it is going to get.
             if book.status != BookStatus.READY:
                 book.status = BookStatus.READY
+                book.metadata = {
+                    k: v
+                    for k, v in (book.metadata or {}).items()
+                    if k not in {"pause_reason", "pause_kind"}
+                }
                 self.storage.save_book(book)
                 self.storage.append_log(book_id, "all pages ready → status=READY", op="finalize")
+                # Without this the reader never learns the book finished:
+                # the last page event fires while the book is still COMPILING.
+                await BookStream(get_book_bus(book_id)).book_event(
+                    "book_ready",
+                    {"book_id": book_id, "page_count": len(pages)},
+                    stage=STAGE_COMPILATION,
+                )
 
     # ── Block-level controls (Phase 1: regenerate single block) ─────────
 
+    @_with_book_sources
     async def regenerate_block(
         self,
         *,
@@ -926,6 +1608,7 @@ class BookEngine:
         page = self.storage.load_page(book_id, page_id)
         if book is None or spine is None or page is None:
             return None
+        self._require_generation_allowed(book_id, book)
         chapter = spine.chapter_by_id(page.chapter_id)
         if chapter is None:
             return None
@@ -935,7 +1618,7 @@ class BookEngine:
         if params_override:
             block.params = {**block.params, **params_override}
 
-        bus = stream or StreamBus()
+        bus = stream or get_book_bus(book_id)
         bstream = BookStream(bus)
 
         from .blocks.base import BlockContext, get_block_registry
@@ -965,6 +1648,11 @@ class BookEngine:
 
         async with bstream.stage(STAGE_COMPILATION):
             await generator.generate(ctx)
+            # The content is machine-written again, so the reader's edit is
+            # gone; leaving the flag set would make force-regenerate skip this
+            # block for the rest of the book's life.
+            if block.metadata:
+                block.metadata.pop("edited_by_user", None)
             if block.status.value == "ready":
                 await self.compiler.attach_bridge_text(
                     block,
@@ -989,10 +1677,12 @@ class BookEngine:
             return {"book_id": book_id, "has_drift": False, "missing": True}
         return report.to_dict()
 
-    def refresh_kb_fingerprints(self, book_id: str) -> dict[str, Any] | None:
+    def refresh_kb_fingerprints(
+        self, book_id: str, *, force: bool = False
+    ) -> dict[str, Any] | None:
         from .kb_health import refresh_book_fingerprints
 
-        book = refresh_book_fingerprints(book_id, storage=self.storage)
+        book = refresh_book_fingerprints(book_id, storage=self.storage, force=force)
         if book is None:
             return None
         return {
@@ -1006,8 +1696,107 @@ class BookEngine:
 
         return scan_log_health(book_id, storage=self.storage).to_dict()
 
+    def is_worker_live(self, book_id: str) -> bool:
+        """Is something in *this process* actually compiling *book_id* right now?
+
+        ``status == COMPILING`` is a stored fact and outlives the process that
+        set it: restart the backend mid-compile and the manifest still claims
+        the book is being written while no queue, worker or task exists. The
+        runtime table is the only honest answer, so callers that want to tell
+        "working" from "abandoned" have to ask it rather than the manifest.
+        """
+
+        # `getattr`: embedders and focused tests build the engine with
+        # ``__new__`` and only wire ``storage``, and a diagnostics read must
+        # not be the thing that raises on them.
+        runtime = (getattr(self, "_runtimes", None) or {}).get(book_id)
+        if runtime is None:
+            return False
+        worker = runtime.worker
+        if worker is not None and not worker.done():
+            return True
+        return any(not task.done() for task in runtime.in_flight.values())
+
+    def generation_overview(self, book: Book) -> dict[str, Any]:
+        """Manifest-only generation state, cheap enough for the library."""
+
+        source_quality = (book.metadata or {}).get("source_quality")
+        compiling = book.status == BookStatus.COMPILING
+        working = compiling and self.is_worker_live(book.id)
+        return {
+            "status": book.status.value,
+            "can_resume": book.status
+            in {BookStatus.COMPILING, BookStatus.PAUSED, BookStatus.ERROR},
+            "pause_reason": str((book.metadata or {}).get("pause_reason") or ""),
+            "source_quality": source_quality if isinstance(source_quality, dict) else None,
+            # Live now, versus "says compiling but nobody is compiling it".
+            "working": working,
+            "interrupted": compiling and not working,
+            # Epoch seconds this compile run began, so every viewer's clock
+            # agrees and survives a reload. 0 when no run has started.
+            "started_at": float((book.metadata or {}).get("compile_started_at") or 0.0),
+        }
+
+    def generation_summary(
+        self,
+        book_id: str,
+        *,
+        book: Book | None = None,
+        pages: list[Page] | None = None,
+    ) -> dict[str, Any]:
+        """Actionable generation, retry, source, and failure diagnostics."""
+
+        book = book or self.storage.load_book(book_id)
+        if book is None:
+            return {"book_id": book_id, "status": "missing"}
+        pages = pages if pages is not None else self.storage.list_pages(book_id)
+        page_counts = {status.value: 0 for status in PageStatus}
+        failed_blocks = 0
+        categories: dict[str, int] = {}
+        for page in pages:
+            page_counts[page.status.value] += 1
+            errors = [page.error] if page.error else []
+            for block in page.blocks:
+                if block.status == BlockStatus.ERROR:
+                    failed_blocks += 1
+                    if block.error:
+                        errors.append(block.error)
+            for error in errors:
+                category = _generation_error_category(error)
+                categories[category] = categories.get(category, 0) + 1
+
+        overview = self.generation_overview(book)
+        # Chapters still owed work. Queued is not the same as broken: while a
+        # worker is running these are simply the tail of its queue, and
+        # counting them as "retryable" is what made a healthy book announce
+        # "3 chapters can be retried" the moment it started — a failure
+        # warning on zero failures.
+        queued = sum(
+            page_counts[status.value]
+            for status in (PageStatus.PENDING, PageStatus.PLANNING, PageStatus.GENERATING)
+        )
+        failed = page_counts[PageStatus.ERROR.value]
+        # Owed chapters become the reader's problem only when nothing is going
+        # to pick them up: paused, errored, or a compile the process lost.
+        stalled = 0 if overview["working"] else queued
+        retryable = failed + stalled
+        return {
+            "book_id": book.id,
+            **overview,
+            "pages": {"total": len(pages), **page_counts},
+            "failed_blocks": failed_blocks,
+            "retryable_pages": retryable,
+            # Kept apart so the UI can say "2 queued" without an alarm and
+            # "1 failed" with one.
+            "queued_pages": queued,
+            "failed_pages": failed,
+            "can_resume": bool(retryable) and bool(overview["can_resume"]),
+            "failure_categories": categories,
+        }
+
     # ── Block CRUD operations (Phase 3) ────────────────────────────────
 
+    @_with_book_sources
     async def insert_block(
         self,
         *,
@@ -1022,8 +1811,11 @@ class BookEngine:
         """Insert a fresh PENDING block at *position* (default: end)."""
         spine = self.storage.load_spine(book_id)
         page = self.storage.load_page(book_id, page_id)
-        if spine is None or page is None:
+        book = self.storage.load_book(book_id)
+        if spine is None or page is None or book is None:
             return None
+        if compile_now and block_type != BlockType.USER_NOTE:
+            self._require_generation_allowed(book_id, book)
         chapter = spine.chapter_by_id(page.chapter_id)
         if chapter is None:
             return None
@@ -1051,14 +1843,10 @@ class BookEngine:
                     chapter=chapter,
                     page=page,
                     block=block,
-                    language=self.storage.load_book(book_id).language
-                    if self.storage.load_book(book_id)
-                    else "en",
-                    knowledge_bases=self.storage.load_book(book_id).knowledge_bases
-                    if self.storage.load_book(book_id)
-                    else [],
+                    language=book.language,
+                    knowledge_bases=book.knowledge_bases,
                 )
-                bus = stream or StreamBus()
+                bus = stream or get_book_bus(book_id)
                 bstream = BookStream(bus)
                 async with bstream.stage(STAGE_COMPILATION):
                     await generator.generate(ctx)
@@ -1076,6 +1864,52 @@ class BookEngine:
             book_id,
             f"inserted {block_type.value} block on page {page_id} (pos={position})",
             op="insert_block",
+        )
+        return block
+
+    async def update_block(
+        self,
+        *,
+        book_id: str,
+        page_id: str,
+        block_id: str,
+        title: str | None = None,
+        body: str | None = None,
+    ) -> Block | None:
+        """Edit a block's prose in place, marking it as the reader's own.
+
+        Deliberately limited to title and body. The point is to let someone fix
+        a wrong sentence or write a margin note without gambling on a whole
+        regeneration — not to turn the reader into a block-payload editor.
+
+        The ``edited_by_user`` mark matters: :meth:`_reset_page_for_force_compile`
+        honours it, so a later "regenerate this page" cannot quietly delete
+        something the reader wrote.
+        """
+        page = self.storage.load_page(book_id, page_id)
+        if page is None:
+            return None
+        block = page.block_by_id(block_id)
+        if block is None or block.type not in _EDITABLE_BLOCK_TYPES:
+            return None
+
+        if title is not None:
+            block.title = title
+        if body is not None:
+            block.payload = {
+                **block.payload,
+                _body_key(block): body,
+                "format": "markdown",
+            }
+        block.status = BlockStatus.READY
+        block.error = ""
+        block.metadata = {**(block.metadata or {}), "edited_by_user": True}
+        block.updated_at = time.time()
+
+        self.compiler._finalize_page_status(page)
+        self.storage.save_page(page)
+        self.storage.append_log(
+            book_id, f"edited {block.type.value} block {block_id}", op="edit_block"
         )
         return block
 
@@ -1124,6 +1958,7 @@ class BookEngine:
         params_override: dict[str, Any] | None = None,
         stream: StreamBus | None = None,
     ) -> Block | None:
+        self._require_generation_allowed(book_id)
         spine = self.storage.load_spine(book_id)
         page = self.storage.load_page(book_id, page_id)
         if spine is None or page is None:
@@ -1164,6 +1999,7 @@ class BookEngine:
         parent = self.storage.load_page(book_id, parent_page_id)
         if book is None or spine is None or parent is None:
             return None
+        self._require_generation_allowed(book_id, book)
 
         # Add a synthetic chapter so the planner has a target
         chapter = Chapter(
@@ -1173,6 +2009,12 @@ class BookEngine:
             summary=f"Sub-chapter spawned from {parent.title}.",
             order=len(spine.chapters),
         )
+        # The compiler needs a chapter to plan against, but this one is not part
+        # of the book's structure: the spine editor hides it and a rebuild must
+        # not resurrect it as a top-level chapter. Same marker pattern as
+        # ``auto_overview``.
+        chapter.__pydantic_extra__ = chapter.__pydantic_extra__ or {}
+        chapter.__pydantic_extra__["deep_dive"] = True
         spine.chapters.append(chapter)
         self.storage.save_spine(spine)
 
@@ -1191,11 +2033,25 @@ class BookEngine:
         self.storage.save_spine(spine)
 
         # Add link from parent → sub
+        book.page_count = len(self.storage.list_pages(book_id))
+        book.updated_at = time.time()
+        self.storage.save_book(book)
+
         parent.links.append(PageLink(target_page_id=sub.id, relation="deepens", label=topic))
         if block_id:
             block = parent.block_by_id(block_id)
             if block is not None:
-                block.metadata = {**block.metadata, "deep_dive_page_id": sub.id}
+                # Keyed by topic: one card offers several, and each can be
+                # expanded independently. The old scalar recorded only the
+                # first and disabled the others.
+                pages_by_topic = dict(block.metadata.get("deep_dive_pages") or {})
+                pages_by_topic[topic] = sub.id
+                block.metadata = {
+                    **block.metadata,
+                    "deep_dive_pages": pages_by_topic,
+                    # Kept for books written before this change.
+                    "deep_dive_page_id": block.metadata.get("deep_dive_page_id") or sub.id,
+                }
         self.storage.save_page(parent)
 
         # Compile the new page now (blocking, so caller gets ready content)
@@ -1209,6 +2065,9 @@ class BookEngine:
 
     # ── Quiz attempts (Phase 3) ────────────────────────────────────────
 
+    def _page_to_chapter(self, book_id: str) -> dict[str, str]:
+        return {p.id: p.chapter_id for p in self.storage.list_pages(book_id) if p.chapter_id}
+
     async def record_quiz_attempt(
         self,
         *,
@@ -1217,24 +2076,32 @@ class BookEngine:
         block_id: str,
         question_id: str,
         user_answer: str,
-        is_correct: bool,
+        is_correct: bool | None,
     ) -> Progress:
-        progress = self.load_progress(book_id)
-        progress.quiz_attempts.append(
-            QuizAttempt(
-                block_id=block_id,
-                page_id=page_id,
-                question_id=question_id,
-                user_answer=user_answer,
-                is_correct=is_correct,
-            )
+        progress = progress_ops.record_attempt(
+            self.load_progress(book_id),
+            page_id=page_id,
+            block_id=block_id,
+            question_id=question_id,
+            user_answer=user_answer,
+            is_correct=is_correct,
+            page_to_chapter=self._page_to_chapter(book_id),
         )
-        if not is_correct:
-            page = self.storage.load_page(book_id, page_id)
-            if page and page.chapter_id and page.chapter_id not in progress.weak_chapters:
-                progress.weak_chapters.append(page.chapter_id)
-        else:
-            progress.score += 1
+        self.storage.save_progress(progress)
+        return progress
+
+    # ── Reading position / bookmarks ────────────────────────────────────
+
+    def mark_page_visited(self, *, book_id: str, page_id: str) -> Progress:
+        """Remember where the reader is, so they can pick the book back up."""
+        progress = self.load_progress(book_id)
+        if progress_ops.mark_visited(progress, page_id):
+            self.storage.save_progress(progress)
+        return progress
+
+    def toggle_page_bookmark(self, *, book_id: str, page_id: str) -> Progress:
+        progress = self.load_progress(book_id)
+        progress_ops.toggle_bookmark(progress, page_id)
         self.storage.save_progress(progress)
         return progress
 
@@ -1246,26 +2113,51 @@ class BookEngine:
         topic: str,
         stream: StreamBus | None = None,
     ) -> Block | None:
-        """Append an extra TEXT + QUIZ block when the user struggles."""
+        """Append a pitfall callout + worked explanation + an easier quiz.
+
+        Idempotent per topic: asking twice returns the existing remediation
+        rather than stacking a second copy onto the page. Three generated
+        blocks per request is expensive enough that a double-click, a retry, or
+        a second reader hitting the same wall must not pay for it twice.
+        """
+        self._require_generation_allowed(book_id)
+        page = self.storage.load_page(book_id, page_id)
+        if page is None:
+            return None
+
+        clean_topic = (topic or "").strip()
+        existing = next(
+            (
+                block
+                for block in page.blocks
+                if block.params.get("role") == "remediation"
+                and str(block.params.get("topic") or "").strip() == clean_topic
+            ),
+            None,
+        )
+        if existing is not None:
+            return existing
+
         await self.insert_block(
             book_id=book_id,
             page_id=page_id,
             block_type=BlockType.CALLOUT,
-            params={"variant": "common_pitfall", "topic": topic},
+            params={"variant": "common_pitfall", "topic": clean_topic},
             stream=stream,
         )
+        # The marker block the idempotency check above looks for.
         await self.insert_block(
             book_id=book_id,
             page_id=page_id,
             block_type=BlockType.TEXT,
-            params={"role": "remediation", "topic": topic},
+            params={"role": "remediation", "topic": clean_topic},
             stream=stream,
         )
         return await self.insert_block(
             book_id=book_id,
             page_id=page_id,
             block_type=BlockType.QUIZ,
-            params={"num_questions": 2, "difficulty": "easy", "topic": topic},
+            params={"num_questions": 2, "difficulty": "easy", "topic": clean_topic},
             stream=stream,
         )
 

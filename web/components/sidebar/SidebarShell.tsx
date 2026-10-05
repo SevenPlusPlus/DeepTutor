@@ -1,127 +1,85 @@
 "use client";
 
+import { navigateTask } from "@/lib/workspace-scope";
 import Image from "next/image";
+import dynamic from "next/dynamic";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { useEffect, useState, type ReactNode } from "react";
-import { useAppShell } from "@/context/AppShellContext";
 import {
-  BookOpen,
-  BookText,
-  Bot,
-  Brain,
-  ChevronDown,
-  Github,
-  HeartHandshake,
-  House,
-  LayoutGrid,
-  Library,
-  Lock,
-  PanelLeftClose,
-  PanelLeftOpen,
-  PenLine,
-  Settings,
-  type LucideIcon,
-} from "lucide-react";
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type ReactNode,
+  type CSSProperties,
+} from "react";
+import { useAppShell } from "@/context/AppShellContext";
+import { PanelLeftClose, PanelLeftOpen } from "lucide-react";
 import { useTranslation } from "react-i18next";
+import { useChatWorkspaces } from "@/hooks/useChatWorkspaces";
 import SessionList from "@/components/SessionList";
+import { useSidebarDrawer } from "@/components/layout/AppShell";
+import { useDevice } from "@/hooks/useDevice";
 import { VersionBadge } from "@/components/sidebar/VersionBadge";
-import type { SessionSummary } from "@/lib/session-api";
-import { Tooltip } from "@/components/ui/Tooltip";
-import { useCapabilityAccess } from "@/components/access/CapabilityAccessContext";
-import type { Capability } from "@/lib/capability-routes";
+import type {
+  SessionOrganizationPatch,
+  SessionSummary,
+} from "@/lib/session-api";
+import type { MasteryTopicLabel } from "@/lib/learning-api";
+import type { ReadingCollectionLabel } from "@/lib/reading-workspace-api";
+import type { StudyCourse } from "@/lib/courses-api";
+import { useSidebarResize } from "@/hooks/useSidebarResize";
+import { SidebarHome, SidebarNav } from "@/components/sidebar/SidebarNav";
+import { SECONDARY_NAV, isNavActive } from "@/components/sidebar/nav-entries";
+import Tooltip from "@/shared/ui/Tooltip";
+import {
+  mergeManualOrder,
+  readSessionOrder,
+  writeSessionOrder,
+} from "@/lib/sidebar-layout";
 
-interface NavEntry {
-  href: string;
-  label: string;
-  icon: LucideIcon;
-  tooltipKey?: string;
-  /** Model capability this feature needs; locked when the user lacks it. */
-  requires?: Capability;
-}
-
-const PRIMARY_NAV: NavEntry[] = [
+// Session data arrives after mount; defer its organization UI with it so
+// every workspace route does not download it as part of the initial shell.
+const OrganizedSessionList = dynamic(
+  () => import("@/components/courses/OrganizedSessionList"),
   {
-    href: "/home",
-    label: "Home",
-    icon: House,
-    tooltipKey: "Home tooltip",
-    requires: "llm",
+    ssr: false,
+    loading: () => (
+      <div aria-busy="true" className="space-y-1.5 px-2 py-1">
+        {[1, 2, 3].map((i) => (
+          <div
+            key={i}
+            className="h-4 w-3/4 animate-pulse rounded bg-muted/40"
+          />
+        ))}
+      </div>
+    ),
   },
-  {
-    href: "/partners",
-    label: "Partners",
-    icon: HeartHandshake,
-    tooltipKey: "Partners tooltip",
-    requires: "llm",
-  },
-  {
-    // My Agents is its own top-level feature (pulled out of the Learning
-    // Space): connect a live local Claude Code / Codex to consult in chat,
-    // and manage imported agent conversations. Ungated — managing connections
-    // and imports needs no per-user model grant.
-    href: "/agents",
-    label: "My Agents",
-    icon: Bot,
-    tooltipKey: "Agents tooltip",
-  },
-  {
-    href: "/co-writer",
-    label: "Co-Writer",
-    icon: PenLine,
-    tooltipKey: "Co-Writer tooltip",
-    requires: "llm",
-  },
-  {
-    href: "/book",
-    label: "Book",
-    icon: Library,
-    tooltipKey: "Book tooltip",
-    requires: "llm",
-  },
-  {
-    href: "/space",
-    label: "Learning Space",
-    icon: LayoutGrid,
-    tooltipKey: "Space tooltip",
-  },
-];
-
-const SECONDARY_NAV: NavEntry[] = [
-  {
-    // Memory is its own top-level console (pulled out of the Learning Space):
-    // a place to inspect and curate the tutor's long-term memory, not a daily
-    // workspace. Never gated — memory has no per-user model requirement.
-    href: "/memory",
-    label: "Memory",
-    icon: Brain,
-    tooltipKey: "Memory tooltip",
-  },
-  {
-    // Knowledge Center sits just above Settings: it's a console for managing
-    // KBs and retrieval engines, not a daily workspace. Never gated — embedding
-    // / search are shared admin infrastructure, no per-user model grant needed.
-    href: "/knowledge",
-    label: "Knowledge Center",
-    icon: BookOpen,
-    tooltipKey: "Knowledge tooltip",
-  },
-  { href: "/settings", label: "Settings", icon: Settings },
-];
-const GITHUB_REPO_URL = "https://github.com/HKUDS/DeepTutor";
-const DOCS_URL = "https://deeptutor.info/";
-const RECENTS_COLLAPSED_KEY = "deeptutor.sidebar.recentsCollapsed";
+);
 
 interface SidebarShellProps {
   sessions?: SessionSummary[];
   activeSessionId?: string | null;
+  /** Conversations the caller is streaming right now; they sort to the top. */
+  liveSessionIds?: ReadonlySet<string>;
   loadingSessions?: boolean;
   showSessions?: boolean;
   /** Clicking the Chat nav item resets to a fresh session via this handler. */
   onNewChat?: () => void;
+  onNewWorkspaceChat?: (workspaceId: string) => void;
+  workspaceRefreshToken?: number;
   onSelectSession?: (sessionId: string) => void | Promise<void>;
   onRenameSession?: (sessionId: string, title: string) => void | Promise<void>;
   onDeleteSession?: (sessionId: string) => void | Promise<void>;
+  courses?: StudyCourse[];
+  /** Topic labels for grouping mastery study conversations under their path. */
+  masteryTopics?: MasteryTopicLabel[];
+  /** Collection labels for grouping reading conversations under their shelf. */
+  readingCollections?: ReadingCollectionLabel[];
+  onOrganizeSession?: (
+    sessionId: string,
+    patch: SessionOrganizationPatch,
+  ) => void | Promise<void>;
   /**
    * Footer content rendered below the nav. Pass a render function to receive
    * the current ``collapsed`` state so footer items (e.g. Admin / Sign out) can
@@ -133,46 +91,73 @@ interface SidebarShellProps {
 export function SidebarShell({
   sessions = [],
   activeSessionId = null,
+  liveSessionIds,
   loadingSessions = false,
   showSessions = false,
   onNewChat,
+  onNewWorkspaceChat,
   onSelectSession,
   onRenameSession,
   onDeleteSession,
+  masteryTopics = [],
+  readingCollections = [],
+  onOrganizeSession,
   footerSlot,
 }: SidebarShellProps) {
   const pathname = usePathname();
   const router = useRouter();
   const { t } = useTranslation();
-  const { has } = useCapabilityAccess();
-  const { sidebarCollapsed: collapsed, setSidebarCollapsed: setCollapsed } =
-    useAppShell();
+  const { sidebarCollapsed, setSidebarCollapsed: setCollapsed } = useAppShell();
+  const { isMobile } = useDevice();
+  const drawer = useSidebarDrawer();
+  const recentsScrollRef = useRef<HTMLDivElement>(null);
+  // One load for the whole column: the workspace groups head their own
+  // section with it and the row menus offer it as a move destination.
+  const { workspaces } = useChatWorkspaces();
 
-  const navLocked = (item: NavEntry) =>
-    item.requires ? !has(item.requires) : false;
-  const lockedTooltip = t("Locked — contact your administrator to get access.");
+  // Inside the mobile drawer the icon-only rail is pointless — the panel is
+  // already hidden when you don't want it, so it always opens fully expanded
+  // regardless of the persisted desktop preference.
+  const collapsed = sidebarCollapsed && !isMobile;
+  const resize = useSidebarResize(collapsed || isMobile);
+
+  /** Dismiss the drawer on nav clicks that actually navigate in-place. */
+  const closeDrawerOnNav = (event: React.MouseEvent) => {
+    if (event.metaKey || event.ctrlKey || event.shiftKey || event.button === 1)
+      return;
+    drawer?.close();
+  };
+
   const renderedFooter =
     typeof footerSlot === "function" ? footerSlot(collapsed) : footerSlot;
-  const [recentsCollapsed, setRecentsCollapsed] = useState(false);
+  // The order the learner dragged the history region into — conversation ids
+  // and group ids in one list, since the two are peers there. Like the
+  // collapse preference above it is per-machine view state, hydrated after
+  // mount.
+  const [sessionOrder, setSessionOrder] = useState<string[]>([]);
+  const sessionOrderRef = useRef<string[]>([]);
 
-  // Hydrate Recents collapse from localStorage after first render to stay SSR-safe.
   useEffect(() => {
-    if (typeof window === "undefined") return;
+    const stored = readSessionOrder();
+    sessionOrderRef.current = stored;
     // eslint-disable-next-line react-hooks/set-state-in-effect
-    setRecentsCollapsed(
-      window.localStorage.getItem(RECENTS_COLLAPSED_KEY) === "1",
-    );
+    setSessionOrder(stored);
   }, []);
 
-  const toggleRecents = () => {
-    setRecentsCollapsed((prev) => {
-      const next = !prev;
-      if (typeof window !== "undefined") {
-        window.localStorage.setItem(RECENTS_COLLAPSED_KEY, next ? "1" : "0");
-      }
-      return next;
-    });
-  };
+  // A drag only ever speaks for the entries on screen, so it is merged into
+  // the stored order rather than replacing it.
+  const handleReorderSessions = useCallback((nextIds: string[]) => {
+    const merged = mergeManualOrder(sessionOrderRef.current, nextIds);
+    sessionOrderRef.current = merged;
+    setSessionOrder(merged);
+    writeSessionOrder(merged);
+  }, []);
+
+  const handleResetSessionOrder = useCallback(() => {
+    sessionOrderRef.current = [];
+    setSessionOrder([]);
+    writeSessionOrder([]);
+  }, []);
 
   const handleHomeClick = (event: React.MouseEvent) => {
     // Always reset to a fresh session (mirrors the old "New Chat" affordance);
@@ -181,18 +166,30 @@ export function SidebarShell({
     if (event.metaKey || event.ctrlKey || event.shiftKey || event.button === 1)
       return;
     event.preventDefault();
+    drawer?.close();
     onNewChat?.();
-    router.push("/home");
+    navigateTask("/chat", router.push);
   };
+
+  // Everything the learner has, minus the archived and minus the tutor threads
+  // that render nested under the conversation that spawned them.
+  //
+  // Keep the complete index here. OrganizedSessionList limits the initial
+  // rendering and exposes older conversations through Show more.
+  const visibleSessions = sessions.filter(
+    (session) =>
+      !session.preferences?.archived && !session.preferences?.parent_session_id,
+  );
 
   /* ---- Collapsed state ---- */
   if (collapsed) {
     return (
-      <aside className="group/sb relative flex h-screen w-[60px] shrink-0 flex-col items-center bg-[var(--secondary)] py-3 transition-all duration-200">
+      <aside className="group/sb relative flex h-dvh w-[60px] shrink-0 flex-col items-center bg-[var(--secondary)] py-3 transition-all duration-200">
         {/* Header: logo + collapse toggle (toggle replaces logo on hover) */}
         <div className="relative mb-2 flex h-9 w-9 items-center justify-center">
           <Link
             href="/"
+            prefetch={false}
             aria-label="DeepTutor"
             className="flex items-center justify-center transition-opacity duration-150 group-hover/sb:opacity-0"
           >
@@ -206,61 +203,37 @@ export function SidebarShell({
           </Link>
           <button
             onClick={() => setCollapsed(false)}
-            className="absolute inset-0 flex items-center justify-center rounded-lg text-[var(--muted-foreground)] opacity-0 transition-all duration-150 hover:bg-[var(--background)]/60 hover:text-[var(--foreground)] group-hover/sb:opacity-100"
+            className="absolute inset-0 flex items-center justify-center rounded-lg text-[var(--muted-foreground)] opacity-0 transition-all duration-150 hover:bg-background/60 hover:text-[var(--foreground)] group-hover/sb:opacity-100"
             aria-label={t("Expand sidebar")}
           >
             <PanelLeftOpen size={16} />
           </button>
         </div>
 
-        {/* Primary nav */}
-        <nav className="mt-1 flex w-full flex-col items-center gap-1 px-1.5">
-          {PRIMARY_NAV.map((item) => {
-            const active = pathname.startsWith(item.href);
-            const locked = navLocked(item);
-            const description = locked
-              ? lockedTooltip
-              : item.tooltipKey
-                ? t(item.tooltipKey)
-                : undefined;
-            if (locked) {
-              return (
-                <Tooltip
-                  key={item.href}
-                  label={t(item.label)}
-                  description={description}
-                  side="right"
-                >
-                  <div
-                    aria-label={`${t(item.label)} — ${lockedTooltip}`}
-                    aria-disabled
-                    className="relative flex h-9 w-9 cursor-not-allowed items-center justify-center rounded-xl text-[var(--muted-foreground)]/40"
-                  >
-                    <item.icon size={18} strokeWidth={1.6} />
-                    <Lock
-                      size={10}
-                      strokeWidth={2}
-                      className="absolute bottom-1 right-1 text-[var(--muted-foreground)]/70"
-                    />
-                  </div>
-                </Tooltip>
-              );
-            }
+        <SidebarHome collapsed onHomeClick={handleHomeClick} />
+        <div className="min-h-0 w-full flex-1 overflow-y-auto overscroll-contain">
+          <SidebarNav
+            collapsed
+            onHomeClick={handleHomeClick}
+            onNavigate={closeDrawerOnNav}
+          />
+        </div>
+
+        {/* Secondary nav + footer */}
+        <div className="flex w-full shrink-0 flex-col items-center gap-1 px-1.5">
+          <div className="my-1 h-px w-7 bg-border/40" />
+          {SECONDARY_NAV.map((item) => {
+            const active = isNavActive(pathname, item.href);
             return (
-              <Tooltip
-                key={item.href}
-                label={t(item.label)}
-                description={description}
-                side="right"
-              >
+              <Tooltip key={item.href} label={t(item.label) as string} side="right">
                 <Link
                   href={item.href}
-                  onClick={item.href === "/home" ? handleHomeClick : undefined}
-                  aria-label={t(item.label)}
+                  prefetch={false}
+                  aria-label={t(item.label) as string}
                   className={`relative flex h-9 w-9 items-center justify-center rounded-xl transition-all duration-150 ${
                     active
                       ? "bg-[var(--accent)] text-[var(--foreground)] shadow-sm"
-                      : "text-[var(--foreground)]/85 hover:bg-[var(--background)]/60 hover:text-[var(--foreground)]"
+                      : "text-foreground/85 hover:bg-background/60 hover:text-[var(--foreground)]"
                   }`}
                 >
                   <item.icon size={18} strokeWidth={active ? 2 : 1.6} />
@@ -268,52 +241,8 @@ export function SidebarShell({
               </Tooltip>
             );
           })}
-        </nav>
-
-        <div className="flex-1" />
-
-        {/* Secondary nav + footer */}
-        <div className="flex w-full flex-col items-center gap-1 px-1.5">
-          <div className="my-1 h-px w-7 bg-[var(--border)]/40" />
-          {SECONDARY_NAV.map((item) => {
-            const active = pathname.startsWith(item.href);
-            return (
-              <Link
-                key={item.href}
-                href={item.href}
-                title={t(item.label) as string}
-                className={`relative flex h-9 w-9 items-center justify-center rounded-xl transition-all duration-150 ${
-                  active
-                    ? "bg-[var(--accent)] text-[var(--foreground)] shadow-sm"
-                    : "text-[var(--foreground)]/85 hover:bg-[var(--background)]/60 hover:text-[var(--foreground)]"
-                }`}
-              >
-                <item.icon size={18} strokeWidth={active ? 2 : 1.6} />
-              </Link>
-            );
-          })}
           {renderedFooter}
-          <a
-            href={DOCS_URL}
-            target="_blank"
-            rel="noreferrer noopener"
-            title={t("Docs") as string}
-            aria-label={t("Docs") as string}
-            className="mt-1 flex h-9 w-9 items-center justify-center rounded-xl text-[var(--muted-foreground)]/70 transition-colors hover:bg-[var(--background)]/50 hover:text-[var(--foreground)]"
-          >
-            <BookText size={15} strokeWidth={1.6} />
-          </a>
-          <a
-            href={GITHUB_REPO_URL}
-            target="_blank"
-            rel="noreferrer noopener"
-            title="GitHub"
-            aria-label="GitHub"
-            className="flex h-9 w-9 items-center justify-center rounded-xl text-[var(--muted-foreground)]/70 transition-colors hover:bg-[var(--background)]/50 hover:text-[var(--foreground)]"
-          >
-            <Github size={15} strokeWidth={1.6} />
-          </a>
-          <VersionBadge collapsed />
+          <VersionBadge onNavigate={closeDrawerOnNav} />
         </div>
       </aside>
     );
@@ -321,10 +250,13 @@ export function SidebarShell({
 
   /* ---- Expanded state ---- */
   return (
-    <aside className="flex w-[220px] h-screen shrink-0 flex-col bg-[var(--secondary)] transition-all duration-200">
+    <aside
+      style={{ "--sidebar-width": `${resize.width}px` } as CSSProperties}
+      className="relative flex h-dvh w-[var(--sidebar-width)] max-w-[45vw] shrink-0 flex-col bg-[var(--secondary)] max-md:w-[220px] max-md:max-w-[85vw]"
+    >
       {/* Header: logo + collapse toggle */}
-      <div className="flex h-14 items-center justify-between px-4">
-        <Link href="/" className="group flex items-center gap-1.5">
+      <div className="flex h-[52px] shrink-0 items-center justify-between px-4">
+        <Link href="/" prefetch={false} className="group flex items-center gap-1.5">
           <Image
             src="/logo.png"
             alt="DeepTutor"
@@ -341,156 +273,134 @@ export function SidebarShell({
             className="h-[22px] w-auto transition-transform duration-200 group-hover:scale-105"
           />
         </Link>
+        {/* The rail is a desktop affordance; in the drawer the scrim and the
+            top-bar toggle already own "make this go away". */}
         <button
           onClick={() => setCollapsed(true)}
-          className="rounded-md p-1 text-[var(--muted-foreground)] transition-colors hover:text-[var(--foreground)]"
+          className="rounded-md p-1 text-[var(--muted-foreground)] transition-colors hover:text-[var(--foreground)] max-md:hidden"
           aria-label={t("Collapse sidebar")}
         >
           <PanelLeftClose size={15} />
         </button>
       </div>
 
-      {/* Primary nav */}
-      <nav className="px-2 pt-1">
-        <div className="space-y-px">
-          {PRIMARY_NAV.map((item) => {
-            const active = pathname.startsWith(item.href);
-            const locked = navLocked(item);
-            if (locked) {
-              return (
-                <Tooltip
-                  key={item.href}
-                  label={t(item.label)}
-                  description={lockedTooltip}
-                  side="right"
-                >
-                  <div
-                    aria-label={`${t(item.label)} — ${lockedTooltip}`}
-                    aria-disabled
-                    className="flex cursor-not-allowed items-center gap-2.5 rounded-lg px-3 py-2 text-[13.5px] text-[var(--muted-foreground)]/40"
-                  >
-                    <item.icon size={16} strokeWidth={1.5} />
-                    <span>{t(item.label)}</span>
-                    <Lock size={13} strokeWidth={1.8} className="ml-auto" />
-                  </div>
-                </Tooltip>
-              );
-            }
-            return (
-              <Link
-                key={item.href}
-                href={item.href}
-                onClick={item.href === "/home" ? handleHomeClick : undefined}
-                className={`flex items-center gap-2.5 rounded-lg px-3 py-2 text-[13.5px] transition-colors ${
-                  active
-                    ? "bg-[var(--accent)] font-medium text-[var(--foreground)]"
-                    : "text-[var(--foreground)]/85 hover:bg-[var(--background)]/60 hover:text-[var(--foreground)]"
-                }`}
-              >
-                <item.icon size={16} strokeWidth={active ? 1.9 : 1.5} />
-                <span>{t(item.label)}</span>
-              </Link>
-            );
-          })}
-        </div>
-      </nav>
+      <SidebarHome onHomeClick={handleHomeClick} />
 
-      {/* Chat history — its own region below the nav, takes remaining height */}
-      {showSessions && onSelectSession && onRenameSession && onDeleteSession ? (
-        <section
-          className={`mt-4 flex min-h-0 flex-col ${
-            recentsCollapsed ? "" : "flex-1"
-          }`}
-        >
-          <button
-            type="button"
-            onClick={toggleRecents}
-            className="group/recents mx-2 flex items-center justify-between rounded-md px-2 py-1 text-left text-[11.5px] font-normal text-[var(--muted-foreground)]/60 transition-colors hover:bg-[var(--background)]/40 hover:text-[var(--muted-foreground)]"
-            aria-expanded={!recentsCollapsed}
-            aria-label={
-              recentsCollapsed
-                ? (t("Show recents") as string)
-                : (t("Hide recents") as string)
-            }
-          >
-            <span>{t("Recents")}</span>
-            <ChevronDown
-              size={13}
-              strokeWidth={1.7}
-              className={`transition-all duration-200 ${
-                recentsCollapsed
-                  ? "-rotate-90 opacity-60"
-                  : "rotate-0 opacity-0 group-hover/recents:opacity-60"
-              }`}
-            />
-          </button>
-          {!recentsCollapsed && (
-            <div className="min-h-0 flex-1 overflow-y-auto px-2 pb-2 pt-0.5">
+      {/* Modules and conversations share one scroll region below Home. */}
+      <div
+        ref={recentsScrollRef}
+        className="min-h-0 flex-1 overflow-y-auto overscroll-contain pb-2"
+      >
+        <SidebarNav
+          scrollRef={recentsScrollRef}
+          collapsed={false}
+          onHomeClick={handleHomeClick}
+          onNavigate={closeDrawerOnNav}
+        />
+
+        {/* Conversation history follows the module entries in the same scroller. */}
+        {showSessions &&
+        onSelectSession &&
+        onRenameSession &&
+        onDeleteSession ? (
+          <section className="mt-3 px-2 pt-0.5">
+            {!onOrganizeSession && <div className="mb-2 px-2 text-xs text-[var(--muted-foreground)]">{t("Recent")}</div>}
+            {loadingSessions ? (
               <SessionList
-                sessions={sessions}
+                sessions={[]}
                 activeSessionId={activeSessionId}
-                loading={loadingSessions}
+                loading
                 onSelect={onSelectSession}
                 onRename={onRenameSession}
                 onDelete={onDeleteSession}
                 compact
               />
-            </div>
-          )}
-        </section>
-      ) : null}
-
-      {/* When recents is collapsed or unavailable, fill the gap above the footer. */}
-      {(!showSessions ||
-        !onSelectSession ||
-        !onRenameSession ||
-        !onDeleteSession ||
-        recentsCollapsed) && <div className="flex-1" />}
+            ) : onOrganizeSession ? (
+              <OrganizedSessionList
+                sessions={visibleSessions}
+                // Course grouping temporarily hidden pending further product
+                // work; passing [] keeps the list flat without touching the
+                // course data callers still fetch.
+                courses={[]}
+                workspaces={workspaces}
+                groupWorkspaces
+                onNewWorkspaceChat={onNewWorkspaceChat}
+                masteryTopics={masteryTopics}
+                readingCollections={readingCollections}
+                activeSessionId={activeSessionId}
+                liveSessionIds={liveSessionIds}
+                manualOrder={sessionOrder}
+                onReorder={handleReorderSessions}
+                onResetOrder={handleResetSessionOrder}
+                scrollRef={recentsScrollRef}
+                onSelect={(sessionId) => {
+                  drawer?.close();
+                  return onSelectSession(sessionId);
+                }}
+                onRename={onRenameSession}
+                onDelete={onDeleteSession}
+                onOrganize={onOrganizeSession}
+              />
+            ) : (
+              <SessionList
+                sessions={visibleSessions}
+                activeSessionId={activeSessionId}
+                onSelect={(sessionId) => {
+                  drawer?.close();
+                  return onSelectSession(sessionId);
+                }}
+                onRename={onRenameSession}
+                onDelete={onDeleteSession}
+                compact
+              />
+            )}
+          </section>
+        ) : null}
+      </div>
 
       {/* Secondary nav + footer */}
-      <div className="border-t border-[var(--border)]/40 px-2 py-2">
-        {SECONDARY_NAV.map((item) => {
-          const active = pathname.startsWith(item.href);
-          return (
-            <Link
-              key={item.href}
-              href={item.href}
-              className={`flex items-center gap-2.5 rounded-lg px-3 py-2 text-[13.5px] transition-colors ${
-                active
-                  ? "bg-[var(--accent)] font-medium text-[var(--foreground)]"
-                  : "text-[var(--foreground)]/85 hover:bg-[var(--background)]/60 hover:text-[var(--foreground)]"
-              }`}
-            >
-              <item.icon size={16} strokeWidth={active ? 1.9 : 1.5} />
-              <span>{t(item.label)}</span>
-            </Link>
-          );
-        })}
+      <div className="shrink-0 border-t border-border/40 px-2 py-2">
         {renderedFooter}
-        <div className="mt-0.5 flex items-center gap-0.5">
-          <VersionBadge />
-          <a
-            href={DOCS_URL}
-            target="_blank"
-            rel="noreferrer noopener"
-            title={t("Docs") as string}
-            aria-label={t("Docs") as string}
-            className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-[var(--muted-foreground)]/55 transition-colors hover:bg-[var(--background)]/50 hover:text-[var(--muted-foreground)]"
-          >
-            <BookText size={13} strokeWidth={1.7} />
-          </a>
-          <a
-            href={GITHUB_REPO_URL}
-            target="_blank"
-            rel="noreferrer noopener"
-            title="GitHub"
-            aria-label="GitHub"
-            className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-[var(--muted-foreground)]/55 transition-colors hover:bg-[var(--background)]/50 hover:text-[var(--muted-foreground)]"
-          >
-            <Github size={13} strokeWidth={1.7} />
-          </a>
+        <div className="flex items-center gap-1">
+          {SECONDARY_NAV.map((item) => {
+            const active = isNavActive(pathname, item.href);
+            return (
+              <Link
+                key={item.href}
+                href={item.href}
+                prefetch={false}
+                onClick={closeDrawerOnNav}
+                className={`flex min-h-8 min-w-0 flex-1 items-center gap-2 rounded-md px-2.5 py-1.5 text-[13px] transition-colors ${
+                  active
+                    ? "bg-[var(--accent)] font-medium text-[var(--foreground)]"
+                    : "text-foreground/85 hover:bg-background/60 hover:text-[var(--foreground)]"
+                }`}
+              >
+                <item.icon size={15} strokeWidth={active ? 1.9 : 1.6} />
+                <span>{t(item.label)}</span>
+              </Link>
+            );
+          })}
+          <VersionBadge onNavigate={closeDrawerOnNav} />
         </div>
       </div>
+      {!isMobile && (
+        <div
+          role="separator"
+          aria-label={t("Resize sidebar")}
+          aria-orientation="vertical"
+          aria-valuemin={resize.min}
+          aria-valuemax={resize.max}
+          aria-valuenow={resize.width}
+          tabIndex={0}
+          {...resize.handleProps}
+          className="group/resize absolute inset-y-0 -right-1 z-30 w-2 touch-none cursor-col-resize outline-none max-md:hidden"
+        >
+          <div
+            className={`mx-auto h-full w-0.5 transition-colors group-hover/resize:bg-[var(--ring)] group-focus-visible/resize:bg-[var(--ring)] ${resize.resizing ? "bg-[var(--ring)]" : "bg-transparent"}`}
+          />
+        </div>
+      )}
     </aside>
   );
 }

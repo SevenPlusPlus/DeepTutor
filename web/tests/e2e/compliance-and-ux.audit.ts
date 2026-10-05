@@ -12,17 +12,17 @@ async function expectAnyVisible(
   locators: import("@playwright/test").Locator[],
   message: string,
 ) {
-  for (const loc of locators) {
-    try {
-      if (await loc.first().isVisible()) return;
-    } catch {}
-  }
-  expect(false, message).toBe(true);
+  await expect.poll(async () => {
+    for (const loc of locators) {
+      if (await loc.first().isVisible()) return true;
+    }
+    return false;
+  }, { message }).toBe(true);
 }
 
 test.describe("Compliance :: Accessibility & Semantics", () => {
   test("home page exposes main landmark and H1", async ({ page }) => {
-    await page.goto(`${BASE_URL}/`);
+    await page.goto(`${BASE_URL}/`, { waitUntil: "domcontentloaded" });
     await page.waitForSelector("main", { timeout: 5000 });
     const main = page.locator("main");
     await expect(main, "Missing <main> landmark").toBeVisible();
@@ -32,7 +32,7 @@ test.describe("Compliance :: Accessibility & Semantics", () => {
   });
 
   test("images provide alt text", async ({ page }) => {
-    await page.goto(`${BASE_URL}/`);
+    await page.goto(`${BASE_URL}/`, { waitUntil: "domcontentloaded" });
     const missingAltCount = await page.$$eval(
       "img",
       (imgs) =>
@@ -49,7 +49,7 @@ test.describe("Compliance :: Accessibility & Semantics", () => {
   test("links have accessible names (text/aria-label/title)", async ({
     page,
   }) => {
-    await page.goto(`${BASE_URL}/`);
+    await page.goto(`${BASE_URL}/`, { waitUntil: "domcontentloaded" });
     const namelessLinks = await page.$$eval(
       "a",
       (anchors) =>
@@ -57,7 +57,15 @@ test.describe("Compliance :: Accessibility & Semantics", () => {
           const text = (a.textContent || "").trim();
           const aria = (a.getAttribute("aria-label") || "").trim();
           const title = (a.getAttribute("title") || "").trim();
-          return text.length === 0 && aria.length === 0 && title.length === 0;
+          const imageName = Array.from(a.querySelectorAll("img")).some(
+            (image) => (image.getAttribute("alt") || "").trim().length > 0,
+          );
+          return (
+            text.length === 0 &&
+            aria.length === 0 &&
+            title.length === 0 &&
+            !imageName
+          );
         }).length,
     );
     expect(
@@ -67,7 +75,7 @@ test.describe("Compliance :: Accessibility & Semantics", () => {
   });
 
   test("viewport meta present for responsive UX", async ({ page }) => {
-    await page.goto(`${BASE_URL}/`);
+    await page.goto(`${BASE_URL}/`, { waitUntil: "domcontentloaded" });
     const hasViewport = await page.$('meta[name="viewport"]');
     expect(!!hasViewport, "Missing viewport meta tag").toBe(true);
   });
@@ -77,7 +85,7 @@ test.describe("Compliance :: Error Handling & UX Signals", () => {
   test("api error surfaces user-friendly feedback (alert or message)", async ({
     page,
   }) => {
-    await page.route("**/api/v1/notebook/list", (route) =>
+    await page.route("**/api/notebooks*", (route) =>
       route.fulfill({
         status: 500,
         headers: { "content-type": "application/json" },
@@ -85,7 +93,7 @@ test.describe("Compliance :: Error Handling & UX Signals", () => {
       }),
     );
 
-    await page.goto(`${BASE_URL}/notebook`);
+    await page.goto(`${BASE_URL}/notebooks`, { waitUntil: "domcontentloaded" });
 
     await expectAnyVisible(
       [

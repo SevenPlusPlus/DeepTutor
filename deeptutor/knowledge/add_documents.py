@@ -8,26 +8,38 @@ import asyncio
 from dataclasses import dataclass
 from datetime import datetime
 import hashlib
+import itertools
 import json
 import logging
 from pathlib import Path
 import shutil
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 from deeptutor.services.config import resolve_llm_runtime_config
 from deeptutor.services.file_io import atomic_write_json
 from deeptutor.services.rag.factory import (
     DEFAULT_PROVIDER,
+    LIGHTRAG_PROVIDER,
     has_ready_provider_index,
     normalize_provider_name,
 )
 from deeptutor.services.rag.file_routing import FileTypeRouter
+from deeptutor.services.rag.index_probe import provider_failure_summary
+from deeptutor.services.rag.index_versioning import list_kb_versions
 from deeptutor.services.rag.provider_binding import resolve_bound_provider
 from deeptutor.services.rag.service import RAGService
+from deeptutor.services.setup.data_volume import (
+    DataVolumePermissionError,
+    ensure_data_volume_writable,
+    format_data_volume_permission_error,
+)
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_BASE_DIR = "./data/knowledge_bases"
+
+if TYPE_CHECKING:
+    from deeptutor.knowledge.manager import KnowledgeBaseManager
 
 
 @dataclass(frozen=True)
@@ -110,6 +122,22 @@ def _raw_hash_key(file_path: Path, raw_dir: Path) -> str:
         return file_path.name
 
 
+def _file_hash(file_path: Path) -> str:
+    sha256_hash = hashlib.sha256()
+    with open(file_path, "rb") as handle:
+        for block in iter(lambda: handle.read(65536), b""):
+            sha256_hash.update(block)
+    return sha256_hash.hexdigest()
+
+
+def hashes_for_indexed_files(file_paths: list[str], raw_dir: Path) -> dict[str, str]:
+    """Hash source files already confirmed in an index, keyed by their raw path."""
+    return {
+        _raw_hash_key(Path(file_path), raw_dir): _file_hash(Path(file_path))
+        for file_path in file_paths
+    }
+
+
 def remove_raw_document(kb_dir: Path, file_path: Path) -> RawDocumentRemoval:
     """Delete one staged raw file and drop its indexed-hash record.
 
@@ -152,6 +180,7 @@ class DocumentAdder:
         base_url: str | None = None,
         progress_tracker=None,
         rag_provider: str | None = None,
+        accepted_indexing_snapshot=None,
     ):
         self.kb_name = kb_name
         self.base_dir = Path(base_dir)
@@ -164,6 +193,10 @@ class DocumentAdder:
         self.llamaindex_storage_dir = self.kb_dir / "llamaindex_storage"
         self.legacy_rag_storage_dir = self.kb_dir / "rag_storage"
         self.metadata_file = self.kb_dir / "metadata.json"
+
+        # Fail on UID-mismatched / unwritable volumes before the "not initialized"
+        # check, which otherwise hides Unraid bind-mount permission errors.
+        ensure_data_volume_writable(self.kb_dir)
 
         # Incremental adds must use the engine DeepTutor has bound to this KB. An
         # explicit rag_provider (from the API, already matched against the KB)
@@ -184,8 +217,39 @@ class DocumentAdder:
                 f"Knowledge base '{kb_name}' uses legacy index format and requires reindex before incremental add"
             )
 
-        if not has_provider_index:
+        # Both pipelines create their first index on add; existing broken versions
+        # still require reindex instead of being silently replaced (#1458).
+        versions = list_kb_versions(self.kb_dir)
+        allows_bootstrap = (
+            self.rag_provider
+            in {
+                DEFAULT_PROVIDER,
+                LIGHTRAG_PROVIDER,
+            }
+            and not versions
+        )
+        if not has_provider_index and not allows_bootstrap:
+            if versions:
+                summary = provider_failure_summary(self.kb_dir, self.rag_provider)
+                raise ValueError(
+                    f"Knowledge base has no ready {self.rag_provider} index; reindex required: "
+                    f"{summary or 'stored index version is incomplete'}"
+                )
             raise ValueError(f"Knowledge base not initialized ({self.rag_provider}): {kb_name}")
+
+        self.accepted_indexing_snapshot = accepted_indexing_snapshot
+        if self.rag_provider == LIGHTRAG_PROVIDER and self.accepted_indexing_snapshot is None:
+            from deeptutor.services.rag.pipelines.lightrag.indexing_policy import (
+                bind_target,
+                resolve_write_snapshot,
+            )
+
+            self.accepted_indexing_snapshot = bind_target(
+                resolve_write_snapshot(
+                    self.kb_dir, base_dir=str(self.base_dir), kb_name=self.kb_name
+                ),
+                self.kb_dir,
+            )
 
         self.api_key = api_key
         self.base_url = base_url
@@ -197,11 +261,7 @@ class DocumentAdder:
         return resolve_bound_provider(self.base_dir, self.kb_name)
 
     def _get_file_hash(self, file_path: Path) -> str:
-        sha256_hash = hashlib.sha256()
-        with open(file_path, "rb") as f:
-            for byte_block in iter(lambda: f.read(65536), b""):
-                sha256_hash.update(byte_block)
-        return sha256_hash.hexdigest()
+        return _file_hash(file_path)
 
     def get_ingested_hashes(self) -> dict[str, str]:
         if self.metadata_file.exists():
@@ -213,12 +273,44 @@ class DocumentAdder:
                 return {}
         return {}
 
-    def add_documents(self, source_files: List[str], allow_duplicates: bool = False) -> List[Path]:
-        """Validate and stage files into raw/ before indexing."""
+    @staticmethod
+    def _non_colliding(dest_path: Path) -> Path:
+        """A free sibling name for a *different* document that wants a taken one.
+
+        Two files can legitimately share a name and hold different content — a
+        docs tree with a README.md per folder is the ordinary case, and batched
+        syncs of sibling folders stage them against different roots, so they
+        land on the same name even with structure preserved. Dropping the later
+        one loses a document the user asked to index, silently.
+        """
+        if not dest_path.exists():
+            return dest_path
+        for index in itertools.count(2):
+            candidate = dest_path.with_name(f"{dest_path.stem} ({index}){dest_path.suffix}")
+            if not candidate.exists():
+                return candidate
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    def add_documents(
+        self,
+        source_files: List[str],
+        allow_duplicates: bool = False,
+        source_root: str | Path | None = None,
+    ) -> List[Path]:
+        """Validate and stage files into raw/ before indexing.
+
+        ``source_root``, when given, is the root a caller is syncing from
+        (e.g. a linked folder). Any source file found under it is staged at
+        the same path *relative to that root*, instead of being flattened to
+        its bare filename: without this, every externally-sourced subfolder
+        collapses into raw/'s top level and same-named files in different
+        subfolders collide.
+        """
         logger.info(f"Validating documents for '{self.kb_name}'...")
 
         ingested_hashes = self.get_ingested_hashes()
         files_to_process: list[Path] = []
+        resolved_source_root = Path(source_root).resolve() if source_root else None
 
         for source in source_files:
             source_path = Path(source)
@@ -231,26 +323,33 @@ class DocumentAdder:
                 logger.info(f"Skipped (content already indexed): {source_path.name}")
                 continue
 
+            resolved_source = source_path.resolve()
+
             # Files already saved under raw/ (e.g. by the upload route, possibly
             # inside a folder) are indexed in place — never flattened to the
             # basename — so the uploaded folder structure is preserved verbatim.
-            if source_path.resolve().is_relative_to(self.raw_dir.resolve()):
+            if resolved_source.is_relative_to(self.raw_dir.resolve()):
                 files_to_process.append(source_path)
                 continue
 
-            dest_path = self.raw_dir / source_path.name
+            if resolved_source_root and resolved_source.is_relative_to(resolved_source_root):
+                dest_path = self.raw_dir / resolved_source.relative_to(resolved_source_root)
+            else:
+                dest_path = self.raw_dir / source_path.name
+
             if dest_path.exists():
                 dest_hash = self._get_file_hash(dest_path)
                 if dest_hash == current_hash:
                     logger.info(f"Recovering staged file: {source_path.name}")
                     files_to_process.append(dest_path)
                     continue
-                if not allow_duplicates:
-                    logger.info(f"Skipped (filename collision): {source_path.name}")
-                    continue
+                # Same name, different document: keep both rather than
+                # silently dropping this one.
+                dest_path = self._non_colliding(dest_path)
 
+            dest_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source_path, dest_path)
-            logger.info(f"Staged to raw: {source_path.name}")
+            logger.info(f"Staged to raw: {dest_path.relative_to(self.raw_dir).as_posix()}")
             files_to_process.append(dest_path)
 
         return files_to_process
@@ -259,6 +358,9 @@ class DocumentAdder:
         """Index staged files via the KB's bound provider."""
         if not new_files:
             return DocumentIndexResult(processed_files=[], failures=[])
+
+        if self.rag_provider == LIGHTRAG_PROVIDER:
+            return await self._process_lightrag_batch(new_files)
 
         rag_service = RAGService(kb_base_dir=str(self.base_dir), provider=self.rag_provider)
         processed_files: list[Path] = []
@@ -272,25 +374,107 @@ class DocumentAdder:
 
                     self.progress_tracker.update(
                         ProgressStage.PROCESSING_FILE,
-                        f"Indexing {doc_file.name}",
-                        current=idx,
+                        message_key="Indexing {{name}}",
+                        message_params={"name": doc_file.name},
+                        current=len(processed_files),
                         total=total_files,
                     )
 
                 success = await rag_service.add_documents(self.kb_name, [str(doc_file)])
                 if success:
                     processed_files.append(doc_file)
-                    self._record_successful_hash(doc_file)
+                    # Re-hashes the whole file, so it stays off the event loop:
+                    # this runs inside a FastAPI BackgroundTasks entry, which is
+                    # awaited on the loop and would otherwise stall unrelated
+                    # requests once per indexed file (#777).
+                    try:
+                        await asyncio.to_thread(self._record_successful_hash, doc_file)
+                    except Exception:
+                        if self.rag_provider != LIGHTRAG_PROVIDER:
+                            raise
+                        logger.warning(
+                            "LightRAG published '%s' before its duplicate-detection hash "
+                            "was recorded",
+                            doc_file.name,
+                            exc_info=True,
+                        )
                     logger.info(f"Processed: {doc_file.name}")
+                    if self.progress_tracker is not None:
+                        self.progress_tracker.update(
+                            ProgressStage.PROCESSING_FILE,
+                            message_key="Indexed {{name}}",
+                            message_params={"name": doc_file.name},
+                            current=len(processed_files),
+                            total=total_files,
+                        )
                 else:
                     error = "Provider returned failure without details."
                     failures.append(DocumentIndexFailure(doc_file, error))
                     logger.error(f"Failed to index: {doc_file.name}")
+            except PermissionError as e:
+                logger.exception("Permission denied while indexing %s: %s", doc_file.name, e)
+                raise DataVolumePermissionError(
+                    format_data_volume_permission_error(self.kb_dir, cause=e)
+                ) from e
             except Exception as e:
                 logger.exception(f"Failed {doc_file.name}: {e}")
                 failures.append(DocumentIndexFailure(doc_file, str(e)))
 
         return DocumentIndexResult(processed_files=processed_files, failures=failures)
+
+    async def _process_lightrag_batch(self, files: List[Path]) -> DocumentIndexResult:
+        """Hold native write ownership across the entire accepted batch."""
+        from deeptutor.services.rag.pipelines.lightrag.pipeline import LightRagBatchError
+
+        def prepare_publication(root: Path) -> None:
+            from deeptutor.knowledge.progress_tracker import ProgressStage, ProgressTracker
+
+            tracker = self.progress_tracker or ProgressTracker(self.kb_name, self.base_dir)
+            tracker.update(
+                ProgressStage.COMPLETED,
+                message="Document indexing complete",
+                current=len(files),
+                total=len(files),
+                indexed_count=len(files),
+                index_changed=True,
+                index_action="upload",
+                publication_version=root.name,
+            )
+            tracker.verify_terminal(
+                current=len(files),
+                total=len(files),
+                indexed_count=len(files),
+                index_action="upload",
+                publication_version=root.name,
+            )
+
+        service = RAGService(kb_base_dir=str(self.base_dir), provider=LIGHTRAG_PROVIDER)
+        try:
+            success = await service.add_documents(
+                self.kb_name,
+                [str(path) for path in files],
+                accepted_indexing_snapshot=self.accepted_indexing_snapshot,
+                before_publish=prepare_publication,
+            )
+            if not success:
+                raise RuntimeError("LightRAG returned failure without details.")
+            processed = files
+            failures = []
+        except LightRagBatchError as exc:
+            processed = [path for path in files if path.name in exc.outcome.processed]
+            failures = [
+                DocumentIndexFailure(path, str(exc)) for path in files if path not in processed
+            ]
+        except Exception as exc:
+            return DocumentIndexResult([], [DocumentIndexFailure(path, str(exc)) for path in files])
+        for path in processed:
+            try:
+                await asyncio.to_thread(self._record_successful_hash, path)
+            except Exception:
+                logger.warning(
+                    "Indexed document hash could not be recorded: %s", path.name, exc_info=True
+                )
+        return DocumentIndexResult(processed, failures)
 
     def _record_successful_hash(self, file_path: Path) -> None:
         file_hash = self._get_file_hash(file_path)
@@ -332,6 +516,91 @@ class DocumentAdder:
         _write_metadata(self.metadata_file, metadata)
 
 
+async def _bootstrap_index_from_files(
+    kb_name: str,
+    source_files: list[str],
+    base_dir: str,
+    manager: "KnowledgeBaseManager",
+) -> int:
+    """Create a fresh index for an empty KB from the given source files.
+
+    Called when :class:`DocumentAdder` rejects an add because the KB has no
+    existing index (it was created empty, e.g. via the no-files fast path or
+    a web/GitHub source sync before any documents were indexed). Uses
+    :meth:`RAGService.initialize` to build the index in one batch, then
+    records file hashes so subsequent incremental adds can detect duplicates.
+    """
+    rag_service = RAGService(kb_base_dir=base_dir)
+    kb_dir = Path(base_dir) / kb_name
+    raw_dir = kb_dir / "raw"
+    metadata_file = kb_dir / "metadata.json"
+
+    requested = {str(Path(path).resolve()): str(Path(path)) for path in source_files}
+    confirmed: set[str] = set()
+
+    def on_indexed_file(paths: list[str]) -> None:
+        for path in paths:
+            canonical = str(Path(path).resolve())
+            if canonical in requested:
+                confirmed.add(canonical)
+
+    success = await rag_service.initialize(
+        kb_name=kb_name,
+        file_paths=source_files,
+        indexed_file_callback=on_indexed_file,
+    )
+    if not success:
+        raise RuntimeError(
+            f"Failed to initialize index for KB '{kb_name}' from {len(source_files)} file(s)"
+        )
+
+    indexed_files = [requested[path] for path in sorted(confirmed)]
+    indexed = len(indexed_files)
+    provider = rag_service._resolve_provider(kb_name)
+    try:
+        # Record hashes so future syncs detect unchanged files.
+        metadata = _read_metadata(metadata_file)
+        metadata.setdefault("file_hashes", {}).update(
+            hashes_for_indexed_files(indexed_files, raw_dir)
+        )
+        metadata["rag_provider"] = provider
+        metadata["needs_reindex"] = False
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        metadata["last_updated"] = ts
+        metadata["last_indexed_at"] = ts
+        metadata["last_indexed_count"] = indexed
+        metadata["last_indexed_action"] = "create"
+        _write_metadata(metadata_file, metadata)
+
+        manager.update_kb_status(
+            name=kb_name,
+            status="ready",
+            progress={
+                "stage": "completed",
+                "message": f"Initialized index with {indexed} file(s).",
+                "percent": 100,
+                "current": indexed,
+                "total": max(indexed, 1),
+                "file_name": "",
+                "error": None,
+                "timestamp": datetime.now().isoformat(),
+                "indexed_count": indexed,
+                "index_changed": True,
+                "index_action": "create",
+            },
+        )
+    except Exception:
+        if provider != LIGHTRAG_PROVIDER:
+            raise
+        logger.warning(
+            "LightRAG bootstrap for '%s' published before bookkeeping failed",
+            kb_name,
+            exc_info=True,
+        )
+    logger.info("Bootstrapped index for empty KB '%s' with %d file(s)", kb_name, indexed)
+    return indexed
+
+
 async def add_documents(
     kb_name: str,
     source_files: list[str],
@@ -339,11 +608,13 @@ async def add_documents(
     api_key: Optional[str] = None,
     base_url: Optional[str] = None,
     allow_duplicates: bool = False,
+    accepted_indexing_snapshot=None,
 ) -> int:
     """Convenience function used by CLI wrappers."""
     from deeptutor.knowledge.manager import KnowledgeBaseManager
 
     manager = KnowledgeBaseManager(base_dir=base_dir)
+    published_count = 0
     try:
         manager.update_kb_status(
             name=kb_name,
@@ -360,12 +631,26 @@ async def add_documents(
             },
         )
 
-        adder = DocumentAdder(
-            kb_name=kb_name,
-            base_dir=base_dir,
-            api_key=api_key,
-            base_url=base_url,
-        )
+        try:
+            adder = DocumentAdder(
+                kb_name=kb_name,
+                base_dir=base_dir,
+                api_key=api_key,
+                base_url=base_url,
+                accepted_indexing_snapshot=accepted_indexing_snapshot,
+            )
+        except ValueError as exc:
+            if "not initialized" not in str(exc).lower() or not source_files:
+                raise
+            # Empty KB (created without initial documents): bootstrap the
+            # index from these files instead of erroring.
+            return await _bootstrap_index_from_files(
+                kb_name=kb_name,
+                source_files=source_files,
+                base_dir=base_dir,
+                manager=manager,
+            )
+
         new_files = adder.add_documents(source_files, allow_duplicates=allow_duplicates)
         if not new_files:
             manager.update_kb_status(
@@ -389,6 +674,8 @@ async def add_documents(
                 f"Failed to index {result.failed_count}/{len(new_files)} file(s): "
                 f"{result.failure_summary()}"
             )
+        if adder.rag_provider == LIGHTRAG_PROVIDER:
+            published_count = result.processed_count
         adder.update_metadata(result.processed_count)
 
         manager.update_kb_status(
@@ -410,6 +697,13 @@ async def add_documents(
         )
         return result.processed_count
     except Exception as exc:
+        if published_count:
+            logger.warning(
+                "LightRAG append for '%s' published before bookkeeping failed",
+                kb_name,
+                exc_info=True,
+            )
+            return published_count
         manager.update_kb_status(
             name=kb_name,
             status="error",

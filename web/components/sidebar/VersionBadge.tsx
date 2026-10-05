@@ -1,32 +1,81 @@
 "use client";
 
-import { normalizeVersionTag } from "@/lib/version";
+import Link from "next/link";
+import { useEffect, useState, type MouseEventHandler } from "react";
+import { useTranslation } from "react-i18next";
+import Tooltip from "@/shared/ui/Tooltip";
+
+import {
+  fetchAppUpdateStatus,
+  subscribeAppUpdateStatus,
+  type AppUpdateStatus,
+} from "@/lib/app-update";
 
 interface VersionBadgeProps {
-  /** Render the compact variant for the collapsed sidebar (currently hidden). */
-  collapsed?: boolean;
+  onNavigate?: MouseEventHandler<HTMLAnchorElement>;
 }
 
-const RELEASES_URL = "https://github.com/HKUDS/DeepTutor/releases";
+export function VersionBadge({ onNavigate }: VersionBadgeProps) {
+  const { t } = useTranslation();
+  const [status, setStatus] = useState<AppUpdateStatus | null>(null);
+  const [error, setError] = useState("");
 
-export function VersionBadge({ collapsed = false }: VersionBadgeProps) {
-  // Keep the collapsed sidebar entirely free of version chrome.
-  if (collapsed) return null;
+  useEffect(() => {
+    let active = true;
+    const controller = new AbortController();
+    const unsubscribe = subscribeAppUpdateStatus((signal) => {
+      if (!active) return;
+      if (signal.status) setStatus(signal.status);
+      setError(signal.error);
+    });
 
-  const tag = normalizeVersionTag(process.env.NEXT_PUBLIC_APP_VERSION || "");
-  const displayTag = tag ?? "—";
+    void fetchAppUpdateStatus(controller.signal).catch((cause) => {
+      if (!active || controller.signal.aborted) return;
+      setError(
+        cause instanceof Error ? cause.message : "Unable to check for updates",
+      );
+    });
+
+    return () => {
+      active = false;
+      controller.abort();
+      unsubscribe();
+    };
+  }, []);
+
+  const state = error
+    ? { dot: "bg-red-500", label: t("Status check failed") }
+    : status?.update_available
+      ? { dot: "bg-amber-500", label: t("Update available") }
+      : status?.release
+        ? {
+            dot: "bg-[color-mix(in_srgb,var(--muted-foreground)_35%,transparent)]",
+            label: t("Up to date"),
+          }
+        : status && !status.check_enabled
+          ? {
+              dot: "bg-[color-mix(in_srgb,var(--muted-foreground)_35%,transparent)]",
+              label: t("Version checks are disabled."),
+            }
+          : {
+              dot: "bg-[color-mix(in_srgb,var(--muted-foreground)_35%,transparent)]",
+              label: status ? t("Not checked yet") : t("Checking..."),
+            };
 
   return (
-    <a
-      href={RELEASES_URL}
-      target="_blank"
-      rel="noreferrer noopener"
-      title={displayTag}
-      className="group/ver flex min-w-0 flex-1 items-center rounded-lg px-3 py-1.5 text-[11px] font-mono tabular-nums tracking-tight text-[var(--muted-foreground)]/55 transition-colors hover:bg-[var(--background)]/50 hover:text-[var(--muted-foreground)]"
-    >
-      <span className="truncate leading-none decoration-[var(--muted-foreground)]/40 decoration-dotted underline-offset-[3px] group-hover/ver:underline">
-        {displayTag}
-      </span>
-    </a>
+    <Tooltip label={state.label as string} side="right">
+      <Link
+        href="/settings/about"
+        prefetch={false}
+        onClick={onNavigate}
+        aria-label={state.label as string}
+        className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-[var(--muted-foreground)] transition-colors hover:bg-background/50 hover:text-[var(--foreground)]"
+      >
+        <span
+          aria-hidden="true"
+          className={`h-1.5 w-1.5 rounded-full transition-colors ${state.dot}`}
+        />
+      </Link>
+    </Tooltip>
   );
 }

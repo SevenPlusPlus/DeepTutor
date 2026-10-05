@@ -15,7 +15,6 @@ import websockets
 from deeptutor.partners.bus.events import OutboundMessage
 from deeptutor.partners.bus.queue import MessageBus
 from deeptutor.partners.channels.base import BaseChannel
-from deeptutor.partners.config.paths import get_media_dir
 from deeptutor.partners.config.schema import DeliveryOverrides, StreamingSupport
 from deeptutor.partners.helpers import split_message
 
@@ -73,6 +72,13 @@ class DiscordChannel(BaseChannel):
         """Start the Discord gateway connection."""
         if not self.config.token:
             logger.error("Discord bot token not configured")
+            self.set_setup_state(
+                "action_required",
+                message=(
+                    "Required fields are missing. Complete the channel configuration "
+                    "and save again."
+                ),
+            )
             return
 
         self._running = True
@@ -80,6 +86,7 @@ class DiscordChannel(BaseChannel):
 
         while self._running:
             try:
+                self.set_setup_state("connecting")
                 logger.info("Connecting to Discord gateway...")
                 async with websockets.connect(self.config.gateway_url) as ws:
                     self._ws = ws
@@ -88,6 +95,10 @@ class DiscordChannel(BaseChannel):
                 break
             except Exception as e:
                 logger.warning("Discord gateway error: {}", e)
+                self.set_setup_state(
+                    "error",
+                    message="Channel connection failed; the listener will retry.",
+                )
                 if self._running:
                     logger.info("Reconnecting to Discord gateway in 5 seconds...")
                     await asyncio.sleep(5)
@@ -340,6 +351,7 @@ class DiscordChannel(BaseChannel):
                 await self._identify()
             elif op == 0 and event_type == "READY":
                 logger.info("Discord gateway READY")
+                self.set_setup_state("connected")
                 # Capture bot user ID for mention detection
                 user_data = payload.get("user") or {}
                 self._bot_user_id = user_data.get("id")
@@ -415,7 +427,7 @@ class DiscordChannel(BaseChannel):
 
         content_parts = [content] if content else []
         media_paths: list[str] = []
-        media_dir = get_media_dir("discord")
+        media_dir = self.media_dir()
 
         for attachment in payload.get("attachments") or []:
             url = attachment.get("url")

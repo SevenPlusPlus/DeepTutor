@@ -18,13 +18,14 @@ from typing import Any, AsyncGenerator, Awaitable, Callable
 from deeptutor.config.settings import settings
 from deeptutor.logging import LLMStats
 from deeptutor.services.config import get_agent_params
-from deeptutor.services.llm import complete as llm_complete
 from deeptutor.services.llm import (
+    StreamOutcome,
     get_llm_config,
     get_token_limit_kwargs,
     prepare_multimodal_messages,
     supports_response_format,
 )
+from deeptutor.services.llm import complete as llm_complete
 from deeptutor.services.llm import stream as llm_stream
 from deeptutor.services.prompt import get_prompt_manager
 
@@ -358,6 +359,7 @@ class BaseAgent(ABC):
         stage: str | None = None,
         attachments: list[Any] | None = None,
         trace_meta: dict[str, Any] | None = None,
+        reasoning_effort: str | None = None,
     ) -> str:
         """
         Unified interface for calling LLM (non-streaming).
@@ -376,6 +378,9 @@ class BaseAgent(ABC):
             verbose: Whether to print raw LLM output (default True)
             stage: Stage marker for logging and tracking
             attachments: Image/file attachments for multimodal input (optional)
+            reasoning_effort: Override the model's thinking level for this one
+                call. Callers use it to free the token budget for the answer
+                when a reasoning model spent it all on hidden tokens.
 
         Returns:
             LLM response text
@@ -396,6 +401,9 @@ class BaseAgent(ABC):
         # Handle token limit for newer OpenAI models
         if max_tokens:
             kwargs.update(get_token_limit_kwargs(model, max_tokens))
+
+        if reasoning_effort is not None:
+            kwargs["reasoning_effort"] = reasoning_effort
 
         # Handle response_format with capability check
         if response_format:
@@ -520,6 +528,9 @@ class BaseAgent(ABC):
         stage: str | None = None,
         attachments: list[Any] | None = None,
         trace_meta: dict[str, Any] | None = None,
+        reasoning_effort: str | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        outcome: StreamOutcome | None = None,
     ) -> AsyncGenerator[str, None]:
         """
         Unified interface for streaming LLM responses.
@@ -537,6 +548,12 @@ class BaseAgent(ABC):
             response_format: JSON schema for structured output (optional)
             stage: Stage marker for logging
             attachments: Image/file attachments for multimodal input (optional)
+            reasoning_effort: Override the model's thinking level for this one
+                call (see :meth:`call_llm`).
+            outcome: Filled in with the provider's terminal reason and usage
+                when the stream ends. An agent that parses the streamed text
+                needs it to tell a complete response from one the provider cut
+                off at ``max_tokens`` (#1545).
 
         Yields:
             Response chunks as strings
@@ -550,10 +567,15 @@ class BaseAgent(ABC):
         kwargs = {
             "temperature": temperature,
         }
+        if tools:
+            kwargs["tools"] = tools
 
         # Handle token limit for newer OpenAI models
         if max_tokens:
             kwargs.update(get_token_limit_kwargs(model, max_tokens))
+
+        if reasoning_effort is not None:
+            kwargs["reasoning_effort"] = reasoning_effort
 
         # Handle response_format with capability check
         if response_format:
@@ -619,6 +641,7 @@ class BaseAgent(ABC):
                 binding=self.binding,
                 messages=messages,
                 max_retries=max_retries,
+                outcome=outcome,
                 **kwargs,
             ):
                 full_response += chunk

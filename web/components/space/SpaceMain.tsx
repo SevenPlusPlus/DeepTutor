@@ -1,18 +1,10 @@
 "use client";
 
 import Link from "next/link";
+import { SkillLibraryScope } from "./SkillLibraryScope";
 import { usePathname } from "next/navigation";
 import { ArrowLeft } from "lucide-react";
 import { useTranslation } from "react-i18next";
-
-// Sections that own their full height + scroll (Mastery Path's list/detail
-// console). They must NOT be squeezed into the centered, padded document
-// container the list-style sections use.
-const FULL_BLEED = ["/space/learning"];
-
-function isFullBleed(pathname: string): boolean {
-  return FULL_BLEED.some((p) => pathname === p || pathname.startsWith(`${p}/`));
-}
 
 // Hub-and-spoke: the dashboard at `/space` is the only navigator. Once inside a
 // section we don't re-list every sibling on a rail — a single "back to the hub"
@@ -40,17 +32,6 @@ export default function SpaceMain({
   const pathname = usePathname() ?? "";
   const isDashboard = pathname === "/space";
 
-  if (isFullBleed(pathname)) {
-    return (
-      <div className="flex h-full min-h-0 flex-col bg-[var(--background)]">
-        <div className="shrink-0 border-b border-[var(--border)] px-5 py-2.5">
-          <BackToHub />
-        </div>
-        <div className="min-h-0 flex-1 overflow-hidden">{children}</div>
-      </div>
-    );
-  }
-
   return (
     <div className="h-full overflow-y-auto bg-[var(--background)] [scrollbar-gutter:stable]">
       <div className="mx-auto max-w-5xl px-8 py-8 pb-12">
@@ -59,8 +40,19 @@ export default function SpaceMain({
             <BackToHub />
           </div>
         )}
+        {['/space/skills', '/space/mcp'].includes(pathname) && (
+          <div className="mb-5 rounded-lg border border-[var(--border)] p-3 text-sm text-[var(--muted-foreground)]">
+            <ResourceLibraryNote />
+          </div>
+        )}
+        {pathname === "/space/skills" && <SkillLibraryScope />}
         {children}
       </div>
     </div>
   );
+}
+
+function ResourceLibraryNote() {
+  const { t } = useTranslation();
+  return <>{t("Account resource library. Manage resources here and assign them to workspaces in Settings.")} <Link className="underline" href="/settings#workspace">{t("Workspaces")}</Link></>;
 }

@@ -99,7 +99,7 @@ def test_moonshot_kimi_drops_external_url_only_attachment(caplog) -> None:
 
 
 def test_moonshot_kimi_resolves_local_attachment_url(tmp_path, monkeypatch) -> None:
-    """A ``/api/attachments/...`` URL is read from the AttachmentStore and
+    """A ``/files/attachments/...`` URL is read from the AttachmentStore and
     re-encoded as inline base64 before being sent to Moonshot."""
     monkeypatch.setenv("CHAT_ATTACHMENT_DIR", str(tmp_path))
     attachment_store.reset_attachment_store()
@@ -110,7 +110,7 @@ def test_moonshot_kimi_resolves_local_attachment_url(tmp_path, monkeypatch) -> N
     session_dir.mkdir(parents=True)
     (session_dir / f"{aid}_{name}").write_bytes(raw_bytes)
 
-    url = f"/api/attachments/{quote(sid)}/{quote(aid)}/{quote(name)}"
+    url = f"/files/attachments/{quote(sid)}/{quote(aid)}/{quote(name)}"
     att = SimpleNamespace(type="image", url=url, base64="")
 
     try:
@@ -161,6 +161,10 @@ def test_should_degrade_only_for_non_vision_model_with_images() -> None:
     assert should_degrade_to_text("moonshot", "moonshot-v1-8k", msgs) is True
     # Known vision-capable model → keep images, surface the real error.
     assert should_degrade_to_text("openai", "gpt-4o", msgs) is False
+    # Codex uses the Responses API and must not silently retry without its image.
+    assert should_degrade_to_text("openai_codex", "gpt-5.6-sol", msgs) is False
+    # Qwen3.8-Max is multimodal even though its model ID has no ``-vl`` suffix.
+    assert should_degrade_to_text("dashscope", "qwen3.8-max", msgs) is False
     # An allowlisted provider (VolcEngine) is trusted even for a model we have
     # no per-model entry for.
     assert should_degrade_to_text("volcengine", "doubao-1.5-vision-pro", msgs) is False

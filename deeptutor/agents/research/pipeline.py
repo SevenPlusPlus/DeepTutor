@@ -33,9 +33,10 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import html
 import logging
+from pathlib import Path
 import re
 from typing import Any
 
@@ -47,6 +48,10 @@ from deeptutor.agents._shared.tool_composition import (
     user_has_memory,
     user_has_notebooks,
 )
+from deeptutor.agents._shared.tool_runtime import (
+    bind_workspace_tool_runtime,
+    fallback_task_dir_from_metadata,
+)
 from deeptutor.agents.research.data_structures import (
     DynamicTopicQueue,
     ToolTrace,
@@ -54,7 +59,14 @@ from deeptutor.agents.research.data_structures import (
     TopicStatus,
 )
 from deeptutor.agents.research.utils.citation_manager import CitationManager
-from deeptutor.core.agentic import (
+from deeptutor.core.context import Attachment, UnifiedContext
+from deeptutor.core.trace import (
+    build_trace_metadata,
+    derive_trace_metadata,
+    merge_trace_metadata,
+    new_call_id,
+)
+from deeptutor.runtime.agentic import (
     DispatchOutcome,
     LabeledStepResult,
     LabelProtocol,
@@ -65,24 +77,25 @@ from deeptutor.core.agentic import (
     can_use_native_tool_calling,
     classify_label,
     dispatch_tool_calls,
+    recover_finished_label,
     run_agentic_loop,
     run_labeled_step,
 )
-from deeptutor.core.agentic.tool_dispatch import (
+from deeptutor.runtime.agentic.messages import assistant_message
+from deeptutor.runtime.agentic.tool_dispatch import (
     MAX_PARALLEL_TOOL_CALLS,
-)
-from deeptutor.core.context import Attachment, UnifiedContext
-from deeptutor.core.stream_bus import StreamBus
-from deeptutor.core.trace import (
-    build_trace_metadata,
-    derive_trace_metadata,
-    merge_trace_metadata,
-    new_call_id,
+    tool_error_message_factory,
 )
 from deeptutor.runtime.registry.tool_registry import get_tool_registry
+from deeptutor.runtime.stream_bus import StreamBus
 from deeptutor.services.config import parse_language
-from deeptutor.services.llm import get_llm_config, prepare_multimodal_messages
-from deeptutor.services.path_service import get_path_service
+from deeptutor.services.config.loader import get_capability_params
+from deeptutor.services.llm import (
+    finish_was_truncated,
+    get_llm_config,
+    prepare_multimodal_messages,
+)
+from deeptutor.services.llm.structured_retry import payload_with_reasoning_retry
 from deeptutor.services.prompt import get_prompt_manager
 from deeptutor.services.prompt.language import append_language_directive
 from deeptutor.services.sandbox import exec_capability_available
@@ -97,8 +110,28 @@ SOURCE = "deep_research"
 # (``compose_enabled_tools``), then narrows the result to tools that can
 # produce evidence for a block-level research summary.
 RESEARCH_OPTIONAL_TOOLS: list[str] = default_optional_tools()
+
+# Read-only Obsidian tools a research block may use when the selected KB is a
+# connected Obsidian vault. Write tools stay out of research blocks — the
+# block loop only retrieves evidence, never mutates the vault. The vault root
+# is injected server-side as ``_vault_path`` (see ``_augment_tool_kwargs``).
+RESEARCH_OBSIDIAN_READ_TOOLS: tuple[str, ...] = (
+    "obsidian_search",
+    "obsidian_read",
+    "obsidian_list",
+)
 RESEARCH_BLOCK_TOOL_ALLOWLIST: frozenset[str] = frozenset(
-    {"rag", "web_search", "paper_search", "code_execution"}
+    {
+        "rag",
+        "web_search",
+        "paper_search",
+        "exec",
+        "workspace_list",
+        "workspace_read",
+        "workspace_search",
+        "workspace_present",
+        *RESEARCH_OBSIDIAN_READ_TOOLS,
+    }
 )
 
 # ---------------------------------------------------------------------------
@@ -195,10 +228,22 @@ _PROTOCOL_NOTE = LabelProtocol(
 # Tools whose results get summarised + recorded in the citation manager.
 # Any tool whose results carry source documents / external evidence
 # should be added here.
-CITABLE_TOOLS: frozenset[str] = frozenset({"rag", "web_search", "paper_search", "code_execution"})
+CITABLE_TOOLS: frozenset[str] = frozenset(
+    {
+        "rag",
+        "web_search",
+        "paper_search",
+        "exec",
+        *RESEARCH_OBSIDIAN_READ_TOOLS,
+    }
+)
+
+
+def _is_citable_tool(name: str) -> bool:
+    return name in CITABLE_TOOLS or name.startswith(("pageindex_cloud_", "pageindex_oss_"))
+
 
 # Token budget for the note summarization sidecar.
-DEFAULT_NOTE_MAX_TOKENS = 1500
 # How much of the raw tool output we feed into the note summarizer.
 NOTE_RAW_INPUT_TRUNCATE_CHARS = 8000
 
@@ -210,13 +255,12 @@ DEFAULT_REPHRASE_MAX_ITERATIONS = (
 )
 DEFAULT_REPHRASE_MAX_ROUNDS = 3
 DEFAULT_REPHRASE_MAX_QUESTIONS_PER_ROUND = 3
+# Per-stage token budgets moved to agents.yaml — see
+# ``DEFAULT_RESEARCH_PARAMS`` in services.config.loader. agents.yaml owns
+# every LLM budget; this module keeps only runtime behaviour (iteration
+# caps, tool policy), which is main.yaml's half of the split.
 DEFAULT_BLOCK_MAX_ITERATIONS = 5
-DEFAULT_BLOCK_MAX_TOKENS = 6000
-DEFAULT_OUTLINE_MAX_TOKENS = 2000
-DEFAULT_REPORT_OUTLINE_MAX_TOKENS = 2000
-DEFAULT_REPORT_INTRO_MAX_TOKENS = 3000
-DEFAULT_REPORT_SECTION_MAX_TOKENS = 6000
-DEFAULT_REPORT_CONCLUSION_MAX_TOKENS = 3000
+DEFAULT_REPORT_STEP_MAX_ATTEMPTS = 3
 DEFAULT_INITIAL_SUBTOPICS = 5
 DEFAULT_MAX_PARALLEL_TOPICS = 3
 DEFAULT_QUEUE_MAX_LENGTH = 8
@@ -259,16 +303,43 @@ class ReportOutline:
     sections: tuple[ReportSectionPlan, ...]
 
 
+class IncompleteReportError(RuntimeError):
+    """A report stopped after some parts may already have reached the reader."""
+
+
 # ---------------------------------------------------------------------------
 # ResearchPipeline
 # ---------------------------------------------------------------------------
+
+
+def _outline_payload_is_usable(payload: Any) -> bool:
+    """Whether a decompose response actually carries sub-topics.
+
+    The parser accepts a bare array as well as an object, so "usable" cannot
+    be the generic "is a non-empty dict" the object-shaped callers use — an
+    array answer would be thrown away and retried for nothing.
+    """
+    if isinstance(payload, list):
+        return bool(payload)
+    if isinstance(payload, dict):
+        return bool(payload.get("sub_topics") or payload.get("subtopics"))
+    return False
+
+
+def _report_outline_payload_is_usable(payload: Any) -> bool:
+    """Whether a report-outline response actually carries sections."""
+    if isinstance(payload, list):
+        return bool(payload)
+    if isinstance(payload, dict):
+        return bool(payload.get("sections"))
+    return False
 
 
 class ResearchPipeline:
     """One-shot orchestrator: instantiate per turn, call :meth:`run` once.
 
     The pipeline owns control flow and per-phase prompt assembly; every
-    LLM call goes through :mod:`deeptutor.core.agentic` primitives. The
+    LLM call goes through :mod:`deeptutor.runtime.agentic` primitives. The
     legacy ``DynamicTopicQueue`` + :class:`CitationManager` are reused
     verbatim as the in-flight scratchpad and citation registry.
     """
@@ -285,6 +356,29 @@ class ResearchPipeline:
         self.kb_name = (kb_name or "").strip() or None
         self.enabled_tools = list(enabled_tools or [])
         self.runtime_config: dict[str, Any] = dict(runtime_config or {})
+
+        # Resolve whether the attached KB is a connected Obsidian vault. The
+        # metadata comes from the access-controlled resolver (never the model),
+        # and the resolution is a pure read with no RAG usage audit. Unresolvable
+        # references / ordinary KBs behave exactly as before (``rag``-style KB).
+        self._is_obsidian_kb = False
+        self._vault_path: str | None = None
+        if self.kb_name:
+            try:
+                from deeptutor.knowledge.kb_types import OBSIDIAN_KB_TYPE
+                from deeptutor.multi_user.knowledge_access import resolve_kb_metadata
+
+                meta = resolve_kb_metadata(self.kb_name)
+                if meta and meta.get("type") == OBSIDIAN_KB_TYPE:
+                    self._is_obsidian_kb = True
+                    vault_path = str(meta.get("vault_path") or "").strip()
+                    if vault_path:
+                        self._vault_path = vault_path
+            except Exception:
+                logger.warning(
+                    "Failed to resolve KB metadata for %r; treating as non-Obsidian.",
+                    self.kb_name,
+                )
 
         # Read structured policy sub-dicts produced by
         # :func:`build_research_runtime_config`. All keys are best-effort —
@@ -334,6 +428,32 @@ class ResearchPipeline:
             key="max_iterations",
             default=DEFAULT_BLOCK_MAX_ITERATIONS,
         )
+        # A ceiling on a stalled provider, not a service-level objective. A
+        # research tool is not quick by nature: one ``rag`` call against a
+        # LightRAG or GraphRAG index makes its own LLM calls before it returns
+        # anything, and a search-then-fetch chain waits on someone else's site.
+        # 60s would have cancelled work that was going to succeed, and each
+        # retry then pays the full timeout again. 240s matches the ceiling
+        # ``geogebra_analysis`` uses for the same reason, and retries are off by
+        # default: only a caller who knows its tools are flaky (rather than
+        # slow) should pay for a second attempt.
+        self._budgets = get_capability_params("research")
+        self.tool_timeout = max(
+            1,
+            _read_int(
+                researching,
+                key="tool_timeout",
+                default=240,
+            ),
+        )
+        self.tool_max_retries = max(
+            0,
+            _read_int(
+                researching,
+                key="tool_max_retries",
+                default=0,
+            ),
+        )
         self.max_parallel_topics = max(
             1,
             _read_int(
@@ -374,6 +494,8 @@ class ResearchPipeline:
             api_version=self.api_version,
             extra_headers=self.extra_headers or None,
             reasoning_effort=self.reasoning_effort,
+            wire_api=getattr(self.llm_config, "wire_api", None) or "auto",
+            api_format=getattr(self.llm_config, "api_format", None) or "auto",
         )
 
         self.registry = get_tool_registry()
@@ -422,6 +544,7 @@ class ResearchPipeline:
         client = self._build_client()
 
         try:
+            await self._prepare_pageindex_tools()
             return await self._run_inner(
                 context=context,
                 topic=topic,
@@ -510,7 +633,12 @@ class ResearchPipeline:
             f"research_{context.session_id or 'adhoc'}",
             max_length=self.queue_max_length,
         )
-        citations = CitationManager(queue.research_id, cache_dir=None)
+        research_cache = (
+            Path(context.runtime.workspace.output_dir) / "research"
+            if context.runtime.workspace is not None
+            else None
+        )
+        citations = CitationManager(queue.research_id, cache_dir=research_cache)
         for sub in confirmed_outline:
             queue.add_block(sub.title, sub.overview)
 
@@ -594,25 +722,37 @@ class ResearchPipeline:
         call_id = new_call_id("research-failure")
         meta = build_trace_metadata(
             call_id=call_id,
-            phase="researching",
-            label=self._t("labels.research_step", default="Research step"),
+            phase="reporting" if isinstance(exc, IncompleteReportError) else "researching",
+            label=(
+                self._t("labels.report_failure", default="Report incomplete")
+                if isinstance(exc, IncompleteReportError)
+                else self._t("labels.research_step", default="Research step")
+            ),
             call_kind="llm_final_response",
             trace_id=call_id,
             trace_role="response",
             trace_group="stage",
         )
-        message = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+        if isinstance(exc, IncompleteReportError):
+            cause = exc.__cause__ or exc
+            error_message = f"{type(cause).__name__}: {cause}"
+            visible_message = str(exc)
+            stage = "reporting"
+        else:
+            error_message = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+            visible_message = error_message
+            stage = "researching"
         await stream.error(
-            message,
+            error_message,
             source=SOURCE,
-            stage="researching",
+            stage=stage,
             metadata=merge_trace_metadata(meta, {"trace_kind": "error"}),
         )
         prefix = self._t("system.warning_prefix", default="⚠ ")
         await stream.content(
-            f"{prefix}{message}",
+            f"{prefix}{visible_message}",
             source=SOURCE,
-            stage="researching",
+            stage=stage,
             metadata=merge_trace_metadata(meta, {"trace_kind": "llm_output"}),
         )
 
@@ -673,7 +813,7 @@ class ResearchPipeline:
                 protocol=_PROTOCOL_REPHRASE,
                 client=client,
                 model=self.model,
-                completion_kwargs=self._completion_kwargs(DEFAULT_BLOCK_MAX_TOKENS),
+                completion_kwargs=self._completion_kwargs(self._budgets["block"]["max_tokens"]),
                 binding=self.binding,
                 tool_schemas=tool_schemas,
                 stream=stream,
@@ -740,21 +880,32 @@ class ResearchPipeline:
             trace_group="plan",
             research_status_key="decompose_target",
         )
-        step = await self._run_labeled_step(
-            client=client,
-            messages=messages,
-            tool_schemas=None,
-            protocol=_PROTOCOL_DECOMPOSE,
-            stream=stream,
-            stage="decomposing",
-            iter_meta=iter_meta,
-            max_tokens=DEFAULT_OUTLINE_MAX_TOKENS,
-            eager_sub_trace=False,
-        )
-        return self._parse_outline(topic, step.text)
 
-    def _parse_outline(self, topic: str, raw: str) -> list[SubTopicItem]:
-        data = parse_json_response(raw, logger_instance=logger, fallback={})
+        async def _attempt(reasoning_effort: str | None) -> str:
+            step = await self._run_labeled_step(
+                client=client,
+                messages=messages,
+                tool_schemas=None,
+                protocol=_PROTOCOL_DECOMPOSE,
+                stream=stream,
+                stage="decomposing",
+                iter_meta=iter_meta,
+                max_tokens=self._budgets["outline"]["max_tokens"],
+                reasoning_effort=reasoning_effort,
+                eager_sub_trace=False,
+            )
+            return step.text
+
+        # Decompose asks for the whole outline in one shot, so a reasoning
+        # model that spends the budget thinking returns nothing to parse and
+        # the topic silently degrades to a single sub-topic — research's
+        # version of the one-chapter book (#1316).
+        data = await payload_with_reasoning_retry(
+            _attempt, is_usable=_outline_payload_is_usable, logger_instance=logger
+        )
+        return self._parse_outline(topic, data)
+
+    def _parse_outline(self, topic: str, data: Any) -> list[SubTopicItem]:
         if isinstance(data, list):
             iterable: list[Any] = data
         elif isinstance(data, dict):
@@ -831,6 +982,11 @@ class ResearchPipeline:
             kb_note=kb_note,
             tool_list=tool_list,
         )
+        from deeptutor.agents._shared.workspace_prompt import workspace_system_note
+
+        workspace_note = workspace_system_note(context, language=self.language)
+        if workspace_note:
+            system_prompt = f"{system_prompt}\n\n{workspace_note}"
         system_prompt = append_language_directive(system_prompt, self.language)
 
         sibling_topics = self._render_sibling_topics(queue, block)
@@ -859,7 +1015,7 @@ class ResearchPipeline:
                 protocol=_PROTOCOL_BLOCK,
                 client=client,
                 model=self.model,
-                completion_kwargs=self._completion_kwargs(DEFAULT_BLOCK_MAX_TOKENS),
+                completion_kwargs=self._completion_kwargs(self._budgets["block"]["max_tokens"]),
                 binding=self.binding,
                 tool_schemas=tool_schemas,
                 stream=stream,
@@ -930,7 +1086,13 @@ class ResearchPipeline:
             calls += 1
             if result.label == LABEL_FINISH and result.text.strip():
                 return result.text, True, calls
-            messages.append({"role": "assistant", "content": result.text[:500]})
+            messages.append(
+                assistant_message(
+                    result.text[:500],
+                    reasoning_content=result.reasoning_content or None,
+                    thinking_blocks=list(result.thinking_blocks) or None,
+                )
+            )
             messages.append({"role": "user", "content": self._t("protocol.force_finish_repair")})
         return self._t("protocol.fallback_final"), False, calls
 
@@ -952,6 +1114,33 @@ class ResearchPipeline:
     def _kb_system_note(self) -> str:
         if not self.kb_name:
             return ""
+        if self._is_obsidian_kb:
+            return self._t(
+                "system.obsidian_kb_system_note",
+                default=(
+                    f"Attached knowledge base {self.kb_name!r} is a read-only "
+                    f"Obsidian vault. Gather evidence with obsidian_search, "
+                    f"obsidian_list and obsidian_read. Do not call rag."
+                ),
+                kb_name=self.kb_name,
+            )
+        tool_context = getattr(self, "_pageindex_tool_context", None)
+        if tool_context is not None:
+            tools = ", ".join(tool.name for tool in tool_context.tools)
+            docs = (
+                "; ".join(
+                    f"{name} (doc_id: {doc_id})"
+                    for name, doc_id in sorted(tool_context.documents.items())
+                )
+                or "(no indexed documents)"
+            )
+            instructions = tool_context.instructions.strip()
+            return (
+                f"Attached PageIndex knowledge base: {self.kb_name!r}. Read it with "
+                f"these tools inside the research loop; do not call rag: {tools}. "
+                f"Documents: {docs}."
+                + (f"\nPageIndex SDK reading instructions:\n{instructions}" if instructions else "")
+            )
         return self._t(
             "system.kb_system_note",
             default=(
@@ -1064,7 +1253,7 @@ class ResearchPipeline:
         )
         messages = self._build_system_user_messages(system_prompt, user_prompt)
         try:
-            kwargs = self._completion_kwargs(DEFAULT_NOTE_MAX_TOKENS)
+            kwargs = self._completion_kwargs(self._budgets["note"]["max_tokens"])
             response = await client.chat.completions.create(
                 model=self.model, messages=messages, stream=False, **kwargs
             )
@@ -1114,6 +1303,23 @@ class ResearchPipeline:
         # them into every report-writing step.
         section_count = len(outline.sections)
         conclusion_number = section_count + 2
+        report_parts = [
+            f"1. {self._t('labels.report_intro_part', default='Introduction')}",
+            *(
+                f"{index + 1}. {section.title}"
+                for index, section in enumerate(outline.sections, start=1)
+            ),
+            f"{conclusion_number}. {self._t('labels.report_conclusion_part', default='Conclusion')}",
+        ]
+
+        def incomplete_error(first_missing: int) -> IncompleteReportError:
+            notice_template = self._t(
+                "notices.report_incomplete",
+                default="The report stopped before these parts could be written: {parts}. Retry to generate the full report.",
+            )
+            return IncompleteReportError(
+                notice_template.format(parts=", ".join(report_parts[first_missing:]))
+            )
 
         section_texts: list[str] = []
 
@@ -1131,42 +1337,57 @@ class ResearchPipeline:
             )
             section_texts.append(title_block)
 
-        intro = await self._write_intro(topic=topic, outline=outline, stream=stream, client=client)
+        # The separator must be on the wire before ``_write_intro`` emits its
+        # first heading. Emitting it afterwards produced the literal live
+        # stream ``# Report title## 1. Introduction`` even though the final
+        # assembled response was normalized correctly.
+        if section_texts:
+            await self._stream_report_separator(stream)
+        try:
+            intro = await self._write_intro(
+                topic=topic, outline=outline, stream=stream, client=client
+            )
+        except Exception as exc:
+            raise incomplete_error(0) from exc
         if intro:
-            if section_texts:
-                await self._stream_report_separator(stream)
             section_texts.append(intro)
 
         section_bodies: list[str] = []
         for section_index, section in enumerate(outline.sections, start=1):
             if section_texts:
                 await self._stream_report_separator(stream)
-            body = await self._write_section(
-                section=section,
-                section_index=section_index,
-                section_count=section_count,
-                section_number=section_index + 1,
-                topic=topic,
-                outline=outline,
-                blocks=blocks,
-                citations=citations,
-                stream=stream,
-                client=client,
-            )
+            try:
+                body = await self._write_section(
+                    section=section,
+                    section_index=section_index,
+                    section_count=section_count,
+                    section_number=section_index + 1,
+                    topic=topic,
+                    outline=outline,
+                    blocks=blocks,
+                    citations=citations,
+                    stream=stream,
+                    client=client,
+                )
+            except Exception as exc:
+                raise incomplete_error(section_index) from exc
             if body:
                 section_texts.append(body)
                 section_bodies.append(body)
 
         if section_texts:
             await self._stream_report_separator(stream)
-        conclusion = await self._write_conclusion(
-            topic=topic,
-            outline=outline,
-            section_bodies=section_bodies,
-            section_number=conclusion_number,
-            stream=stream,
-            client=client,
-        )
+        try:
+            conclusion = await self._write_conclusion(
+                topic=topic,
+                outline=outline,
+                section_bodies=section_bodies,
+                section_number=conclusion_number,
+                stream=stream,
+                client=client,
+            )
+        except Exception as exc:
+            raise incomplete_error(section_count + 1) from exc
         if conclusion:
             section_texts.append(conclusion)
 
@@ -1368,23 +1589,32 @@ class ResearchPipeline:
             research_status_key="report_outline",
             report_part="outline",
         )
-        step = await self._run_labeled_step(
-            client=client,
-            messages=messages,
-            tool_schemas=None,
-            protocol=_PROTOCOL_REPORT_OUTLINE,
-            stream=stream,
-            stage="reporting",
-            iter_meta=iter_meta,
-            max_tokens=DEFAULT_REPORT_OUTLINE_MAX_TOKENS,
-            eager_sub_trace=False,
+
+        async def _attempt(reasoning_effort: str | None) -> str:
+            step = await self._run_labeled_step(
+                client=client,
+                messages=messages,
+                tool_schemas=None,
+                protocol=_PROTOCOL_REPORT_OUTLINE,
+                stream=stream,
+                stage="reporting",
+                iter_meta=iter_meta,
+                max_tokens=self._budgets["report_outline"]["max_tokens"],
+                reasoning_effort=reasoning_effort,
+                eager_sub_trace=False,
+            )
+            return step.text
+
+        # Same one-shot payload, same starvation: an empty outline here costs
+        # the reader the whole report structure.
+        data = await payload_with_reasoning_retry(
+            _attempt, is_usable=_report_outline_payload_is_usable, logger_instance=logger
         )
-        return self._parse_report_outline(topic, step.text, blocks)
+        return self._parse_report_outline(topic, data, blocks)
 
     def _parse_report_outline(
-        self, topic: str, raw: str, blocks: list[ResearchedBlock]
+        self, topic: str, data: Any, blocks: list[ResearchedBlock]
     ) -> ReportOutline:
-        data = parse_json_response(raw, logger_instance=logger, fallback={})
         valid_ids = {rb.block.block_id for rb in blocks}
         title_to_id = {rb.block.sub_topic.lower(): rb.block.block_id for rb in blocks}
 
@@ -1530,7 +1760,8 @@ class ResearchPipeline:
             client=client,
             label=self._t("labels.report_intro", default="Introduction"),
             call_id_root="research-report-intro",
-            max_tokens=DEFAULT_REPORT_INTRO_MAX_TOKENS,
+            max_tokens=self._budgets["report_intro"]["max_tokens"],
+            expected_section_number=1,
             extra_meta={
                 "research_status_key": "report_intro",
                 "report_part": "intro",
@@ -1573,7 +1804,8 @@ class ResearchPipeline:
             client=client,
             label=(f"{self._t('labels.report_section', default='Section')}: {section.title}"),
             call_id_root=f"research-report-section-{section.id}",
-            max_tokens=DEFAULT_REPORT_SECTION_MAX_TOKENS,
+            max_tokens=self._budgets["report_section"]["max_tokens"],
+            expected_section_number=section_number,
             extra_meta={
                 "research_status_key": "report_section",
                 "report_part": "section",
@@ -1617,7 +1849,8 @@ class ResearchPipeline:
             client=client,
             label=self._t("labels.report_conclusion", default="Conclusion"),
             call_id_root="research-report-conclusion",
-            max_tokens=DEFAULT_REPORT_CONCLUSION_MAX_TOKENS,
+            max_tokens=self._budgets["report_conclusion"]["max_tokens"],
+            expected_section_number=section_number,
             extra_meta={
                 "research_status_key": "report_conclusion",
                 "report_part": "conclusion",
@@ -1636,9 +1869,15 @@ class ResearchPipeline:
         call_id_root: str,
         max_tokens: int,
         extra_meta: dict[str, Any] | None = None,
+        expected_section_number: int | None = None,
     ) -> str:
-        """Common runner for the four report sub-phases: one labeled step
-        with body streaming live to the chat bubble + a sub-trace card."""
+        """Run and validate one report sub-phase, retrying partial streams.
+
+        Report prose is buffered until the call is known to be complete. This
+        prevents a timed-out first attempt from leaking half a section into
+        the final bubble before a retry starts. Progress / reasoning traces
+        still stream live, so long report calls remain observable.
+        """
         messages = self._build_system_user_messages(system_prompt, user_prompt)
         trace_extra = dict(extra_meta or {})
         iter_meta = self._build_simple_trace_meta(
@@ -1661,18 +1900,106 @@ class ResearchPipeline:
             trace_group="stage",
             **trace_extra,
         )
-        step = await self._run_labeled_step(
-            client=client,
-            messages=messages,
-            tool_schemas=None,
-            protocol=protocol,
-            stream=stream,
-            stage="reporting",
-            iter_meta=iter_meta,
-            max_tokens=max_tokens,
-            final_meta=final_meta,
+        expected_label = protocol.allowed[0]
+        last_reason = "empty response"
+        for attempt in range(1, DEFAULT_REPORT_STEP_MAX_ATTEMPTS + 1):
+            body = ""
+            step: LabeledStepResult | None = None
+            try:
+                step = await self._run_labeled_step(
+                    client=client,
+                    messages=messages,
+                    tool_schemas=None,
+                    protocol=protocol,
+                    stream=stream,
+                    stage="reporting",
+                    iter_meta=iter_meta,
+                    max_tokens=max_tokens,
+                    # Report prose is the reader-facing body; thinking on a
+                    # reasoning model comes out of the same max_tokens budget
+                    # and is the usual cause of first-attempt truncation.
+                    reasoning_effort="none",
+                    # Buffer body text until validation succeeds. Passing
+                    # ``final_meta`` here would stream a failed attempt and
+                    # make a clean retry impossible without duplicated prose.
+                    final_meta=None,
+                )
+                resolved_label, body = _recover_report_step_reply(
+                    step,
+                    expected_label=expected_label,
+                    expected_section_number=expected_section_number,
+                )
+                if resolved_label != step.label or body != (step.text or "").strip():
+                    step = replace(step, label=resolved_label, text=body)
+                last_reason = _report_step_incomplete_reason(
+                    step,
+                    expected_label=expected_label,
+                    body=body,
+                )
+                if not last_reason:
+                    await stream.content(
+                        body,
+                        source=SOURCE,
+                        stage="reporting",
+                        metadata=merge_trace_metadata(
+                            final_meta,
+                            {"trace_kind": "llm_chunk", "report_attempt": attempt},
+                        ),
+                    )
+                    return body
+            except Exception as exc:
+                last_reason = f"provider error: {type(exc).__name__}"
+                if attempt >= DEFAULT_REPORT_STEP_MAX_ATTEMPTS:
+                    raise
+                logger.warning(
+                    "Report step %s attempt %d/%d failed: %s",
+                    call_id_root,
+                    attempt,
+                    DEFAULT_REPORT_STEP_MAX_ATTEMPTS,
+                    exc,
+                )
+
+            if attempt < DEFAULT_REPORT_STEP_MAX_ATTEMPTS:
+                await stream.progress(
+                    self._t(
+                        "labels.report_retry",
+                        default="Report section was incomplete; retrying.",
+                    ),
+                    source=SOURCE,
+                    stage="reporting",
+                    metadata={
+                        "trace_kind": "warning",
+                        "report_retry": True,
+                        "report_attempt": attempt,
+                        "report_retry_reason": last_reason,
+                        **trace_extra,
+                    },
+                )
+                messages.extend(
+                    [
+                        assistant_message(
+                            f"``{expected_label}``\n{body}" if body else "",
+                            reasoning_content=step.reasoning_content if step else None,
+                            thinking_blocks=list(step.thinking_blocks) if step else None,
+                        ),
+                        {
+                            "role": "user",
+                            "content": self._t(
+                                "report.retry_complete",
+                                default=(
+                                    "The previous report part was incomplete or invalid. "
+                                    "Regenerate the complete part from its ## heading, "
+                                    "follow the required label protocol, and finish every sentence."
+                                ),
+                            ),
+                        },
+                    ]
+                )
+
+        raise RuntimeError(
+            f"Research report step {call_id_root!r} remained incomplete after "
+            f"{DEFAULT_REPORT_STEP_MAX_ATTEMPTS} attempts ({last_reason})."
         )
-        return (step.text or "").strip()
 
     def _render_section_evidence(
         self,
@@ -1733,6 +2060,22 @@ class ResearchPipeline:
     # ------------------------------------------------------------------
     # Tool composition for the block loop
     # ------------------------------------------------------------------
+    async def _prepare_pageindex_tools(self) -> None:
+        from deeptutor.services.rag.pipelines.pageindex.tools import (
+            build_pageindex_tool_context,
+        )
+
+        self._pageindex_tool_context = await build_pageindex_tool_context(
+            self.kb_name,
+            base_registry=self.registry,
+        )
+        if self._pageindex_tool_context is not None:
+            self.registry = self._pageindex_tool_context.registry
+
+    def _pageindex_tool_names(self) -> list[str]:
+        tool_context = getattr(self, "_pageindex_tool_context", None)
+        return [tool.name for tool in tool_context.tools] if tool_context is not None else []
+
     def _block_tool_names(self) -> list[str]:
         """Tools available inside the per-block research loop.
 
@@ -1755,18 +2098,30 @@ class ResearchPipeline:
             requested_tools=self.enabled_tools,
             optional_whitelist=RESEARCH_OPTIONAL_TOOLS,
             mount_flags=ToolMountFlags(
-                has_kb=bool(self.kb_name),
+                has_kb=bool(
+                    self.kb_name
+                    and not self._is_obsidian_kb
+                    and not getattr(self, "_pageindex_tool_context", None)
+                ),
                 has_sources=False,
                 has_memory=user_has_memory(),
                 has_notebooks=user_has_notebooks(),
-                has_code=exec_capability_available(),
+                has_exec=exec_capability_available(),
             ),
         )
-        return [
+        names = [
             name
             for name in composed
             if name in RESEARCH_BLOCK_TOOL_ALLOWLIST and self._tool_in_registry(name)
         ]
+        if self._vault_path:
+            names.extend(
+                name
+                for name in RESEARCH_OBSIDIAN_READ_TOOLS
+                if name in RESEARCH_BLOCK_TOOL_ALLOWLIST and self._tool_in_registry(name)
+            )
+        names.extend(self._pageindex_tool_names())
+        return list(dict.fromkeys(names))
 
     def _build_block_tool_schemas(
         self,
@@ -1798,25 +2153,27 @@ class ResearchPipeline:
         args: dict[str, Any],
         context: UnifiedContext,
     ) -> dict[str, Any]:
-        kwargs = dict(args)
-        turn_id = str(context.metadata.get("turn_id", "") or "").strip()
-        task_dir = None
-        if turn_id:
-            task_dir = get_path_service().get_task_workspace("deep_research", turn_id)
+        workspace = context.runtime.workspace
+        task_dir = (
+            Path(workspace.output_dir)
+            if workspace is not None
+            else fallback_task_dir_from_metadata(context, feature="deep_research")
+        )
+        kwargs = bind_workspace_tool_runtime(
+            tool_name,
+            args,
+            context,
+            fallback_task_dir=task_dir,
+        )
         if tool_name == "rag":
             kwargs.setdefault("mode", "hybrid")
             if self.kb_name:
                 kwargs.setdefault("kb_name", self.kb_name)
-        elif tool_name == "code_execution":
-            from deeptutor.services.sandbox import Mount
-
-            if task_dir is not None:
-                code_dir = task_dir / "code_runs"
-                code_dir.mkdir(parents=True, exist_ok=True)
-                kwargs["_sandbox_workdir"] = str(code_dir)
-                kwargs["_sandbox_mounts"] = (
-                    Mount(host_path=str(code_dir), sandbox_path=str(code_dir), read_only=False),
-                )
+        elif tool_name in RESEARCH_OBSIDIAN_READ_TOOLS:
+            if self._vault_path:
+                # Server-owned: overwrite any model-supplied value so the path
+                # can't be forged to read outside the connected vault.
+                kwargs["_vault_path"] = self._vault_path
         elif tool_name == "web_search":
             kwargs.setdefault("query", context.user_message)
             if task_dir is not None:
@@ -1857,13 +2214,18 @@ class ResearchPipeline:
     def _build_client(self) -> Any:
         return build_openai_client(self.client_config)
 
-    def _completion_kwargs(self, max_tokens: int) -> dict[str, Any]:
+    def _completion_kwargs(
+        self, max_tokens: int, reasoning_effort: str | None = None
+    ) -> dict[str, Any]:
         return build_completion_kwargs(
             temperature=self._temperature,
             model=self.model,
             max_tokens=max_tokens,
             binding=self.binding,
-            reasoning_effort=self.reasoning_effort,
+            # A step may turn thinking down for one call (a retry after the
+            # model spent the whole budget on it); otherwise the configured
+            # level stands.
+            reasoning_effort=reasoning_effort or self.reasoning_effort,
         )
 
     async def _run_labeled_step(
@@ -1876,16 +2238,19 @@ class ResearchPipeline:
         stream: StreamBus,
         stage: str,
         iter_meta: dict[str, Any],
-        max_tokens: int = DEFAULT_BLOCK_MAX_TOKENS,
+        max_tokens: int | None = None,
+        reasoning_effort: str | None = None,
         final_meta: dict[str, Any] | None = None,
         eager_sub_trace: bool = True,
     ) -> LabeledStepResult:
         """Research-flavoured thin wrapper over :func:`run_labeled_step`."""
+        if max_tokens is None:
+            max_tokens = int(self._budgets["block"]["max_tokens"])
         return await run_labeled_step(
             client=client,
             model=self.model,
             messages=messages,
-            completion_kwargs=self._completion_kwargs(max_tokens),
+            completion_kwargs=self._completion_kwargs(max_tokens, reasoning_effort),
             tool_schemas=tool_schemas,
             allowed_labels=protocol.allowed,
             final_labels=protocol.final,
@@ -1968,6 +2333,73 @@ class ResearchPipeline:
 # ---------------------------------------------------------------------------
 
 _REPORT_TOKEN_RE = re.compile(r"[^\W_]+", re.UNICODE)
+_REPORT_SECTION_HEADING_RE = re.compile(r"\A##\s+(\d+)\.\s*\S")
+
+
+def _report_heading_number(body: str) -> int | None:
+    match = _REPORT_SECTION_HEADING_RE.match(body)
+    if match is None:
+        return None
+    return int(match.group(1))
+
+
+def _recover_report_step_reply(
+    step: LabeledStepResult,
+    *,
+    expected_label: str,
+    expected_section_number: int | None,
+) -> tuple[str, str]:
+    """Recover a protocol label from a finished report reply.
+
+    The streaming 64-char probe stays strict. Once the full reply is in
+    hand, accept an unclosed/over-wide fence around the expected label, or
+    a missing label whose body opens with ``## {n}.`` for *this* section.
+    """
+    raw = step.text or ""
+    body = raw.strip()
+    if step.label == expected_label:
+        return expected_label, body
+
+    recovered = recover_finished_label(raw, allowed_labels=(expected_label,))
+    if recovered is not None and recovered[0] == expected_label:
+        return expected_label, recovered[1].strip()
+
+    if (
+        expected_section_number is not None
+        and _report_heading_number(body) == expected_section_number
+    ):
+        return expected_label, body
+    return step.label, body
+
+
+def _report_step_incomplete_reason(
+    step: LabeledStepResult,
+    *,
+    expected_label: str,
+    body: str,
+) -> str:
+    """Return why a generated report part is unsafe to persist, or ``""``.
+
+    Deep Research report calls are stricter than ordinary chat: an empty
+    formal channel, a token-limit finish, or the labeled-step idle escape
+    means the report is incomplete even though the provider call itself did
+    not raise. Every report part must also contain its numbered H2 heading.
+    """
+
+    if step.label != expected_label:
+        return f"expected {expected_label} label, got {step.label or 'none'}"
+    if step.stream_idle_timeout:
+        return "provider stream went idle before an explicit finish"
+    finish_reason = (step.finish_reason or "").strip().lower()
+    if finish_was_truncated(finish_reason):
+        return f"provider stopped at its output limit ({finish_reason})"
+    if len(body) < 80:
+        return f"body is too short ({len(body)} characters)"
+    if not _REPORT_SECTION_HEADING_RE.match(body):
+        return "numbered report heading is missing"
+    return ""
+
+
 _REPORT_STOPWORDS = {
     "a",
     "an",
@@ -2322,13 +2754,16 @@ class _BlockLoopHost:
                 "notices.start_retrieval", default="Starting retrieval"
             ),
             too_many_tool_calls_message=too_many,
-            unknown_error_message_factory=lambda tn: self._pipeline._t(
-                "notices.tool_unknown_error",
-                tool=tn,
-                default=f"Error executing {tn}.",
-            ),
+            tool_error_message_factory=tool_error_message_factory(self._pipeline._t),
             trace_id_prefix=f"research-{self._block.block_id}-iter",
+            tool_timeout=self._pipeline.tool_timeout,
+            tool_max_retries=self._pipeline.tool_max_retries,
         )
+        pageindex_sources = [
+            source for source in outcome.sources if source.get("type") == "pageindex"
+        ]
+        if pageindex_sources:
+            await self._stream.sources(pageindex_sources, source=SOURCE, stage="researching")
         if tool_calls:
             self._tool_rounds_used += 1
         await self._summarise_and_record(tool_calls, outcome)
@@ -2377,13 +2812,19 @@ class _BlockLoopHost:
         for tm in outcome.tool_messages:
             tool_call_id = str(tm.get("tool_call_id") or "")
             tool_name, tool_args = call_meta_by_id.get(tool_call_id, ("", {}))
-            if tool_name not in CITABLE_TOOLS:
+            if not _is_citable_tool(tool_name):
                 continue
             raw_answer = str(tm.get("content") or "")
             if not raw_answer.strip():
                 continue
             try:
-                query = str(tool_args.get("query") or "")
+                query_key = {
+                    "obsidian_read": "note",
+                    "obsidian_list": "folder",
+                }.get(tool_name, "query")
+                query = str(tool_args.get(query_key) or "")
+                if tool_name == "obsidian_list" and not query:
+                    query = "/"
                 summary = await self._pipeline._summarise_tool_result(
                     tool_name=tool_name,
                     query=query,
@@ -2699,11 +3140,7 @@ class _RephraseLoopHost:
                 "notices.start_retrieval", default="Starting retrieval"
             ),
             too_many_tool_calls_message=too_many,
-            unknown_error_message_factory=lambda tn: self._pipeline._t(
-                "notices.tool_unknown_error",
-                tool=tn,
-                default=f"Error executing {tn}.",
-            ),
+            tool_error_message_factory=tool_error_message_factory(self._pipeline._t),
             trace_id_prefix="research-rephrase-iter",
         )
         if rejected:
@@ -2712,13 +3149,13 @@ class _RephraseLoopHost:
         return outcome
 
     async def resolve_pause(self, dispatch: DispatchOutcome) -> bool:
-        from deeptutor.agents.chat.agentic_pipeline import (
+        from deeptutor.agents.loop.pipeline import (
             _format_user_reply_body,
             _normalise_user_reply,
         )
 
         ask_user = (dispatch.pause_payload or {}).get("ask_user") or {}
-        waiter = self._context.metadata.get("wait_for_user_reply")
+        waiter = self._context.runtime.wait_for_user_reply
         if not callable(waiter):
             return False
         raw_reply = await waiter()
@@ -2791,6 +3228,8 @@ __all__ = [
     "LABEL_SECTION",
     "LABEL_THINK",
     "LABEL_TOOL",
+    "RESEARCH_BLOCK_TOOL_ALLOWLIST",
+    "RESEARCH_OBSIDIAN_READ_TOOLS",
     "ResearchPipeline",
     "ResearchedBlock",
     "ReportOutline",

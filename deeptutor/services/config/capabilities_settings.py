@@ -1,6 +1,6 @@
 """Read/write the per-capability tunables surfaced by the Settings UI.
 
-This is the source of truth for the ``/api/v1/capabilities/settings``
+This is the source of truth for the ``/api/capabilities/settings``
 endpoint. It bridges two on-disk files:
 
 * ``data/user/settings/agents.yaml`` — per-capability LLM params
@@ -44,6 +44,7 @@ _AGENTS_YAML_CAPABILITY_SECTIONS: dict[str, tuple[str, ...]] = {
     "solve": ("capabilities", "solve"),
     "research": ("capabilities", "research"),
     "question": ("capabilities", "question"),
+    "visualize": ("capabilities", "visualize"),
     "co_writer": ("capabilities", "co_writer"),
     "vision_solver": ("plugins", "vision_solver"),
     "math_animator": ("plugins", "math_animator"),
@@ -53,6 +54,11 @@ _SIMPLE_LLM_DEFAULTS: dict[str, dict[str, Any]] = {
     "solve": {"temperature": 0.3, "max_tokens": 8192},
     "research": {"temperature": 0.5, "max_tokens": 16834},
     "question": {"temperature": 0.7, "max_tokens": 4096},
+    # The visualize loop's own defaults, unchanged from when they were written
+    # into the pipeline construction: a user who never touches this keeps the
+    # behaviour they had, and one whose reasoning model eats the budget can now
+    # raise it (#1546).
+    "visualize": {"temperature": 0.15, "max_tokens": 16000},
     "co_writer": {"temperature": 0.6, "max_tokens": 4096},
     "vision_solver": {"temperature": 0.3, "max_tokens": 12000},
     "math_animator": {"temperature": 0.2, "max_tokens": 16834},
@@ -72,8 +78,13 @@ _MAIN_YAML_RUNTIME_DEFAULTS: dict[str, dict[str, Any]] = {
     "research": {
         "researching": {
             "note_agent_mode": "auto",
-            "tool_timeout": 60,
-            "tool_max_retries": 3,
+            # Must match ``ResearchPipeline``'s own defaults. This table is the
+            # fallback used when a settings payload is written, so a user who
+            # merely opens research settings and saves would otherwise persist
+            # 60/3 and permanently shadow the pipeline's 240/0 — the same shape
+            # of bug as #1316, where a layer below the config silently won.
+            "tool_timeout": 240,
+            "tool_max_retries": 0,
             "paper_search_years_limit": 5,
         },
     },
@@ -432,6 +443,17 @@ def save_capabilities_settings(payload: dict[str, Any]) -> dict[str, Any]:
     return capabilities_settings_dict()
 
 
+def get_visualize_params() -> dict[str, Any]:
+    """Runtime visualize params, read through the same coerce path as the UI.
+
+    The budget used to be a literal in the capability, so ``agents.yaml`` and
+    the settings page could not move it and a reasoning model that spent most
+    of the budget on chain-of-thought truncated the payload with no recourse
+    (#1546).
+    """
+    return _build_simple_llm_block(_read_agents_yaml(), "visualize")
+
+
 def get_solve_params() -> dict[str, Any]:
     """Runtime solve params, read through the same coerce path as the UI.
 
@@ -451,5 +473,6 @@ def get_solve_params() -> dict[str, Any]:
 __all__ = [
     "capabilities_settings_dict",
     "get_solve_params",
+    "get_visualize_params",
     "save_capabilities_settings",
 ]

@@ -13,7 +13,7 @@ from typing import Awaitable, Callable
 from deeptutor.services.path_service import get_path_service
 
 from .models import RenderedArtifact, RenderResult
-from .utils import slugify_filename, trim_error_message
+from .utils import build_repair_error_message, slugify_filename, trim_error_message
 
 YON_IMAGE_PATTERN = re.compile(
     r"###\s*YON_IMAGE_(\d+)_START\s*###\s*(.*?)\s*###\s*YON_IMAGE_\1_END\s*###",
@@ -37,11 +37,19 @@ class ManimRenderService:
         self,
         turn_id: str,
         progress_callback: Callable[[str, bool], Awaitable[None]] | None = None,
+        *,
+        output_dir: str | Path | None = None,
+        workspace_root: str | Path | None = None,
     ) -> None:
         self.turn_id = turn_id
-        self.path_service = get_path_service()
         self.progress_callback = progress_callback
-        self.base_dir = self.path_service.get_agent_dir("math_animator") / turn_id
+        self.workspace_root = Path(workspace_root).resolve() if workspace_root else None
+        self.path_service = None if output_dir else get_path_service()
+        self.base_dir = (
+            Path(output_dir).resolve()
+            if output_dir
+            else self.path_service.get_agent_dir("math_animator") / turn_id
+        )
         self.source_dir = self.base_dir / "source"
         self.artifacts_dir = self.base_dir / "artifacts"
         self.media_dir = self.base_dir / "media"
@@ -61,10 +69,13 @@ class ManimRenderService:
         else:
             artifacts = [await self._render_video(code_path=source_path, quality=quality)]
 
+        source_code_path = str(source_path)
+        if self.workspace_root is not None:
+            source_code_path = source_path.resolve().relative_to(self.workspace_root).as_posix()
         return RenderResult(
             output_mode=output_mode,
             artifacts=artifacts,
-            source_code_path=str(source_path),
+            source_code_path=source_code_path,
             quality=quality,
         )
 
@@ -192,13 +203,18 @@ class ManimRenderService:
         return_code = process.wait()
         await self._emit_progress(f"Manim process finished with exit code {return_code}.", raw=True)
         if return_code != 0:
-            raise ManimRenderError(
-                trim_error_message(
-                    "\n".join(
-                        part for part in ["\n".join(stdout_lines), "\n".join(stderr_lines)] if part
-                    )
+            detail = trim_error_message(
+                "\n".join(
+                    part for part in ["\n".join(stdout_lines), "\n".join(stderr_lines)] if part
                 )
             )
+            try:
+                generated_code = code_path.read_text(encoding="utf-8")
+            except OSError:
+                # The renderer's stderr is still the cause if the source file
+                # disappeared while Manim was running.
+                generated_code = ""
+            raise ManimRenderError(build_repair_error_message(detail, code=generated_code))
 
     async def _emit_progress(self, message: str, raw: bool = False) -> None:
         if self.progress_callback is None:
@@ -233,13 +249,23 @@ class ManimRenderService:
         content_type: str,
         label: str,
     ) -> RenderedArtifact:
-        rel_path = artifact_path.resolve().relative_to(self.path_service.user_data_dir.resolve())
+        if self.workspace_root is not None:
+            relative_path = artifact_path.resolve().relative_to(self.workspace_root).as_posix()
+            url = ""
+        else:
+            assert self.path_service is not None
+            relative_path = ""
+            rel_path = artifact_path.resolve().relative_to(
+                self.path_service.user_data_dir.resolve()
+            )
+            url = f"/files/outputs/{rel_path.as_posix()}"
         return RenderedArtifact(
             type=artifact_type,
             filename=artifact_path.name,
-            url=f"/api/outputs/{rel_path.as_posix()}",
+            url=url,
             content_type=content_type,
             label=label,
+            relative_path=relative_path,
         )
 
 

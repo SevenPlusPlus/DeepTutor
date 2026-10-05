@@ -14,7 +14,10 @@
  * persisted positive id).
  */
 
-import type { MessageItem } from "@/context/UnifiedChatContext";
+export interface BranchMessage {
+  id?: number;
+  parentMessageId?: number | null;
+}
 
 const ROOT_KEY = "null";
 
@@ -28,7 +31,7 @@ function parentKey(id: number | null | undefined): string {
 // ample headroom and stays well under ``Number.MAX_SAFE_INTEGER``.
 const OPTIMISTIC_RANK_OFFSET = 1e15;
 
-function siblingRank(message: MessageItem): number {
+function siblingRank(message: BranchMessage): number {
   // Optimistic, in-flight messages get a negative ``id`` on the client
   // (``-Date.now()``) and must be treated as the freshest sibling so the
   // bubble the user just submitted stays visible. Among optimistic rows,
@@ -37,6 +40,43 @@ function siblingRank(message: MessageItem): number {
   // messages keep their natural id-ordered rank.
   const id = message.id ?? 0;
   return id < 0 ? OPTIMISTIC_RANK_OFFSET - id : id;
+}
+
+/** Parent key the visible-path walk should start from.
+ *
+ *  Normally that is the session root. A session can also arrive with no root
+ *  message at all — legacy rows whose parent was deleted before turn deletion
+ *  re-parented descendants, or local state in the instant after DELETE_TURN.
+ *  Those rows are still real history, so the walk starts from the dangling
+ *  parent of the oldest orphan rather than rendering a blank page (#912).
+ */
+function walkStartKey<T extends BranchMessage>(
+  allMessages: T[],
+  childrenByParent: Map<string, T[]>,
+): string {
+  if ((childrenByParent.get(ROOT_KEY)?.length ?? 0) > 0) return ROOT_KEY;
+
+  const known = new Set<number>();
+  for (const msg of allMessages) {
+    if (msg.id !== undefined) known.add(msg.id);
+  }
+  const orphans = allMessages.filter(
+    (m) =>
+      m.id !== undefined &&
+      m.parentMessageId != null &&
+      !known.has(m.parentMessageId),
+  );
+  // A pure cycle has no orphan entry point; fall back to the oldest message.
+  const seeds =
+    orphans.length > 0
+      ? orphans
+      : allMessages.filter((m) => m.id !== undefined);
+  if (seeds.length === 0) return ROOT_KEY;
+
+  const oldest = seeds.reduce((a, b) =>
+    siblingRank(b) < siblingRank(a) ? b : a,
+  );
+  return parentKey(oldest.parentMessageId);
 }
 
 export interface SiblingInfo {
@@ -50,20 +90,20 @@ export interface SiblingInfo {
   parentId: number | null;
 }
 
-export interface VisiblePathResult {
+export interface VisiblePathResult<T extends BranchMessage> {
   /** The flat message list to render, in chronological order. */
-  messages: MessageItem[];
+  messages: T[];
   /** Sibling info keyed by message id. Only present for messages whose
    *  parent has more than one child (i.e. branching points). */
   siblingsByMessageId: Map<number, SiblingInfo>;
 }
 
-export function buildVisiblePath(
-  allMessages: MessageItem[],
+export function buildVisiblePath<T extends BranchMessage>(
+  allMessages: T[],
   selectedBranches: Record<string, number> | undefined,
-): VisiblePathResult {
+): VisiblePathResult<T> {
   // Group by parent.
-  const childrenByParent = new Map<string, MessageItem[]>();
+  const childrenByParent = new Map<string, T[]>();
   for (const msg of allMessages) {
     if (msg.id === undefined) continue;
     const key = parentKey(msg.parentMessageId);
@@ -76,10 +116,10 @@ export function buildVisiblePath(
   }
 
   const selection = selectedBranches ?? {};
-  const visible: MessageItem[] = [];
+  const visible: T[] = [];
   const siblingsByMessageId = new Map<number, SiblingInfo>();
   const guard = new Set<string>();
-  let currentParent = ROOT_KEY;
+  let currentParent = walkStartKey(allMessages, childrenByParent);
   // Bound the walk defensively against pathological data (loops).
   let safety = 10_000;
   while (safety > 0) {
@@ -89,7 +129,7 @@ export function buildVisiblePath(
     const children = childrenByParent.get(currentParent);
     if (!children || children.length === 0) break;
 
-    let chosen: MessageItem;
+    let chosen: T;
     if (children.length === 1) {
       chosen = children[0];
     } else {
@@ -118,6 +158,34 @@ export function buildVisiblePath(
   return { messages: visible, siblingsByMessageId };
 }
 
+/** Branch picks safe to persist — optimistic (negative) ids are client-only. */
+export function persistedBranchSelections(
+  selections: Record<string, number>,
+): Record<string, number> {
+  const result: Record<string, number> = {};
+  for (const [key, id] of Object.entries(selections)) {
+    if (Number.isInteger(id) && id > 0) result[key] = id;
+  }
+  return result;
+}
+
+/** Select a freshly-created child at a branch point.
+ *
+ * Sending a message can create a sibling even when the parent previously had
+ * only one visible child (notably message edits). Persisting that choice with
+ * the optimistic id also lets reconcileTurnIds remap it to the server id.
+ */
+export function selectChildBranch(
+  selectedBranches: Record<string, number>,
+  parentId: number | null,
+  childId: number,
+): Record<string, number> {
+  return {
+    ...selectedBranches,
+    [parentKey(parentId)]: childId,
+  };
+}
+
 /**
  * Find the most recent child id under ``parentId`` from a flat message
  * list. Used after an edit to auto-select the freshly persisted sibling.
@@ -125,7 +193,7 @@ export function buildVisiblePath(
  * useful as a persisted selection target.
  */
 export function latestChildId(
-  allMessages: MessageItem[],
+  allMessages: BranchMessage[],
   parentId: number | null,
 ): number | null {
   const key = parentKey(parentId);
@@ -150,7 +218,7 @@ export function latestChildId(
  * when no server reload has reconciled real ids yet. ``null`` for an
  * empty session.
  */
-export function tipMessageId(visible: MessageItem[]): number | null {
+export function tipMessageId(visible: BranchMessage[]): number | null {
   for (let i = visible.length - 1; i >= 0; i -= 1) {
     const id = visible[i].id;
     if (id !== undefined) return id;

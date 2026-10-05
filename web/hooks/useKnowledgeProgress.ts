@@ -2,9 +2,14 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { apiUrl, wsUrl } from "@/lib/api";
-import type { ProgressInfo } from "@/lib/knowledge-helpers";
+import {
+  progressMessage,
+  taskFailureMessage,
+  type ProgressInfo,
+} from "@/lib/knowledge-helpers";
+import { useTranslation } from "react-i18next";
 
-export type TaskKind = "create" | "upload" | "reindex" | "retry";
+export type TaskKind = "create" | "upload" | "sync" | "reindex" | "retry";
 
 export interface TaskState {
   taskId: string;
@@ -13,6 +18,40 @@ export interface TaskState {
   logs: string[];
   executing: boolean;
   error: string | null;
+  errorCode?: string;
+  retryable?: boolean;
+}
+
+export function appendTaskLog(logs: string[], message?: string): string[] {
+  const line = String(message || "").trim();
+  if (!line || logs.at(-1) === line) return logs;
+  return [...logs, line];
+}
+
+export function taskStateAfterProgress(
+  current: TaskState,
+  expectedTaskId: string | undefined,
+  progress: ProgressInfo,
+  /** Defaults to the key itself, i.e. the untranslated English. */
+  t: (key: string, options?: Record<string, unknown>) => string = (key) => key,
+): TaskState {
+  const taskId = expectedTaskId || progress.task_id;
+  if (taskId && current.taskId !== taskId) return current;
+  const logs = appendTaskLog(current.logs, progressMessage(progress, t));
+  if (progress.stage === "completed") {
+    return { ...current, logs, executing: false, error: null };
+  }
+  if (progress.stage === "error") {
+    return {
+      ...current,
+      logs,
+      executing: false,
+      error: progress.error || progressMessage(progress, t) || "Task failed",
+      errorCode: progress.error_code,
+      retryable: progress.retryable,
+    };
+  }
+  return logs === current.logs ? current : { ...current, logs };
 }
 
 interface UseKnowledgeProgressOptions {
@@ -28,6 +67,9 @@ interface UseKnowledgeProgressOptions {
 }
 
 export function useKnowledgeProgress(options?: UseKnowledgeProgressOptions) {
+  // Progress lines arrive as English templates plus values; this hook is the
+  // first place that knows the viewer's language.
+  const { t } = useTranslation();
   const onCompleteRef = useRef(options?.onComplete);
   const onTaskSettledRef = useRef(options?.onTaskSettled);
   useEffect(() => {
@@ -46,10 +88,30 @@ export function useKnowledgeProgress(options?: UseKnowledgeProgressOptions) {
 
   const socketsRef = useRef<Record<string, WebSocket>>({});
   const sourcesRef = useRef<Record<string, EventSource>>({});
+  // Keep task identity after settlement too: a stale list response must not
+  // reopen the same stream or erase its logs on the next polling tick.
+  const trackedTaskIdsRef = useRef<Record<string, string>>({});
+  const resumeTaskRef = useRef<
+    ((kbName: string, progress: ProgressInfo, label?: string) => void) | null
+  >(null);
+  const socketTargetsRef = useRef<
+    Record<string, { taskId?: string; retry: number }>
+  >({});
+  const socketRetryTimersRef = useRef<
+    Record<string, ReturnType<typeof setTimeout>>
+  >({});
+  const subscribeWsRef = useRef<
+    ((kbName: string, expectedTaskId?: string) => void) | null
+  >(null);
 
   const closeSocket = useCallback((kbName: string) => {
-    socketsRef.current[kbName]?.close();
+    delete socketTargetsRef.current[kbName];
+    const retryTimer = socketRetryTimersRef.current[kbName];
+    if (retryTimer) clearTimeout(retryTimer);
+    delete socketRetryTimersRef.current[kbName];
+    const socket = socketsRef.current[kbName];
     delete socketsRef.current[kbName];
+    socket?.close();
   }, []);
 
   const closeSource = useCallback((kbName: string) => {
@@ -58,10 +120,16 @@ export function useKnowledgeProgress(options?: UseKnowledgeProgressOptions) {
   }, []);
 
   const closeAll = useCallback(() => {
+    Object.values(socketRetryTimersRef.current).forEach((timer) =>
+      clearTimeout(timer),
+    );
+    socketRetryTimersRef.current = {};
+    socketTargetsRef.current = {};
     Object.values(socketsRef.current).forEach((s) => s.close());
     socketsRef.current = {};
     Object.values(sourcesRef.current).forEach((s) => s.close());
     sourcesRef.current = {};
+    trackedTaskIdsRef.current = {};
   }, []);
 
   const setProgress = useCallback((kbName: string, info: ProgressInfo) => {
@@ -79,18 +147,43 @@ export function useKnowledgeProgress(options?: UseKnowledgeProgressOptions) {
 
   const subscribeWs = useCallback(
     (kbName: string, expectedTaskId?: string) => {
-      closeSocket(kbName);
-      const query = expectedTaskId
-        ? `?task_id=${encodeURIComponent(expectedTaskId)}`
-        : "";
+      if (
+        socketTargetsRef.current[kbName]?.taskId === expectedTaskId &&
+        (socketsRef.current[kbName] || socketRetryTimersRef.current[kbName])
+      )
+        return;
+      const previous = socketsRef.current[kbName];
+      delete socketsRef.current[kbName];
+      previous?.close();
+      const retryTimer = socketRetryTimersRef.current[kbName];
+      if (retryTimer) clearTimeout(retryTimer);
+      delete socketRetryTimersRef.current[kbName];
+      const existingTarget = socketTargetsRef.current[kbName];
+      socketTargetsRef.current[kbName] = {
+        taskId: expectedTaskId,
+        retry:
+          existingTarget && existingTarget.taskId === expectedTaskId
+            ? existingTarget.retry
+            : 0,
+      };
+      const queryParams = new URLSearchParams();
+      if (expectedTaskId) queryParams.set("task_id", expectedTaskId);
+      if (/^\/knowledge-bases(?:\/|$)/.test(window.location.pathname)) queryParams.set("resource_library", "true");
+      const query = queryParams.size ? `?${queryParams}` : "";
       const socket = new WebSocket(
         wsUrl(
-          `/api/v1/knowledge/${encodeURIComponent(kbName)}/progress/ws${query}`,
+          `/ws/knowledge-bases/${encodeURIComponent(kbName)}/progress${query}`,
         ),
       );
       socketsRef.current[kbName] = socket;
 
+      socket.onopen = () => {
+        const target = socketTargetsRef.current[kbName];
+        if (target && target.taskId === expectedTaskId) target.retry = 0;
+      };
+
       socket.onmessage = (event) => {
+        if (socketsRef.current[kbName] !== socket) return;
         try {
           const raw = JSON.parse(event.data) as {
             type?: string;
@@ -108,8 +201,40 @@ export function useKnowledgeProgress(options?: UseKnowledgeProgressOptions) {
           }
           setProgress(kbName, progress);
           const stage = progress.stage;
+          const terminal = stage === "completed" || stage === "error";
+          if (!expectedTaskId && progress.task_id && !terminal) {
+            resumeTaskRef.current?.(kbName, progress);
+          }
+          setTasksByKb((prev) => {
+            const current = prev[kbName];
+            if (!current) return prev;
+            const finalState = taskStateAfterProgress(
+              current,
+              expectedTaskId,
+              progress,
+              t,
+            );
+            if (finalState === current) return prev;
+            const startedAt =
+              startedAtRef.current[`${kbName}:${current.taskId}`] ?? Date.now();
+            if (terminal && current.executing) {
+              delete startedAtRef.current[`${kbName}:${current.taskId}`];
+              onTaskSettledRef.current?.(kbName, {
+                ...finalState,
+                status: finalState.error ? "error" : "completed",
+                startedAt,
+                completedAt: Date.now(),
+              } as TaskState & {
+                startedAt: number;
+                completedAt: number;
+                status: "error" | "completed";
+              });
+            }
+            return { ...prev, [kbName]: finalState };
+          });
           if (stage === "completed" || stage === "error") {
             closeSocket(kbName);
+            closeSource(kbName);
             onCompleteRef.current?.(kbName);
           }
         } catch {
@@ -117,13 +242,33 @@ export function useKnowledgeProgress(options?: UseKnowledgeProgressOptions) {
         }
       };
 
-      socket.onerror = () => closeSocket(kbName);
+      socket.onerror = () => socket.close();
       socket.onclose = () => {
+        if (socketsRef.current[kbName] !== socket) return;
         delete socketsRef.current[kbName];
+        const target = socketTargetsRef.current[kbName];
+        if (!target || target.taskId !== expectedTaskId) return;
+        const delay = Math.min(500 * 2 ** target.retry, 5000);
+        target.retry += 1;
+        socketRetryTimersRef.current[kbName] = setTimeout(() => {
+          delete socketRetryTimersRef.current[kbName];
+          const latest = socketTargetsRef.current[kbName];
+          if (!latest || latest.taskId !== expectedTaskId) return;
+          subscribeWsRef.current?.(kbName, expectedTaskId);
+        }, delay);
       };
     },
-    [closeSocket, setProgress],
+    [closeSocket, closeSource, setProgress, t],
   );
+
+  useEffect(() => {
+    subscribeWsRef.current = subscribeWs;
+    return () => {
+      if (subscribeWsRef.current === subscribeWs) {
+        subscribeWsRef.current = null;
+      }
+    };
+  }, [subscribeWs]);
 
   const openTaskStream = useCallback(
     (
@@ -134,6 +279,7 @@ export function useKnowledgeProgress(options?: UseKnowledgeProgressOptions) {
       initialLogs: string[] = [],
     ) => {
       closeSource(kbName);
+      trackedTaskIdsRef.current[kbName] = taskId;
       startedAtRef.current[`${kbName}:${taskId}`] = Date.now();
       setTasksByKb((prev) => ({
         ...prev,
@@ -148,7 +294,9 @@ export function useKnowledgeProgress(options?: UseKnowledgeProgressOptions) {
       }));
 
       const source = new EventSource(
-        apiUrl(`/api/v1/knowledge/tasks/${encodeURIComponent(taskId)}/stream`),
+        apiUrl(
+          `/api/knowledge-bases/tasks/${encodeURIComponent(taskId)}/stream`,
+        ),
         { withCredentials: true },
       );
       sourcesRef.current[kbName] = source;
@@ -156,6 +304,7 @@ export function useKnowledgeProgress(options?: UseKnowledgeProgressOptions) {
       let settled = false;
 
       source.addEventListener("process_log", (event) => {
+        if (sourcesRef.current[kbName] !== source) return;
         try {
           const payload = JSON.parse((event as MessageEvent).data) as {
             message?: string;
@@ -164,11 +313,13 @@ export function useKnowledgeProgress(options?: UseKnowledgeProgressOptions) {
           setTasksByKb((prev) => {
             const current = prev[kbName];
             if (!current || current.taskId !== taskId) return prev;
+            const logs = appendTaskLog(current.logs, payload.message);
+            if (logs === current.logs) return prev;
             return {
               ...prev,
               [kbName]: {
                 ...current,
-                logs: [...current.logs, payload.message!],
+                logs,
               },
             };
           });
@@ -178,21 +329,45 @@ export function useKnowledgeProgress(options?: UseKnowledgeProgressOptions) {
       });
 
       source.addEventListener("progress", (event) => {
+        if (sourcesRef.current[kbName] !== source) return;
         try {
           const payload = JSON.parse(
             (event as MessageEvent).data,
           ) as ProgressInfo;
           setProgress(kbName, payload);
+          // The progress bar reads `percent`; the log box reads `task.logs`.
+          // Also surface the message so "Describing images: m/n" and
+          // "Embedding batches: N/M" stream into the log box live (not only at
+          // completion). Dedupe against the last line: process_log may already
+          // have emitted the same message via _task_log.
+          const line = progressMessage(payload, t);
+          if (line) {
+            setTasksByKb((prev) => {
+              const current = prev[kbName];
+              if (!current || current.taskId !== taskId) return prev;
+              const logs = appendTaskLog(current.logs, line);
+              if (logs === current.logs) return prev;
+              return {
+                ...prev,
+                [kbName]: {
+                  ...current,
+                  logs,
+                },
+              };
+            });
+          }
         } catch {
           // ignore malformed progress
         }
       });
 
       source.addEventListener("complete", () => {
+        if (sourcesRef.current[kbName] !== source) return;
         settled = true;
         setTasksByKb((prev) => {
           const current = prev[kbName];
           if (!current || current.taskId !== taskId) return prev;
+          if (!current.executing) return prev;
           const finalState = { ...current, executing: false };
           const startedAt =
             startedAtRef.current[`${kbName}:${taskId}`] ?? Date.now();
@@ -214,27 +389,34 @@ export function useKnowledgeProgress(options?: UseKnowledgeProgressOptions) {
       });
 
       source.addEventListener("failed", (event) => {
+        if (sourcesRef.current[kbName] !== source) return;
         settled = true;
         let detail = "Task failed";
-        let details: string | undefined;
+        let errorCode: string | undefined;
+        let retryable: boolean | undefined;
         try {
           const payload = JSON.parse((event as MessageEvent).data) as {
             detail?: string;
             details?: string;
+            error_code?: string;
+            retryable?: boolean;
           };
-          detail = payload.detail || detail;
-          details = payload.details;
+          detail = taskFailureMessage(payload);
+          errorCode = payload.error_code;
+          retryable = payload.retryable;
         } catch {
           // ignore malformed failure event
         }
-        const composed = details ? `${detail}\n\n${details}` : detail;
         setTasksByKb((prev) => {
           const current = prev[kbName];
           if (!current || current.taskId !== taskId) return prev;
+          if (!current.executing) return prev;
           const finalState = {
             ...current,
             executing: false,
-            error: composed,
+            error: detail,
+            errorCode,
+            retryable,
           };
           const startedAt =
             startedAtRef.current[`${kbName}:${taskId}`] ?? Date.now();
@@ -255,23 +437,11 @@ export function useKnowledgeProgress(options?: UseKnowledgeProgressOptions) {
 
       source.onerror = () => {
         if (settled) return;
-        setTasksByKb((prev) => {
-          const current = prev[kbName];
-          if (!current || current.taskId !== taskId) return prev;
-          if (!current.executing) return prev;
-          return {
-            ...prev,
-            [kbName]: {
-              ...current,
-              executing: false,
-              error: current.error || "Process log stream disconnected.",
-            },
-          };
-        });
-        closeSource(kbName);
+        // EventSource reconnects automatically. Progress WebSocket remains the
+        // authoritative terminal-state fallback while SSE reconnects.
       };
     },
-    [closeSource, setProgress],
+    [closeSource, setProgress, t],
   );
 
   const startTask = useCallback(
@@ -291,9 +461,39 @@ export function useKnowledgeProgress(options?: UseKnowledgeProgressOptions) {
     [openTaskStream, setProgress, subscribeWs],
   );
 
+  const resumeTask = useCallback(
+    (kbName: string, snapshot: ProgressInfo, label = kbName) => {
+      setProgress(kbName, snapshot);
+      const taskId = snapshot.task_id;
+      if (!taskId) {
+        subscribeWs(kbName);
+        return;
+      }
+      if (trackedTaskIdsRef.current[kbName] === taskId) return;
+      const kind: TaskKind = taskId.startsWith("kb_init_")
+        ? "create"
+        : taskId.startsWith("kb_reindex_")
+          ? "reindex"
+          : "upload";
+      const message = progressMessage(snapshot, t);
+      openTaskStream(kbName, taskId, kind, label, message ? [message] : []);
+      subscribeWs(kbName, taskId);
+    },
+    [openTaskStream, setProgress, subscribeWs, t],
+  );
+
+  useEffect(() => {
+    resumeTaskRef.current = resumeTask;
+    return () => {
+      resumeTaskRef.current = null;
+    };
+  }, [resumeTask]);
+
   const dismissTask = useCallback(
     (kbName: string) => {
+      closeSocket(kbName);
       closeSource(kbName);
+      delete trackedTaskIdsRef.current[kbName];
       setTasksByKb((prev) => {
         if (!(kbName in prev)) return prev;
         const next = { ...prev };
@@ -301,7 +501,7 @@ export function useKnowledgeProgress(options?: UseKnowledgeProgressOptions) {
         return next;
       });
     },
-    [closeSource],
+    [closeSocket, closeSource],
   );
 
   const cleanupKb = useCallback(
@@ -309,6 +509,7 @@ export function useKnowledgeProgress(options?: UseKnowledgeProgressOptions) {
       closeSocket(kbName);
       closeSource(kbName);
       clearProgress(kbName);
+      delete trackedTaskIdsRef.current[kbName];
       setTasksByKb((prev) => {
         if (!(kbName in prev)) return prev;
         const next = { ...prev };
@@ -332,6 +533,7 @@ export function useKnowledgeProgress(options?: UseKnowledgeProgressOptions) {
     clearProgress,
     subscribeWs,
     startTask,
+    resumeTask,
     dismissTask,
     cleanupKb,
   };

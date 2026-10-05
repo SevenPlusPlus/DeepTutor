@@ -6,8 +6,8 @@
  * {@link NormalizedSession} shape that mirrors the backend Pydantic models.
  */
 
-/** Provider whose on-disk chat history we know how to read. */
-export type ImportSource = "claude_code" | "codex";
+/** Provider whose local folder or exported chat history we know how to read. */
+export type ImportSource = "claude_code" | "codex" | "chatgpt";
 
 /**
  * A conversation discovered during the scan pass — enough metadata to list and
@@ -73,7 +73,7 @@ export interface NormalizedMessage {
   metadata?: Record<string, unknown>;
 }
 
-/** A conversation ready to POST to `/api/v1/imports/chat-history`. */
+/** A conversation ready to POST to `/api/imports/chat-history`. */
 export interface NormalizedSession {
   external_id: string;
   title: string;
@@ -85,9 +85,7 @@ export interface NormalizedSession {
 }
 
 export type ImportScanErrorCode =
-  | "unsupported_browser"
-  | "not_recognized"
-  | "aborted";
+  "unsupported_browser" | "not_recognized" | "invalid_export" | "aborted";
 
 export class ImportScanError extends Error {
   code: ImportScanErrorCode;

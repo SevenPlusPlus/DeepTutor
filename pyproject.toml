@@ -9,13 +9,11 @@ build-backend = "setuptools.build_meta"
 name = "deeptutor"
 dynamic = ["version"]
 description = "An agent-native intelligent learning companion with multi-agent collaboration and RAG"
-# Capped below 3.14 on purpose (issue #664): on 3.14 pip can't find wheels for
-# some compiled base deps (e.g. faiss-cpu) and silently backtracks into a
-# doomed source build that dies with "subprocess-exited-with-error". The heavy
-# RAG extras (graphrag, rag-lightrag) already carry a `python_version < '3.14'`
-# marker for the same reason; capping here makes pip refuse 3.14 with a
-# readable "Requires a different Python" message instead of a build failure.
-requires-python = ">=3.11,<3.14"
+# Python 3.14 is supported by the core app now that compiled base dependencies
+# such as FAISS publish compatible wheels. Keep a forward cap so a future
+# interpreter is not advertised before the compiled dependency stack is ready.
+# Individual optional integrations may carry tighter markers below.
+requires-python = ">=3.11,<3.15"
 readme = "README.md"
 license = {text = "Apache-2.0"}
 dependencies = [
@@ -32,33 +30,51 @@ dependencies = [
     "tenacity>=8.0.0",
     "pydantic>=2.0.0",
     "pydantic-settings>=2.0.0",
+    "jsonschema>=4.20.0,<5.0.0",
     "aiosqlite>=0.19.0",
-    "typer[all]>=0.9.0",
+    "typer>=0.9.0",
     "rich>=13.0.0",
     "prompt_toolkit>=3.0.36",
     "pyte>=0.8.1",  # in-memory terminal emulator: scrape Claude Code's /model TUI on sync
+    # MCP client. Core rather than a `partners`-only extra (issue #792): the
+    # default chat/tool surface includes configurable MCP servers, so a plain
+    # install must be able to connect them without an optional extra.
+    "mcp>=1.26.0,<2.0.0",
+    "pageindex>=0.2.10,<0.3.0",
+    # Partner channel QR onboarding (WeChat, WeCom, Feishu). Same reasoning as
+    # `mcp` above: scan-based onboarding is part of the default partner setup
+    # surface, it is pure Python with no compiled or system dependencies, and
+    # without it the browser renders no code at all — the operator sees a
+    # button that does nothing, with no error to explain why.
+    "qrcode>=7.4.0,<9.0.0",
     # Full app dependencies included by default for `pip install deeptutor`.
     "anthropic>=0.30.0",
     "dashscope>=1.14.0",
     "perplexityai>=0.1.0",
     "oauth-cli-kit>=0.1.1",
     "llama-index>=0.14.12",
-    "llama-index-retrievers-bm25>=0.7.1,<0.8.0",
+    # The current BM25 integration pins PyStemmer <3, whose 2.x line has no
+    # Python 3.14 wheels. Skip it there so ordinary installs never require a C
+    # compiler; the retriever already falls back to vector search when absent.
+    "llama-index-retrievers-bm25>=0.7.1,<0.8.0; python_version < '3.14'",
     # FAISS vector store: vectorized ANN retrieval that replaces SimpleVectorStore's
     # brute-force per-query scan for large knowledge bases (issue #552). The
     # pipeline imports it lazily and falls back to SimpleVectorStore if absent.
     "llama-index-vector-stores-faiss>=0.4.0,<1.0.0",
-    "faiss-cpu>=1.8.0,<2.0.0",
+    "faiss-cpu>=1.8.0,<2.0.0; python_version < '3.14'",
+    "faiss-cpu>=1.12.0,<2.0.0; python_version >= '3.14'",
     "PyMuPDF>=1.26.0",
+    "Pillow>=10.0.0",
     "numpy>=1.24.0,<3.0.0",
     "arxiv>=2.0.0",
     "python-docx>=1.1.0",
     "openpyxl>=3.1.0",
     "python-pptx>=1.0.0",
     "pypdf>=4.0.0",
-    "pdfplumber>=0.11.0,<0.11.8",  # 0.11.8+ pins pdfminer.six==20251230, conflicts with mineru (via raganything)
+    "pdfplumber>=0.11.0",
     "reportlab>=4.0.0",
     "defusedxml>=0.7.1",
+    "youtube-transcript-api>=1.2.0,<2.0.0",
     "fastapi>=0.100.0",
     "uvicorn[standard]>=0.24.0",
     "websockets>=12.0",
@@ -66,12 +82,26 @@ dependencies = [
     "bcrypt>=4.0.0",
     "python-jose[cryptography]>=3.3.0",
     "pocketbase>=0.12.0",
+    "redis>=5.0.0,<7.0.0",
     "loguru>=0.7.3,<1.0.0",
     "json-repair>=0.57.0,<1.0.0",
+    "croniter>=6.0.0,<7.0.0",
+    # Process-tree memory readings for /api/system/memory. Soft dependency:
+    # deeptutor.runtime.memory_probe imports it lazily and falls back to /proc,
+    # so a missing wheel costs the settings strip, not the app.
+    "psutil>=5.9.0,<8.0.0",
 ]
 
 [project.scripts]
 deeptutor = "deeptutor_cli.main:main"
+deeptutor-export-frontend-contracts = "deeptutor.api.contracts.export:main"
+
+[project.entry-points."deeptutor.reading_extensions"]
+read_aloud = "deeptutor.reading.read_aloud:ReadAloudExtension"
+guided_learning = "deeptutor.reading.study_guidance:StudyGuidanceExtension"
+vocabulary = "deeptutor.reading.vocabulary:VocabularyExtension"
+quiz = "deeptutor.reading.quiz:ReadingQuizExtension"
+translation = "deeptutor.reading.translation:TranslationExtension"
 
 [project.optional-dependencies]
 # Compatibility extra for source installs and older docs. These packages are
@@ -83,15 +113,18 @@ cli = [
     "dashscope>=1.14.0",
     "perplexityai>=0.1.0",
     "oauth-cli-kit>=0.1.1",
+    "pageindex>=0.2.10,<0.3.0",
     # RAG (LlamaIndex)
     "llama-index>=0.14.12",
-    "llama-index-retrievers-bm25>=0.7.1,<0.8.0",
+    "llama-index-retrievers-bm25>=0.7.1,<0.8.0; python_version < '3.14'",
     # FAISS vector store: vectorized ANN retrieval that replaces SimpleVectorStore's
     # brute-force per-query scan for large knowledge bases (issue #552). The
     # pipeline imports it lazily and falls back to SimpleVectorStore if absent.
     "llama-index-vector-stores-faiss>=0.4.0,<1.0.0",
-    "faiss-cpu>=1.8.0,<2.0.0",
+    "faiss-cpu>=1.8.0,<2.0.0; python_version < '3.14'",
+    "faiss-cpu>=1.12.0,<2.0.0; python_version >= '3.14'",
     "PyMuPDF>=1.26.0",
+    "Pillow>=10.0.0",
     "numpy>=1.24.0,<3.0.0",
     "arxiv>=2.0.0",
     # Document text extraction (chat attachments) + office-skill authoring libs
@@ -99,10 +132,28 @@ cli = [
     "openpyxl>=3.1.0",
     "python-pptx>=1.0.0",
     "pypdf>=4.0.0",
-    "pdfplumber>=0.11.0,<0.11.8",  # 0.11.8+ pins pdfminer.six==20251230, conflicts with mineru (via raganything)
+    "pdfplumber>=0.11.0",
     "reportlab>=4.0.0",
     "defusedxml>=0.7.1",
+    "youtube-transcript-api>=1.2.0,<2.0.0",
 ]
+
+# CodeBuddy chat works over HTTP with the login state the IDE plugin / CLI
+# already stores. This extra adds the Agent SDK (a ~130 MB bundled headless
+# CLI) for in-app browser login and CLI-driven agent tools.
+# Upper-bounded on purpose: the provider probes the SDK for its turn-limit
+# and permission-mode kwargs, and a minor bump that renames them would make
+# every options build fail — codebuddy_provider fails closed with a clear
+# message rather than running the agent unrestricted. The floor tracks the
+# published series: there is no 0.1.24 on PyPI (0.1.x stops at 0.1.19), so the
+# old `>=0.1.24,<0.2` range was unsatisfiable and any resolver rejected it.
+# Not in `all` — it vendors a ~130 MB headless CLI and chat works over plain
+# HTTP without it.
+codebuddy = ["codebuddy-agent-sdk>=0.3,<0.4"]
+
+# Native YouTube playback has no Python dependency. This small, optional
+# adapter enables transcript-grounded learning when public captions exist.
+video-learning = ["youtube-transcript-api>=1.0.0,<2.0.0"]
 
 # Compatibility extra for source installs and older docs. These packages are
 # already included in the public `deeptutor` wheel.
@@ -115,17 +166,19 @@ server = [
     "bcrypt>=4.0.0",
     "python-jose[cryptography]>=3.3.0",
     "pocketbase>=0.12.0",
+    "redis>=5.0.0,<7.0.0",
     "loguru>=0.7.3,<1.0.0",
     "json-repair>=0.57.0,<1.0.0",
     "croniter>=6.0.0,<7.0.0",
+    "psutil>=5.9.0,<8.0.0",
 ]
 
-# Partner channel SDKs + MCP client. Mirrors requirements/partners.txt.
+# Partner channel SDKs. Mirrors requirements/partners.txt.
 # Partners run on the chat agent loop, so there is no engine here — just the
-# IM platform SDKs and the MCP client used for deferred tools.
+# IM platform SDKs. The MCP client used for deferred tools is a core dependency
+# (see `mcp` above), not a partners-only one.
 partners = [
     "deeptutor[server]",
-    "mcp>=1.26.0,<2.0.0",
     "python-telegram-bot[socks]>=22.6,<23.0",
     "wecom-aibot-sdk>=1.0.8,<2.0.0",
     "lark-oapi>=1.5.0,<2.0.0",
@@ -146,26 +199,31 @@ partners = [
     "aiohttp>=3.10.0,<4.0.0",
     # msteams Bot Framework token validation
     "PyJWT[crypto]>=2.8.0,<3.0.0",
-    # weixin QR-code login
-    "qrcode>=7.4.0,<9.0.0",
 ]
 
 # Optional document-parsing engines for the shared parse layer
 # (deeptutor/services/parsing). MinerU is an external CLI / hosted API and is
 # not a pip dependency. Engines import lazily, so these stay opt-in and an
 # absent engine simply reports unavailable in Settings → Document Parsing.
-parse-markitdown = ["markitdown[pdf,docx,pptx,xlsx]>=0.0.1a2"]
-parse-docling = ["docling>=2.0.0"]
-# PyMuPDF4LLM rides on PyMuPDF (already a core dep); the extra adds only the
-# thin Markdown layer, so it is the lightest image-capable engine. Pinned to the
-# pre-1.0 line on purpose: 1.x defaults to an onnxruntime layout-AI path that
-# pulls a heavy dep, downloads a model, and can't extract images — defeating the
-# "lightweight, runs on a Pi, extracts images" point of this engine.
-parse-pymupdf4llm = ["pymupdf4llm>=0.0.17,<1.0"]
+parse-markitdown = ["markitdown[all]>=0.1.7"]
+# Docling's base package intentionally leaves some format backends as extras.
+# Install all input-format dependencies so DeepTutor can honor the complete
+# upstream format list. Legacy Office needs LibreOffice and video needs ffmpeg
+# on the host in addition to these Python packages.
+parse-docling = [
+    "docling[xbrl]>=2.123.1",
+    "docling-slim[format-iwork,format-opendocument,format-video]>=2.123.1",
+]
+# Current PyMuPDF4LLM includes CPU-only layout/OCR and image extraction on its
+# public conversion path. Keep it upgradeable so format and layout gains land
+# without a DeepTutor-side major-version ceiling.
+parse-pymupdf4llm = ["pymupdf4llm>=1.28.2"]
+parse-liteparse = ["liteparse>=2.14.2"]
 parse = [
     "deeptutor[parse-markitdown]",
     "deeptutor[parse-docling]",
     "deeptutor[parse-pymupdf4llm]",
+    "deeptutor[parse-liteparse]",
 ]
 
 # Legacy alias kept for one release: `pip install deeptutor[tutorbot]`.
@@ -199,15 +257,17 @@ math-animator = ["manim>=0.19.0"]
 # (1.4.5) and silently downgrades. Floor is 3.0.1 (3.0.0/3.0.3 were yanked).
 graphrag = ["graphrag>=3.0.1,<4.0.0; python_version < '3.14'"]
 
-# LightRAG knowledge-base engine (HKUDS/LightRAG) with multimodal parsing via
-# RAG-Anything (HKUDS/RAG-Anything). Optional, heavy (pulls MinerU transitively —
-# see the pdfplumber pin above). The pipeline imports lazily and the adapter is
-# isolated in services/rag/pipelines/lightrag/engine.py. raganything pulls
-# `mineru[core]`, which is capped at python <3.14, so this carries the same
-# `python_version` marker as graphrag to avoid a silent backtrack/downgrade on
-# 3.14+. Floor is 1.0.1 (no 1.0.0 was ever published) with a <2.0.0 ceiling so
-# a future API-breaking 2.x isn't pulled in silently.
-rag-lightrag = ["raganything>=1.0.1,<2.0.0; python_version < '3.14'"]
+# Built-in LightRAG provider. The exact release is intentional: the adapter
+# isolates a private source-resolver seam and locks it with smoke tests.
+# MinerU remains an independently selected DeepTutor parser and is not a
+# transitive dependency of this extra.
+rag-lightrag = ["lightrag-hku==1.5.7"]
+
+# Optional cross-encoder reranker for the default LlamaIndex engine. The
+# sentence-transformers/torch stack is heavy and model-dependent, so it stays
+# out of `all`; retrieval lazily falls back to embedding-only ranking when the
+# package or configured model is unavailable.
+rag-rerank = ["sentence-transformers>=3.0.0,<6.0.0; python_version < '3.14'"]
 
 # Dev/test tooling. Mirrors requirements/dev.txt.
 dev = [
@@ -217,6 +277,7 @@ dev = [
     "pre-commit>=3.0.0",
     "safety<3.0.0",
     "bandit>=1.8.0",
+    "import-linter>=2.1.0,<3.0.0",
     # Test fixture builders for document-loader tests. Runtime pulls these via
     # cli/server, but dev keeps them explicit for pytest collection.
     "python-docx>=1.1.0",
@@ -232,6 +293,7 @@ all = [
     "deeptutor[matrix]",
     "deeptutor[math-animator]",
     "deeptutor[dev]",
+    "deeptutor[video-learning]",
 ]
 
 [tool.setuptools]
@@ -417,6 +479,9 @@ testpaths = ["tests", "deeptutor/learning/tests"]
 pythonpath = ["."]
 markers = [
     "asyncio: mark async tests that require pytest-asyncio",
+    "integration: requires explicitly configured external services",
+    "redis_integration: requires DEEPTUTOR_TEST_REDIS_URL",
+    "real_llm_resolver: exercises LLM config resolution itself, so it keeps the real resolver",
 ]
 asyncio_default_fixture_loop_scope = "function"
 addopts = [

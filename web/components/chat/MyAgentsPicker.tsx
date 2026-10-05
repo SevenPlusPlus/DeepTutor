@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   ArrowLeft,
   Bot,
@@ -10,7 +10,6 @@ import {
   ChevronRight,
   Eye,
   FolderOpen,
-  Heart,
   Loader2,
   Minus,
   Search,
@@ -21,12 +20,6 @@ import PickerHeader from "@/components/common/PickerHeader";
 import type { SelectedHistorySession } from "@/components/chat/HistorySessionPicker";
 import { listImportedSessions } from "@/lib/imports-api";
 import { getSession } from "@/lib/session-api";
-import {
-  getPartnerHistory,
-  getPartnerSessions,
-  type PartnerSessionInfo,
-} from "@/lib/partners-api";
-import { listSubagentConnections } from "@/lib/subagents-api";
 import {
   epochMsToISODate,
   projectLabel,
@@ -39,6 +32,8 @@ import {
   readImportMeta,
 } from "@/lib/chat-import/attribution";
 import { normalizeMessageContent, truncateText } from "@/lib/message-content";
+import { displaySessionTitle } from "@/lib/session-title";
+import Tooltip from "@/shared/ui/Tooltip";
 
 interface MyAgentsPickerProps {
   open: boolean;
@@ -47,27 +42,18 @@ interface MyAgentsPickerProps {
 }
 
 const UNGROUPED_PREFIX = "ungrouped:";
-const PARTNER_PREFIX = "partner:";
 const ALL = "__all__";
 
-/** Normalized picker row — an imported conversation OR a connected partner's
- *  session. The shared shape lets one set of chip/group/preview/apply paths
- *  drive both sources. ``id`` is the reference id sent to the backend: a real
- *  session id for imports, ``partner:{pid}:{sessionKey}`` for partner sessions
- *  (resolved server-side against the partner store). */
 interface PickerRow {
   id: string;
   title: string;
   lastMessage: string;
   messageCount: number;
   updatedAt: number; // epoch ms
-  ownerKey: string; // chip bucket: agent id | ungrouped:source | partner:{pid}
+  ownerKey: string; // chip bucket: agent id | ungrouped:source
   groupKey: string;
-  groupKind: "project" | "date" | "partner";
+  groupKind: "project" | "date";
   groupLabel: string;
-  kind: "imported" | "partner";
-  partnerId?: string;
-  sessionKey?: string;
 }
 
 interface SubGroup {
@@ -76,12 +62,6 @@ interface SubGroup {
   kind: PickerRow["groupKind"];
   rows: PickerRow[];
   latest: number;
-}
-
-interface PartnerAgent {
-  partnerId: string;
-  name: string;
-  sessions: PartnerSessionInfo[];
 }
 
 interface PreviewState {
@@ -101,32 +81,24 @@ function formatDay(key: string, lang: string): string {
   });
 }
 
-function isoMs(value: string | undefined): number {
-  const ms = value ? new Date(value).getTime() : NaN;
-  return Number.isNaN(ms) ? 0 : ms;
-}
-
-/**
- * Reference picker for agent conversations. Two sources feed one unified list:
- * imported Claude Code / Codex conversations (stored as normal sessions, so a
- * selection is just a session id), and the sessions of any partner connected as
- * an agent (resolved server-side via a ``partner:{id}:{key}`` reference id).
- * Either way a selection is a list of reference ids — the same backend path as
- * the Chat History reference. We attribute each conversation to its agent, let
- * the user filter by agent, then organize an agent's conversations by project
- * (Claude Code), day (Codex / partner) so they can pick a group or single chats.
- */
+/** Reference imported local agent conversations, grouped by project or day. */
 export default function MyAgentsPicker({
   open,
   onClose,
   onApply,
 }: MyAgentsPickerProps) {
   const { t, i18n } = useTranslation();
+  // Backend writes the English sentinel "New conversation" until the LLM title
+  // lands; mirror SessionList with a localized "New chat" label.
+  const placeholderLabel = t("New chat");
+  const formatRowTitle = useCallback(
+    (title: string) => displaySessionTitle(title, placeholderLabel),
+    [placeholderLabel],
+  );
   const [sessions, setSessions] = useState<
     Awaited<ReturnType<typeof listImportedSessions>>
   >([]);
   const [agents, setAgents] = useState<ImportAgent[]>([]);
-  const [partnerAgents, setPartnerAgents] = useState<PartnerAgent[]>([]);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [query, setQuery] = useState("");
   const [activeAgent, setActiveAgent] = useState<string>(ALL);
@@ -140,41 +112,17 @@ export default function MyAgentsPicker({
     const load = async () => {
       setLoading(true);
       try {
-        const [data, reg, conns] = await Promise.all([
+        const [data, reg] = await Promise.all([
           listImportedSessions(200, 0, { force: true }),
           getAgents(),
-          listSubagentConnections().catch(() => []),
         ]);
-        // For every partner connected as an agent, pull its sessions so they
-        // can be referenced just like an imported conversation.
-        const partners = conns.filter((c) => c.agent_kind === "partner");
-        const partnerData = await Promise.all(
-          partners.map(async (c) => {
-            const pid = c.partner_id || "";
-            if (!pid) return null;
-            const list = await getPartnerSessions(pid).catch(
-              () => [] as PartnerSessionInfo[],
-            );
-            const sessionsForPartner = list.filter(
-              (s) => !s.archived && (s.message_count ?? 0) > 0,
-            );
-            if (!sessionsForPartner.length) return null;
-            return {
-              partnerId: pid,
-              name: c.name || pid,
-              sessions: sessionsForPartner,
-            } satisfies PartnerAgent;
-          }),
-        );
         if (!mounted) return;
         setSessions(data);
         setAgents(reg);
-        setPartnerAgents(partnerData.filter((p): p is PartnerAgent => !!p));
       } catch {
         if (mounted) {
           setSessions([]);
           setAgents([]);
-          setPartnerAgents([]);
         }
       } finally {
         if (mounted) setLoading(false);
@@ -198,7 +146,7 @@ export default function MyAgentsPicker({
   }, [open]);
 
   // Owner key per imported session: the agent id, or an ungrouped-by-source
-  // bucket (partner sessions carry their own owner key, built in `rows`).
+  // bucket.
   const ownerKeyById = useMemo(() => {
     const ordered = [...agents].sort(
       (a, b) => (b.lastSyncAt || b.createdAt) - (a.lastSyncAt || a.createdAt),
@@ -214,8 +162,7 @@ export default function MyAgentsPicker({
     return map;
   }, [agents, sessions]);
 
-  // The unified row list — imported conversations and partner sessions both
-  // normalized into `PickerRow`.
+  // Normalize imported conversations into picker rows.
   const rows = useMemo<PickerRow[]>(() => {
     const out: PickerRow[] = [];
     for (const session of sessions) {
@@ -240,48 +187,24 @@ export default function MyAgentsPicker({
         groupLabel: isCodex
           ? formatDay(unit, i18n.language)
           : projectLabel(unit),
-        kind: "imported",
       });
     }
-    for (const partner of partnerAgents) {
-      for (const session of partner.sessions) {
-        const day = epochMsToISODate(isoMs(session.updated_at));
-        out.push({
-          id: `${PARTNER_PREFIX}${partner.partnerId}:${session.session_key}`,
-          title: session.title || "",
-          lastMessage: session.last_message || "",
-          messageCount: session.message_count ?? 0,
-          updatedAt: isoMs(session.updated_at),
-          ownerKey: `${PARTNER_PREFIX}${partner.partnerId}`,
-          groupKey: `${PARTNER_PREFIX}${partner.partnerId}:${day}`,
-          groupKind: "date",
-          groupLabel: formatDay(day, i18n.language),
-          kind: "partner",
-          partnerId: partner.partnerId,
-          sessionKey: session.session_key,
-        });
-      }
-    }
     return out;
-  }, [sessions, ownerKeyById, partnerAgents, i18n.language]);
+  }, [sessions, ownerKeyById, i18n.language]);
 
   const labelForKey = useMemo(() => {
     const byAgent = new Map(agents.map((a) => [a.id, a.name]));
-    const byPartner = new Map(
-      partnerAgents.map((p) => [`${PARTNER_PREFIX}${p.partnerId}`, p.name]),
-    );
     return (key: string): string => {
-      if (key.startsWith(PARTNER_PREFIX)) return byPartner.get(key) ?? key;
       if (key.startsWith(UNGROUPED_PREFIX)) {
         const src = key.slice(UNGROUPED_PREFIX.length) as ImportSource;
         return SOURCE_LABEL[src] ?? src;
       }
       return byAgent.get(key) ?? t("Untitled conversation");
     };
-  }, [agents, partnerAgents, t]);
+  }, [agents, t]);
 
   // Filter chips — every owner with at least one conversation. Named import
-  // agents first (registry order), then connected partners, then ungrouped
+  // agents first (registry order), then ungrouped
   // source buckets.
   const chips = useMemo(() => {
     const counts = new Map<string, number>();
@@ -293,29 +216,25 @@ export default function MyAgentsPicker({
       )
       .map((a) => a.id)
       .filter((id) => counts.has(id));
-    const partners = partnerAgents
-      .map((p) => `${PARTNER_PREFIX}${p.partnerId}`)
-      .filter((k) => counts.has(k));
     const ungrouped = [...counts.keys()]
       .filter((k) => k.startsWith(UNGROUPED_PREFIX))
       .sort();
-    return [...importAgents, ...partners, ...ungrouped].map((key) => ({
+    return [...importAgents, ...ungrouped].map((key) => ({
       key,
       label: labelForKey(key),
       count: counts.get(key) ?? 0,
-      isPartner: key.startsWith(PARTNER_PREFIX),
     }));
-  }, [agents, partnerAgents, rows, labelForKey]);
+  }, [agents, rows, labelForKey]);
 
   // Group the (chip- and search-filtered) rows by project (Claude Code) or day
-  // (Codex / partner), so the user can bulk-pick a group or drill in.
+  // (Codex), so the user can bulk-pick a group or drill in.
   const groups = useMemo<SubGroup[]>(() => {
     const keyword = query.trim().toLowerCase();
     const map = new Map<string, SubGroup>();
     for (const row of rows) {
       if (activeAgent !== ALL && row.ownerKey !== activeAgent) continue;
       if (keyword) {
-        const title = row.title.toLowerCase();
+        const title = formatRowTitle(row.title).toLowerCase();
         const last = normalizeMessageContent(row.lastMessage).toLowerCase();
         if (!title.includes(keyword) && !last.includes(keyword)) continue;
       }
@@ -333,14 +252,13 @@ export default function MyAgentsPicker({
       map.set(row.groupKey, group);
     }
     return Array.from(map.values()).sort((a, b) => b.latest - a.latest);
-  }, [rows, activeAgent, query]);
+  }, [rows, activeAgent, query, formatRowTitle]);
 
   const titleById = useMemo(() => {
     const map = new Map<string, string>();
-    for (const row of rows)
-      map.set(row.id, row.title || t("Untitled conversation"));
+    for (const row of rows) map.set(row.id, formatRowTitle(row.title));
     return map;
-  }, [rows, t]);
+  }, [rows, formatRowTitle]);
 
   const toggleSession = (id: string) =>
     setSelectedIds((prev) =>
@@ -369,19 +287,7 @@ export default function MyAgentsPicker({
   const openPreview = async (row: PickerRow) => {
     setPreview({ row, messages: null, loading: true });
     try {
-      const messages =
-        row.kind === "partner" && row.partnerId && row.sessionKey
-          ? (
-              await getPartnerHistory(row.partnerId, {
-                sessionKey: row.sessionKey,
-                limit: 200,
-              })
-            ).map((m, idx) => ({
-              id: `${row.id}:${idx}`,
-              role: String(m.role || ""),
-              content: String(m.content || ""),
-            }))
-          : (await getSession(row.id)).messages.map((m) => ({
+      const messages = (await getSession(row.id)).messages.map((m) => ({
               id: String(m.id),
               role: String(m.role || ""),
               content: String(m.content || ""),
@@ -401,7 +307,7 @@ export default function MyAgentsPicker({
   const handleApply = () => {
     const selected = selectedIds.map((id) => ({
       sessionId: id,
-      title: titleById.get(id) || t("Untitled conversation"),
+      title: titleById.get(id) || placeholderLabel,
     }));
     onApply(selected);
     onClose();
@@ -421,6 +327,7 @@ export default function MyAgentsPicker({
     >
       <div className="w-[min(48rem,92vw)] overflow-hidden rounded-2xl border border-[var(--border)] bg-[var(--card)] text-[var(--card-foreground)] shadow-[0_18px_56px_rgba(0,0,0,0.16)]">
         <PickerHeader
+          resourceKind="my_agents"
           icon={Bot}
           titleId="agents-picker-title"
           title={t("Select agent conversations")}
@@ -445,7 +352,6 @@ export default function MyAgentsPicker({
                   label={chip.label}
                   count={chip.count}
                   active={activeAgent === chip.key}
-                  partner={chip.isPartner}
                   onClick={() => setActiveAgent(chip.key)}
                 />
               ))}
@@ -570,7 +476,7 @@ export default function MyAgentsPicker({
                                   </div>
                                   <div className="min-w-0 flex-1">
                                     <span className="block truncate text-[14px] font-medium text-[var(--foreground)]">
-                                      {row.title || t("Untitled conversation")}
+                                      {formatRowTitle(row.title)}
                                     </span>
                                     {row.lastMessage ? (
                                       <p className="mt-1 line-clamp-2 text-[12px] leading-5 text-[var(--muted-foreground)]">
@@ -587,15 +493,16 @@ export default function MyAgentsPicker({
                                     </div>
                                   </div>
                                 </button>
-                                <button
-                                  type="button"
-                                  onClick={() => void openPreview(row)}
-                                  title={t("Preview")}
-                                  aria-label={t("Preview")}
-                                  className="mr-3 mt-3 shrink-0 rounded-lg border border-transparent p-1.5 text-[var(--muted-foreground)] opacity-0 transition-all hover:border-[var(--border)] hover:text-[var(--foreground)] focus:opacity-100 group-hover/row:opacity-100"
-                                >
-                                  <Eye size={15} />
-                                </button>
+                                <Tooltip label={t("Preview")} side="top">
+                                  <button
+                                    type="button"
+                                    onClick={() => void openPreview(row)}
+                                    aria-label={t("Preview")}
+                                    className="mr-3 mt-3 shrink-0 rounded-lg border border-transparent p-1.5 text-[var(--muted-foreground)] opacity-0 transition-all hover:border-[var(--border)] hover:text-[var(--foreground)] focus:opacity-100 group-hover/row:opacity-100"
+                                  >
+                                    <Eye size={15} />
+                                  </button>
+                                </Tooltip>
                               </div>
                             );
                           })}
@@ -676,6 +583,7 @@ function PreviewPane({
   onToggleSelect: () => void;
 }) {
   const { t } = useTranslation();
+  const placeholderLabel = t("New chat");
   const { row, messages, loading } = preview;
   const visible = (messages ?? []).filter(
     (m) => (m.content || "").trim() && m.role !== "system",
@@ -693,7 +601,7 @@ function PreviewPane({
         </button>
         <div className="min-w-0 flex-1">
           <div className="truncate text-[13px] font-semibold text-[var(--foreground)]">
-            {row.title || t("Untitled conversation")}
+            {displaySessionTitle(row.title, placeholderLabel)}
           </div>
           <div className="text-[11px] text-[var(--muted-foreground)]">
             {row.messageCount || visible.length} {t("messages")}
@@ -743,13 +651,11 @@ function Chip({
   label,
   count,
   active,
-  partner,
   onClick,
 }: {
   label: string;
   count?: number;
   active: boolean;
-  partner?: boolean;
   onClick: () => void;
 }) {
   return (
@@ -762,7 +668,6 @@ function Chip({
           : "border-[var(--border)] bg-[var(--card)] text-[var(--muted-foreground)] hover:border-[var(--primary)]/50 hover:text-[var(--foreground)]"
       }`}
     >
-      {partner ? <Heart size={11} className="shrink-0 fill-current" /> : null}
       <span className="truncate">{label}</span>
       {typeof count === "number" ? (
         <span

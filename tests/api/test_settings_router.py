@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 from copy import deepcopy
 import json
 from types import SimpleNamespace
@@ -18,6 +19,114 @@ from deeptutor.services.embedding import client as embedding_client_module
 from deeptutor.services.embedding import config as embedding_config_module
 from deeptutor.services.llm import client as llm_client_module
 from deeptutor.services.llm import config as llm_config_module
+from deeptutor.services.settings import interface_settings
+
+
+def test_load_ui_settings_migrates_legacy_language_to_response_language(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    settings_file = tmp_path / "interface.json"
+    settings_file.write_text('{"theme": "snow", "language": "zh"}', encoding="utf-8")
+    monkeypatch.setattr(settings_router, "_settings_file", lambda: settings_file)
+
+    settings = settings_router.load_ui_settings()
+
+    assert settings["language"] == "zh"
+    assert settings["response_language"] == "zh"
+
+
+def test_both_readers_of_interface_json_agree_on_a_legacy_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """The router and the service must read the same file the same way.
+
+    ``interface.json`` has two readers: ``interface_settings.get_ui_settings``
+    (used by the turn path) and the router's ``load_ui_settings`` (which layers
+    the API's superset of defaults on top). They resolve the language pair
+    through one shared helper precisely so a legacy file can't mean different
+    things depending on which one asked.
+    """
+    from deeptutor.services.settings import interface_settings
+
+    settings_file = tmp_path / "interface.json"
+    settings_file.write_text('{"theme": "dark", "language": "zh"}', encoding="utf-8")
+    monkeypatch.setattr(settings_router, "_settings_file", lambda: settings_file)
+    monkeypatch.setattr(interface_settings, "_interface_settings_file", lambda: settings_file)
+
+    from_router = settings_router.load_ui_settings()
+    from_service = interface_settings.get_ui_settings()
+
+    for field in ("language", "response_language"):
+        assert from_router[field] == from_service[field] == "zh"
+
+
+@pytest.mark.asyncio
+async def test_ui_languages_are_persisted_independently(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    settings_file = tmp_path / "interface.json"
+    monkeypatch.setattr(settings_router, "_settings_file", lambda: settings_file)
+
+    response = await settings_router.update_ui_settings(
+        settings_router.UISettingsUpdate(theme="snow", language="en", response_language="zh")
+    )
+
+    assert response["language"] == "en"
+    assert response["response_language"] == "zh"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("language", ["fr", "uk"])
+async def test_ui_settings_persist_supported_languages_independently(
+    monkeypatch: pytest.MonkeyPatch, tmp_path, language: str
+) -> None:
+    settings_file = tmp_path / "interface.json"
+    monkeypatch.setattr(settings_router, "_settings_file", lambda: settings_file)
+
+    response = await settings_router.update_ui_settings(
+        settings_router.UISettingsUpdate(theme="snow", language=language, response_language="en")
+    )
+
+    assert response["language"] == language
+    assert response["response_language"] == "en"
+    persisted = settings_router.load_ui_settings()
+    assert persisted["language"] == language
+    assert persisted["response_language"] == "en"
+    assert (await settings_router.get_ui_settings())["language"] == language
+    assert settings_router.LanguageUpdate(language=language).language == language
+
+
+def test_ui_settings_update_rejects_unsupported_language() -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        settings_router.UISettingsUpdate(language="xx")
+    with pytest.raises(ValidationError):
+        settings_router.UISettingsUpdate(response_language="xx")
+
+
+@pytest.mark.asyncio
+async def test_ui_accepts_extended_response_languages(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    settings_file = tmp_path / "interface.json"
+    monkeypatch.setattr(settings_router, "_settings_file", lambda: settings_file)
+
+    response = await settings_router.update_ui_settings(
+        settings_router.UISettingsUpdate(language="en", response_language="ja")
+    )
+    assert response["response_language"] == "ja"
+
+    response = await settings_router.update_ui_settings(
+        settings_router.UISettingsUpdate(response_language="pt")
+    )
+    assert response["response_language"] == "pt"
+
+    response = await settings_router.update_ui_settings(
+        settings_router.UISettingsUpdate(response_language="ms")
+    )
+    assert response["response_language"] == "ms"
+    assert settings_router.load_ui_settings()["response_language"] == "ms"
 
 
 class _FakeEmbeddingAdapter:
@@ -149,6 +258,37 @@ def _build_catalog(
             },
         },
     }
+
+
+def _managed_codex_profile(
+    supported: list[str],
+    reasoning_effort: str | None = None,
+    *,
+    account_binding: str | None = "account-binding",
+) -> dict[str, Any]:
+    model = {
+        "id": "llm-model-openai-codex-sol",
+        "name": "GPT 5.6 Sol",
+        "model": "gpt-5.6-sol",
+        "context_window": "128000",
+        "context_window_source": "metadata",
+        "codex_supported_reasoning_levels": supported,
+    }
+    if reasoning_effort is not None:
+        model["reasoning_effort"] = reasoning_effort
+    profile = {
+        "id": "llm-profile-openai-codex-managed",
+        "name": "OpenAI Codex",
+        "binding": "openai_codex",
+        "base_url": "https://chatgpt.com/backend-api",
+        "api_key": "",
+        "managed_by": "openai_codex_oauth",
+        "read_only": True,
+        "models": [model],
+    }
+    if account_binding is not None:
+        profile["codex_account_binding"] = account_binding
+    return profile
 
 
 def _patch_runtime(
@@ -297,6 +437,25 @@ async def test_mineru_settings_roundtrip_redacts_token(
 
 
 @pytest.mark.asyncio
+async def test_mineru_settings_accept_token_array(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    service = RuntimeSettingsService(tmp_path / "settings", process_env={})
+    monkeypatch.setattr(settings_router, "get_runtime_settings_service", lambda: service)
+
+    response = await settings_router.update_mineru_settings(
+        settings_router.MinerUSettingsUpdate(
+            mode="cloud",
+            api_token=[" token-a ", "token-b"],
+        )
+    )
+
+    assert response["api_token_set"] is True
+    assert "api_token" not in response["settings"]
+    assert service.load_mineru()["api_token"] == ["token-a", "token-b"]
+
+
+@pytest.mark.asyncio
 async def test_mineru_token_tristate_keep_then_clear(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
@@ -366,12 +525,20 @@ async def test_mineru_test_connection_local_mode(monkeypatch: pytest.MonkeyPatch
         "local_cli_probe",
         lambda *a: {"found": True, "command": "mineru", "path": "/env/bin/mineru"},
     )
-    monkeypatch.setattr(mineru_backend, "local_cli_version", lambda cmd: "mineru, version 2.5.0")
+    monkeypatch.setattr(mineru_backend, "local_cli_version", lambda cmd: "mineru, version 3.4.5")
     result = await settings_router.test_mineru_connection(
         settings_router.MinerUSettingsUpdate(mode="local")
     )
     assert result["ok"] is True
-    assert "2.5.0" in result["message"]
+    assert "3.4.5" in result["message"]
+
+    # An old CLI is present but cannot provide the current format/API surface.
+    monkeypatch.setattr(mineru_backend, "local_cli_version", lambda cmd: "mineru, version 2.5.0")
+    result = await settings_router.test_mineru_connection(
+        settings_router.MinerUSettingsUpdate(mode="local")
+    )
+    assert result["ok"] is False
+    assert "3.4.5" in result["message"]
 
     # CLI absent → actionable failure message.
     monkeypatch.setattr(
@@ -475,11 +642,52 @@ def test_embedding_provider_choices_use_full_endpoint_urls() -> None:
     assert "custom_openai_sdk" not in embedding
 
 
+def test_media_and_voice_provider_choices_include_dashscope() -> None:
+    choices = settings_router._provider_choices()
+    services = ("tts", "stt", "imagegen", "videogen")
+    dashscope = {
+        service: {item["value"]: item for item in choices[service]}["dashscope"]
+        for service in services
+    }
+
+    assert set(dashscope) == set(services)
+    assert all(item["label"] == "Aliyun DashScope" for item in dashscope.values())
+    assert all(
+        item["base_url"] == "https://dashscope.aliyuncs.com/api/v1" for item in dashscope.values()
+    )
+    assert dashscope["tts"]["default_model"] == "qwen3-tts-flash"
+    assert dashscope["tts"]["default_voice"] == "Cherry"
+    assert dashscope["stt"]["default_model"] == "paraformer-realtime-v2"
+    assert dashscope["imagegen"]["default_model"] == "wanx2.1-t2i-turbo"
+    assert dashscope["videogen"]["default_model"] == "wanx2.1-t2v-turbo"
+
+
 def test_llm_provider_choices_include_atlascloud() -> None:
     llm = {item["value"]: item for item in settings_router._provider_choices()["llm"]}
 
     assert llm["atlascloud"]["label"] == "Atlas Cloud"
     assert llm["atlascloud"]["base_url"] == "https://api.atlascloud.ai/v1"
+
+
+def test_llm_provider_choices_include_unifically() -> None:
+    llm = {item["value"]: item for item in settings_router._provider_choices()["llm"]}
+
+    assert llm["unifically"]["label"] == "Unifically"
+    assert llm["unifically"]["base_url"] == "https://api.unifically.com/v1"
+
+
+def test_llm_provider_choices_include_cheaperinference() -> None:
+    llm = {item["value"]: item for item in settings_router._provider_choices()["llm"]}
+
+    assert llm["cheaperinference"]["label"] == "Cheaper Inference"
+    assert llm["cheaperinference"]["base_url"] == "https://api.cheaperinference.com/v1"
+
+
+def test_llm_provider_choices_include_novita() -> None:
+    llm = {item["value"]: item for item in settings_router._provider_choices()["llm"]}
+
+    assert llm["novita"]["label"] == "Novita AI"
+    assert llm["novita"]["base_url"] == "https://api.novita.ai/openai"
 
 
 def test_llm_provider_choices_include_edenai() -> None:
@@ -511,6 +719,31 @@ async def test_get_llm_options_returns_redacted_catalog(monkeypatch: pytest.Monk
     assert response["options"][0]["model"] == "gpt-4o-mini"
     assert "api_key" not in response["options"][0]
     assert "base_url" not in response["options"][0]
+
+
+@pytest.mark.asyncio
+async def test_get_settings_never_returns_catalog_secrets(monkeypatch: pytest.MonkeyPatch) -> None:
+    catalog = _build_catalog(
+        llm_model="gpt-4o-mini",
+        llm_base_url="https://llm.example/v1",
+        llm_api_key="secret-key",
+        embedding_model="text-embedding-3-small",
+        embedding_base_url="https://emb.example/v1/embeddings",
+        embedding_api_key="emb-key",
+    )
+    catalog["services"]["llm"]["profiles"][0]["extra_headers"] = {"Authorization": "Bearer secret"}
+    service = _FakeCatalogService(catalog)
+    monkeypatch.setattr(settings_router, "get_model_catalog_service", lambda: service)
+
+    response = await settings_router.get_settings()
+
+    llm_profile = response["catalog"]["services"]["llm"]["profiles"][0]
+    embedding_profile = response["catalog"]["services"]["embedding"]["profiles"][0]
+    assert llm_profile["api_key"] == settings_router.CATALOG_SECRET_MASK
+    assert llm_profile["extra_headers"]["Authorization"] == settings_router.CATALOG_SECRET_MASK
+    assert embedding_profile["api_key"] == settings_router.CATALOG_SECRET_MASK
+    assert "secret-key" not in json.dumps(response)
+    assert "emb-key" not in json.dumps(response)
 
 
 @pytest.fixture(autouse=True)
@@ -557,7 +790,8 @@ async def test_update_catalog_invalidates_runtime_caches(monkeypatch: pytest.Mon
     new_llm_client = llm_client_module.get_llm_client()
     new_embedding_client = embedding_client_module.get_embedding_client()
 
-    assert response == {"catalog": updated_catalog}
+    assert response == {"catalog": settings_router.redact_catalog_secrets(updated_catalog)}
+    assert service.load() == updated_catalog
     assert old_llm_config.model == "gpt-old"
     assert new_llm_config.model == "gpt-new"
     assert new_llm_config.base_url == "https://new-llm.example/v1"
@@ -602,7 +836,8 @@ async def test_apply_catalog_invalidates_runtime_caches(monkeypatch: pytest.Monk
     new_llm_client = llm_client_module.get_llm_client()
     new_embedding_client = embedding_client_module.get_embedding_client()
 
-    assert response["catalog"] == applied_catalog
+    assert response["catalog"] == settings_router.redact_catalog_secrets(applied_catalog)
+    assert service.load() == applied_catalog
     assert response["runtime"]["catalog_path"]
     assert new_llm_config.model == "gpt-after-apply"
     assert new_llm_client is not old_llm_client
@@ -612,9 +847,406 @@ async def test_apply_catalog_invalidates_runtime_caches(monkeypatch: pytest.Monk
 
 
 @pytest.mark.asyncio
+async def test_reapplying_an_unchanged_catalog_keeps_the_runtime_clients(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An apply that changes nothing must not reset the shared clients.
+
+    The clients are process-wide singletons; resetting them flips the client
+    out from under any turn that is mid-call and hangs that turn in the
+    provider retry ladder. A settings visit that re-applies the same
+    configuration — the shape a cold-start first message keeps meeting
+    (#1421) — has nothing to invalidate.
+    """
+    catalog = _build_catalog(
+        llm_model="gpt-same",
+        llm_base_url="https://same-llm.example/v1",
+        llm_api_key="same-llm-key",
+        embedding_model="text-embedding-same",
+        embedding_base_url="https://same-embedding.example/v1/embeddings",
+        embedding_api_key="same-embedding-key",
+    )
+    service = _FakeCatalogService(catalog)
+    _patch_runtime(monkeypatch, service)
+
+    llm_config_module.get_llm_config()
+    old_llm_client = llm_client_module.get_llm_client()
+    old_embedding_client = embedding_client_module.get_embedding_client()
+
+    response = await settings_router.apply_catalog(settings_router.CatalogPayload(catalog=catalog))
+
+    new_llm_client = llm_client_module.get_llm_client()
+    new_embedding_client = embedding_client_module.get_embedding_client()
+
+    assert response["catalog"] == settings_router.redact_catalog_secrets(catalog)
+    assert new_llm_client is old_llm_client
+    assert new_embedding_client is old_embedding_client
+    assert new_llm_client.config.model == "gpt-same"
+
+
+@pytest.mark.asyncio
+async def test_re_saving_an_unchanged_catalog_keeps_the_runtime_clients(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``PUT /catalog`` with the stored catalog skips the reset too."""
+    catalog = _build_catalog(
+        llm_model="gpt-put",
+        llm_base_url="https://put-llm.example/v1",
+        llm_api_key="put-llm-key",
+        embedding_model="text-embedding-put",
+        embedding_base_url="https://put-embedding.example/v1/embeddings",
+        embedding_api_key="put-embedding-key",
+    )
+    service = _FakeCatalogService(catalog)
+    _patch_runtime(monkeypatch, service)
+
+    old_llm_client = llm_client_module.get_llm_client()
+    old_embedding_client = embedding_client_module.get_embedding_client()
+
+    response = await settings_router.update_catalog(settings_router.CatalogPayload(catalog=catalog))
+
+    assert response == {"catalog": settings_router.redact_catalog_secrets(catalog)}
+    assert llm_client_module.get_llm_client() is old_llm_client
+    assert embedding_client_module.get_embedding_client() is old_embedding_client
+
+
+@pytest.mark.asyncio
+async def test_finishing_the_tour_without_edits_keeps_the_runtime_clients(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """The tour is the cold start #1421 described, and it applies on exit.
+
+    Completing it with nothing changed used to reset the shared clients while
+    the learner's first message was already in flight.
+    """
+    catalog = _build_catalog(
+        llm_model="gpt-tour",
+        llm_base_url="https://tour-llm.example/v1",
+        llm_api_key="tour-llm-key",
+        embedding_model="text-embedding-tour",
+        embedding_base_url="https://tour-embedding.example/v1/embeddings",
+        embedding_api_key="tour-embedding-key",
+    )
+    service = _FakeCatalogService(catalog)
+    _patch_runtime(monkeypatch, service)
+    monkeypatch.setattr(settings_router, "_tour_cache_file", lambda: tmp_path / "tour.json")
+
+    old_llm_client = llm_client_module.get_llm_client()
+    old_embedding_client = embedding_client_module.get_embedding_client()
+
+    await settings_router.complete_tour(None)
+
+    assert llm_client_module.get_llm_client() is old_llm_client
+    assert embedding_client_module.get_embedding_client() is old_embedding_client
+
+
+@pytest.mark.asyncio
+async def test_reapplying_one_unchanged_service_keeps_the_runtime_clients(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """Applying a single service that already holds that value resets nothing."""
+    catalog = _build_catalog(
+        llm_model="gpt-service",
+        llm_base_url="https://service-llm.example/v1",
+        llm_api_key="service-llm-key",
+        embedding_model="text-embedding-service",
+        embedding_base_url="https://service-embedding.example/v1/embeddings",
+        embedding_api_key="service-embedding-key",
+    )
+    from deeptutor.services.config.settings_draft import SettingsDraftService
+
+    service = _FakeCatalogService(catalog)
+    _patch_runtime(monkeypatch, service)
+    draft_service = SettingsDraftService(tmp_path / "settings_draft.json")
+    monkeypatch.setattr(settings_router, "get_settings_draft_service", lambda: draft_service)
+
+    old_llm_client = llm_client_module.get_llm_client()
+    old_embedding_client = embedding_client_module.get_embedding_client()
+
+    await settings_router.apply_catalog_service(
+        settings_router.CatalogServicePayload(service="llm", config=catalog["services"]["llm"])
+    )
+
+    assert llm_client_module.get_llm_client() is old_llm_client
+    assert embedding_client_module.get_embedding_client() is old_embedding_client
+
+
+@pytest.mark.asyncio
+async def test_apply_catalog_service_only_promotes_the_selected_service_and_updates_saved_draft(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    from deeptutor.services.config.settings_draft import SettingsDraftService
+
+    live = _build_catalog(
+        llm_model="gpt-live",
+        llm_base_url="https://llm.example/v1",
+        llm_api_key="llm-key",
+        embedding_model="text-embedding-live",
+        embedding_base_url="https://embedding.example/v1/embeddings",
+        embedding_api_key="embedding-key",
+    )
+    live["services"]["stt"] = {
+        "active_profile_id": "stt-profile",
+        "active_model_id": "stt-model",
+        "profiles": [
+            {
+                "id": "stt-profile",
+                "name": "Live STT",
+                "binding": "openai",
+                "base_url": "https://old-stt.example/v1",
+                "api_key": "old-stt-key",
+                "api_version": "",
+                "extra_headers": {},
+                "models": [{"id": "stt-model", "name": "Whisper", "model": "whisper-1"}],
+            }
+        ],
+    }
+    draft = deepcopy(live)
+    draft["services"]["stt"]["profiles"][0]["base_url"] = "https://new-stt.example/v1"
+    draft["services"]["stt"]["profiles"][0]["api_key"] = "new-stt-key"
+    draft["services"]["llm"]["profiles"][0]["name"] = "Unapplied LLM edit"
+
+    catalog_service = _FakeCatalogService(live)
+    draft_service = SettingsDraftService(tmp_path / "settings_draft.json")
+    draft_service.save({"catalog": draft, "extensions": {"network": {"backend_port": 9000}}})
+    monkeypatch.setattr(settings_router, "get_model_catalog_service", lambda: catalog_service)
+    monkeypatch.setattr(settings_router, "get_settings_draft_service", lambda: draft_service)
+    monkeypatch.setattr(settings_router, "_runtime_catalog_write", contextlib.nullcontext)
+
+    response = await settings_router.apply_catalog_service(
+        settings_router.CatalogServicePayload(service="stt", config=draft["services"]["stt"])
+    )
+
+    applied = catalog_service.load()
+    assert applied["services"]["stt"]["profiles"][0]["base_url"] == ("https://new-stt.example/v1")
+    assert applied["services"]["stt"]["profiles"][0]["api_key"] == "new-stt-key"
+    assert applied["services"]["llm"]["profiles"][0]["name"] == ("Default LLM Endpoint")
+
+    remaining_draft = draft_service.load()
+    assert remaining_draft["catalog"]["services"]["stt"] == applied["services"]["stt"]
+    assert remaining_draft["catalog"]["services"]["llm"]["profiles"][0]["name"] == (
+        "Unapplied LLM edit"
+    )
+    assert remaining_draft["extensions"] == {"network": {"backend_port": 9000}}
+    assert response["draft"] is not None
+    assert response["catalog"]["services"]["stt"]["profiles"][0]["api_key"] == (
+        settings_router.CATALOG_SECRET_MASK
+    )
+
+
+@pytest.mark.asyncio
+async def test_update_catalog_restores_masked_secrets(monkeypatch: pytest.MonkeyPatch) -> None:
+    current = _build_catalog(
+        llm_model="gpt-4o-mini",
+        llm_base_url="https://llm.example/v1",
+        llm_api_key="stored-llm-key",
+        embedding_model="text-embedding-3-small",
+        embedding_base_url="https://emb.example/v1/embeddings",
+        embedding_api_key="stored-embedding-key",
+    )
+    service = _FakeCatalogService(current)
+    monkeypatch.setattr(settings_router, "get_model_catalog_service", lambda: service)
+    monkeypatch.setattr(settings_router, "_runtime_catalog_write", contextlib.nullcontext)
+    draft = settings_router.redact_catalog_secrets(current)
+    draft["services"]["llm"]["profiles"][0]["name"] = "Renamed"
+
+    response = await settings_router.update_catalog(settings_router.CatalogPayload(catalog=draft))
+
+    saved = service.load()
+    assert saved["services"]["llm"]["profiles"][0]["api_key"] == "stored-llm-key"
+    assert saved["services"]["embedding"]["profiles"][0]["api_key"] == ("stored-embedding-key")
+    assert response["catalog"]["services"]["llm"]["profiles"][0]["api_key"] == (
+        settings_router.CATALOG_SECRET_MASK
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["save", "apply"])
+@pytest.mark.parametrize(
+    ("supported", "requested", "expected"),
+    [
+        (["medium"], "high", None),
+        (["medium", "high"], "high", "high"),
+        (["medium", "high"], None, None),
+    ],
+)
+async def test_catalog_writes_preserve_current_managed_codex_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    supported: list[str],
+    requested: str | None,
+    expected: str | None,
+) -> None:
+    current = _build_catalog(
+        llm_model="gpt-standard",
+        llm_base_url="https://llm.example/v1",
+        llm_api_key="llm-key",
+        embedding_model="text-embedding-current",
+        embedding_base_url="https://embedding.example/v1/embeddings",
+        embedding_api_key="",
+    )
+    managed_profile = _managed_codex_profile(
+        supported,
+        reasoning_effort="medium" if requested is None else None,
+    )
+    managed_model = managed_profile["models"][0]
+    current["services"]["llm"]["profiles"].append(managed_profile)
+    current["services"]["llm"]["active_profile_id"] = managed_profile["id"]
+    current["services"]["llm"]["active_model_id"] = managed_model["id"]
+    service = _FakeCatalogService(current)
+    monkeypatch.setattr(settings_router, "get_model_catalog_service", lambda: service)
+    monkeypatch.setattr(settings_router, "_runtime_catalog_write", contextlib.nullcontext)
+
+    stale_draft = deepcopy(current)
+    stale_draft["services"]["embedding"]["profiles"][0]["name"] = "Unsaved edit"
+    stale_model = stale_draft["services"]["llm"]["profiles"][1]["models"][0]
+    stale_model["context_window"] = "272000"
+    stale_model["codex_supported_reasoning_levels"] = ["medium", "high", "xhigh"]
+    if requested is not None:
+        stale_model["reasoning_effort"] = requested
+    else:
+        stale_model.pop("reasoning_effort", None)
+    payload = settings_router.CatalogPayload(catalog=stale_draft)
+
+    if operation == "save":
+        await settings_router.update_catalog(payload)
+    else:
+        await settings_router.apply_catalog(payload)
+
+    stored = service.load()
+    stored_model = stored["services"]["llm"]["profiles"][1]["models"][0]
+    assert stored_model["context_window"] == "128000"
+    assert stored_model["codex_supported_reasoning_levels"] == supported
+    assert stored_model.get("reasoning_effort") == expected
+    assert stored["services"]["embedding"]["profiles"][0]["name"] == "Unsaved edit"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["save", "apply"])
+@pytest.mark.parametrize(
+    ("current_binding", "proposed_binding"),
+    [
+        ("account-b-binding", "account-a-binding"),
+        (None, None),
+    ],
+)
+async def test_catalog_write_rejects_unbound_or_cross_account_codex_reasoning_changes(
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    current_binding: str | None,
+    proposed_binding: str | None,
+) -> None:
+    current = _build_catalog(
+        llm_model="gpt-standard",
+        llm_base_url="https://llm.example/v1",
+        llm_api_key="llm-key",
+        embedding_model="text-embedding-current",
+        embedding_base_url="https://embedding.example/v1/embeddings",
+        embedding_api_key="",
+    )
+    current_profile = _managed_codex_profile(
+        ["medium", "high"],
+        reasoning_effort="medium",
+        account_binding=current_binding,
+    )
+    current["services"]["llm"]["profiles"].append(current_profile)
+    service = _FakeCatalogService(current)
+    monkeypatch.setattr(settings_router, "get_model_catalog_service", lambda: service)
+    monkeypatch.setattr(settings_router, "_runtime_catalog_write", contextlib.nullcontext)
+
+    stale_draft = deepcopy(current)
+    stale_profile = stale_draft["services"]["llm"]["profiles"][1]
+    if proposed_binding is None:
+        stale_profile.pop("codex_account_binding", None)
+    else:
+        stale_profile["codex_account_binding"] = proposed_binding
+    stale_profile["models"][0]["reasoning_effort"] = "high"
+    payload = settings_router.CatalogPayload(catalog=stale_draft)
+
+    if operation == "save":
+        await settings_router.update_catalog(payload)
+    else:
+        await settings_router.apply_catalog(payload)
+
+    stored_profile = service.load()["services"]["llm"]["profiles"][1]
+    assert stored_profile.get("codex_account_binding") == current_binding
+    assert stored_profile["models"][0]["reasoning_effort"] == "medium"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("current_has_managed", [True, False])
+async def test_catalog_write_uses_current_managed_codex_profile_presence(
+    monkeypatch: pytest.MonkeyPatch,
+    current_has_managed: bool,
+) -> None:
+    base = _build_catalog(
+        llm_model="gpt-standard",
+        llm_base_url="https://llm.example/v1",
+        llm_api_key="llm-key",
+        embedding_model="text-embedding-current",
+        embedding_base_url="https://embedding.example/v1/embeddings",
+        embedding_api_key="",
+    )
+    current = deepcopy(base)
+    stale_draft = deepcopy(base)
+    managed_profile = _managed_codex_profile(["medium", "high"])
+    if current_has_managed:
+        current["services"]["llm"]["profiles"].append(managed_profile)
+    else:
+        stale_draft["services"]["llm"]["profiles"].append(managed_profile)
+    service = _FakeCatalogService(current)
+    monkeypatch.setattr(settings_router, "get_model_catalog_service", lambda: service)
+    monkeypatch.setattr(settings_router, "_runtime_catalog_write", contextlib.nullcontext)
+
+    await settings_router.update_catalog(settings_router.CatalogPayload(catalog=stale_draft))
+
+    managed = [
+        profile
+        for profile in service.load()["services"]["llm"]["profiles"]
+        if profile.get("managed_by") == "openai_codex_oauth"
+    ]
+    assert bool(managed) is current_has_managed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["save", "apply"])
+async def test_incomplete_catalog_write_preserves_the_current_managed_codex_profile(
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    current = _build_catalog(
+        llm_model="gpt-standard",
+        llm_base_url="https://llm.example/v1",
+        llm_api_key="llm-key",
+        embedding_model="text-embedding-current",
+        embedding_base_url="https://embedding.example/v1/embeddings",
+        embedding_api_key="",
+    )
+    managed_profile = _managed_codex_profile(
+        ["medium", "high"],
+        reasoning_effort="medium",
+        account_binding="current-account-binding",
+    )
+    current["services"]["llm"]["profiles"].append(managed_profile)
+    service = _FakeCatalogService(current)
+    monkeypatch.setattr(settings_router, "get_model_catalog_service", lambda: service)
+    monkeypatch.setattr(settings_router, "_runtime_catalog_write", contextlib.nullcontext)
+    payload = settings_router.CatalogPayload(catalog={"version": 1})
+
+    if operation == "save":
+        await settings_router.update_catalog(payload)
+    else:
+        await settings_router.apply_catalog(payload)
+
+    stored_profiles = service.load()["services"]["llm"]["profiles"]
+    assert stored_profiles == [managed_profile]
+
+
+@pytest.mark.asyncio
 async def test_enabled_tools_roundtrip(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
     settings_file = tmp_path / "interface.json"
     monkeypatch.setattr(settings_router, "_settings_file", lambda: settings_file)
+    monkeypatch.setattr(interface_settings, "_interface_settings_file", lambda: settings_file)
 
     # Default state — no file yet, so the loader emits the full toggleable set.
     assert set(settings_router.get_enabled_optional_tools()) == set(
@@ -689,7 +1321,9 @@ async def test_complete_tour_invalidates_runtime_caches(
 async def test_fetch_models_returns_picker_options(monkeypatch: pytest.MonkeyPatch) -> None:
     import deeptutor.services.llm.factory as factory_module
 
-    async def _fake_fetch(binding: str, base_url: str, api_key: str | None = None):
+    async def _fake_fetch(
+        binding: str, base_url: str, api_key: str | None = None, api_format: str = "auto"
+    ):
         assert binding == "openai"  # "OpenAI" is normalized to lowercase
         assert base_url == "https://api.example.com/v1"
         assert api_key == "sk-x"
@@ -712,6 +1346,47 @@ async def test_fetch_models_returns_picker_options(monkeypatch: pytest.MonkeyPat
 
 
 @pytest.mark.asyncio
+async def test_fetch_models_resolves_masked_key_server_side(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import deeptutor.services.llm.factory as factory_module
+
+    catalog = _build_catalog(
+        llm_model="gpt-4o-mini",
+        llm_base_url="https://llm.example/v1",
+        llm_api_key="stored-secret",
+        embedding_model="text-embedding-3-small",
+        embedding_base_url="https://emb.example/v1/embeddings",
+        embedding_api_key="emb-key",
+    )
+    service = _FakeCatalogService(catalog)
+    monkeypatch.setattr(settings_router, "get_model_catalog_service", lambda: service)
+
+    async def _fake_fetch(
+        binding: str, base_url: str, api_key: str | None = None, api_format: str = "auto"
+    ):
+        assert (binding, base_url, api_key) == (
+            "openai",
+            "https://llm.example/v1",
+            "stored-secret",
+        )
+        return ["gpt-4o-mini"]
+
+    monkeypatch.setattr(factory_module, "fetch_models", _fake_fetch)
+
+    response = await settings_router.fetch_models_from_provider(
+        settings_router.FetchModelsPayload(
+            binding="openai",
+            base_url="https://llm.example/v1",
+            api_key=settings_router.CATALOG_SECRET_MASK,
+            profile_id="llm-profile-default",
+        )
+    )
+
+    assert response == {"models": [{"id": "gpt-4o-mini", "name": "gpt-4o-mini"}]}
+
+
+@pytest.mark.asyncio
 async def test_fetch_models_requires_base_url() -> None:
     from fastapi import HTTPException
 
@@ -720,6 +1395,59 @@ async def test_fetch_models_requires_base_url() -> None:
             settings_router.FetchModelsPayload(base_url="   ")
         )
     assert exc_info.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_fetch_models_allows_codebuddy_without_base_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import deeptutor.services.llm.factory as factory_module
+
+    async def _fake_fetch(
+        binding: str, base_url: str, api_key: str | None = None, api_format: str = "auto"
+    ):
+        assert (binding, base_url, api_key) == ("codebuddy", "", None)
+        return ["hy3", "glm-5.2"]
+
+    monkeypatch.setattr(factory_module, "fetch_models", _fake_fetch)
+
+    response = await settings_router.fetch_models_from_provider(
+        settings_router.FetchModelsPayload(binding="codebuddy")
+    )
+
+    assert response == {
+        "models": [
+            {"id": "hy3", "name": "hy3"},
+            {"id": "glm-5.2", "name": "glm-5.2"},
+        ]
+    }
+
+
+@pytest.mark.asyncio
+async def test_codebuddy_auth_routes_use_admin_scoped_service(monkeypatch) -> None:
+    class FakeService:
+        async def status(self):
+            return {"connection": "connected"}
+
+        async def start_login(self):
+            return {"connection": "authorizing"}
+
+        async def cancel_login(self):
+            return {"connection": "disconnected"}
+
+        async def logout(self):
+            return {"connection": "disconnected", "user_label": None}
+
+    monkeypatch.setattr(settings_router, "_require_settings_admin", lambda: None)
+    monkeypatch.setattr(settings_router, "get_codebuddy_auth_service", lambda: FakeService())
+
+    assert await settings_router.get_codebuddy_auth_status() == {"connection": "connected"}
+    assert await settings_router.start_codebuddy_auth() == {"connection": "authorizing"}
+    assert await settings_router.cancel_codebuddy_auth() == {"connection": "disconnected"}
+    assert await settings_router.logout_codebuddy_auth() == {
+        "connection": "disconnected",
+        "user_label": None,
+    }
 
 
 @pytest.mark.asyncio
@@ -767,6 +1495,26 @@ async def test_update_ui_settings_preserves_theme_and_language_when_code_block_u
     assert persisted["code_block_theme"] == "dracula"
 
 
+@pytest.mark.asyncio
+async def test_get_ui_settings_returns_persisted_interface_preferences(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    settings_file = tmp_path / "interface.json"
+    monkeypatch.setattr(settings_router, "_settings_file", lambda: settings_file)
+    settings_router.save_ui_settings(
+        {
+            **settings_router.DEFAULT_UI_SETTINGS,
+            "theme": "dark",
+            "language": "zh",
+        }
+    )
+
+    response = await settings_router.get_ui_settings()
+
+    assert response["theme"] == "dark"
+    assert response["language"] == "zh"
+
+
 def test_codex_provider_choice_is_advertised_as_oauth() -> None:
     llm = {item["value"]: item for item in settings_router._provider_choices()["llm"]}
 
@@ -775,34 +1523,55 @@ def test_codex_provider_choice_is_advertised_as_oauth() -> None:
         "label": "OpenAI Codex",
         "base_url": "https://chatgpt.com/backend-api",
         "auth_mode": "oauth",
+        "supports_wire_api_selection": False,
+        # OAuth fixes the protocol: nothing for a profile to choose.
+        "api_formats": [],
+        "default_api_format": "auto",
+        "base_urls": {},
+        "status": "supported",
     }
     # API-key providers keep the same shape, so the frontend never special-cases
     # a missing field.
     assert llm["openai"]["auth_mode"] == "api_key"
 
 
+def test_provider_choices_advertise_wire_api_support_from_backend_metadata() -> None:
+    llm = {item["value"]: item for item in settings_router._provider_choices()["llm"]}
+
+    assert llm["custom"]["supports_wire_api_selection"] is True
+    assert llm["openai"]["supports_wire_api_selection"] is True
+    assert llm["azure_openai"]["supports_wire_api_selection"] is False
+    assert llm["custom_anthropic"]["supports_wire_api_selection"] is False
+
+
 @pytest.mark.asyncio
-async def test_codex_oauth_status_is_admin_only(
+async def test_codex_oauth_status_is_reachable_by_an_ordinary_user(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from fastapi import HTTPException
+    """Codex OAuth is personal, not administrative (#781).
 
+    This route used to be administrator-gated, which left ordinary users with
+    no path to Codex at all: an owner-bound profile is never grantable, so
+    they could neither be given one nor sign in for themselves. Everything it
+    touches — credential store, model catalog, callback route — resolves from
+    owner scope, so it is the caller's own login either way. The full
+    authorization contract, including the partner refusal that replaced the
+    admin gate, lives in ``tests/api/test_codex_oauth_scope.py``.
+    """
+    fake = _FakeCodexOAuthService()
     monkeypatch.setattr(
         settings_router,
         "get_current_user",
-        lambda: SimpleNamespace(is_admin=False),
+        lambda: SimpleNamespace(id="u_alice", is_admin=False),
     )
     monkeypatch.setattr(
         settings_router,
         "get_codex_oauth_service",
-        lambda: (_ for _ in ()).throw(AssertionError("service must not be accessed")),
+        lambda: fake,
         raising=False,
     )
 
-    with pytest.raises(HTTPException) as exc_info:
-        await settings_router.get_openai_codex_oauth_status()
-
-    assert exc_info.value.status_code == 403
+    assert await settings_router.get_openai_codex_oauth_status() == fake.public_status()
 
 
 @pytest.mark.asyncio
@@ -813,7 +1582,7 @@ async def test_codex_oauth_routes_return_only_public_service_payloads(
     monkeypatch.setattr(
         settings_router,
         "get_current_user",
-        lambda: SimpleNamespace(is_admin=True),
+        lambda: SimpleNamespace(id="root", is_admin=True),
     )
     monkeypatch.setattr(
         settings_router,
@@ -862,7 +1631,7 @@ async def test_codex_oauth_error_maps_to_sanitized_http_detail(
     monkeypatch.setattr(
         settings_router,
         "get_current_user",
-        lambda: SimpleNamespace(is_admin=True),
+        lambda: SimpleNamespace(id="root", is_admin=True),
     )
     monkeypatch.setattr(
         settings_router,
@@ -905,3 +1674,206 @@ async def test_update_ui_settings_persists_explicit_theme_and_language_defaults(
     persisted = settings_router.load_ui_settings()
     assert persisted["theme"] == "snow"
     assert persisted["language"] == "en"
+
+
+def test_get_ui_settings_is_public_without_auth(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """Auth pages bootstrap the interface language *before* a session exists.
+
+    Regression for #760: the app shell fetches GET /api/settings/ui on the
+    /register and /login pages, which have no session. When the endpoint sat
+    behind the ``_auth`` dependency it returned 401, the bootstrap silently
+    bailed out, and the auth pages stayed English even with the persisted
+    language set to zh. The read lives on ``public_router`` so it is reachable
+    anonymously (it only exposes non-sensitive UI preferences).
+    """
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    settings_file = tmp_path / "interface.json"
+    monkeypatch.setattr(settings_router, "_settings_file", lambda: settings_file)
+    settings_router.save_ui_settings(
+        {
+            **settings_router.DEFAULT_UI_SETTINGS,
+            "theme": "dark",
+            "language": "zh",
+        }
+    )
+
+    app = FastAPI()
+    app.include_router(settings_router.public_router, prefix="/api/settings")
+
+    client = TestClient(app)
+    response = client.get("/api/settings/ui")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["language"] == "zh"
+    assert payload["theme"] == "dark"
+
+
+def test_auth_disabled_settings_endpoint_does_not_expose_provider_secrets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for #857: local-admin mode is not a secret-viewing mode."""
+    from fastapi import Depends, FastAPI
+    from fastapi.testclient import TestClient
+
+    from deeptutor.api.routers import auth as auth_router
+
+    catalog = _build_catalog(
+        llm_model="gpt-4o-mini",
+        llm_base_url="https://llm.example/v1",
+        llm_api_key="secret-key",
+        embedding_model="text-embedding-3-small",
+        embedding_base_url="https://emb.example/v1/embeddings",
+        embedding_api_key="emb-key",
+    )
+    monkeypatch.setattr(auth_router, "AUTH_ENABLED", False)
+    monkeypatch.setattr(
+        settings_router,
+        "get_model_catalog_service",
+        lambda: _FakeCatalogService(catalog),
+    )
+
+    app = FastAPI()
+    app.include_router(
+        settings_router.router,
+        prefix="/api/settings",
+        dependencies=[Depends(auth_router.require_auth)],
+    )
+
+    response = TestClient(app).get("/api/settings")
+
+    assert response.status_code == 200
+    serialized = response.text
+    assert "secret-key" not in serialized
+    assert "emb-key" not in serialized
+    assert settings_router.CATALOG_SECRET_MASK in serialized
+
+
+def test_public_ui_read_omits_deployment_configuration(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """The anonymous read must not enumerate what the deployment turned on.
+
+    ``ui`` also carries sidebar_nav_order, enabled_optional_tools and
+    chat_response_timeout. Those describe the deployment rather than the
+    visitor, so the pre-session projection stops at theme + language and the
+    rest stays behind auth on GET /settings.
+    """
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    settings_file = tmp_path / "interface.json"
+    monkeypatch.setattr(settings_router, "_settings_file", lambda: settings_file)
+    settings_router.save_ui_settings(
+        {
+            **settings_router.DEFAULT_UI_SETTINGS,
+            "language": "zh",
+            "enabled_optional_tools": ["rag", "web_search"],
+            "chat_response_timeout": 900,
+        }
+    )
+
+    app = FastAPI()
+    app.include_router(settings_router.public_router, prefix="/api/settings")
+
+    payload = TestClient(app).get("/api/settings/ui").json()
+
+    assert set(payload) == set(settings_router.PRESESSION_UI_FIELDS)
+    assert "enabled_optional_tools" not in payload
+    assert "chat_response_timeout" not in payload
+    assert "sidebar_nav_order" not in payload
+
+
+def test_get_ui_settings_not_registered_on_gated_router() -> None:
+    """The public read is not duplicated on the auth-gated settings router.
+
+    The write (PUT /ui) stays auth-gated; only the anonymous read moved to
+    ``public_router``.
+    """
+    gated_methods = {
+        method
+        for route in settings_router.router.routes
+        for method in (getattr(route, "methods", None) or ())
+        if getattr(route, "path", "") == "/ui"
+    }
+    assert "GET" not in gated_methods, f"GET /ui must not be on the gated router: {gated_methods}"
+    assert "PUT" in gated_methods
+
+
+def test_ui_writes_are_atomic_and_serialised(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """Both writers of interface.json must share one lock and one atomic replace.
+
+    The router and the setup capability write the same file. While each opened
+    it directly, twelve concurrent writes left two fields on disk — a lock only
+    one side takes is not a lock, and a plain ``open(..., "w")`` can also leave
+    a truncated file behind a crash.
+    """
+    import threading
+
+    from deeptutor.services.settings import interface_settings
+
+    settings_file = tmp_path / "interface.json"
+    monkeypatch.setattr(settings_router, "_settings_file", lambda: settings_file)
+    monkeypatch.setattr(interface_settings, "_interface_settings_file", lambda: settings_file)
+
+    def via_router(index: int) -> None:
+        for _ in range(20):
+            settings_router.patch_ui_settings(**{f"router_{index}": index})
+
+    def via_capability(index: int) -> None:
+        for _ in range(20):
+            interface_settings.set_ui_setting(f"cap_{index}", index)
+
+    threads = [threading.Thread(target=via_router, args=(i,)) for i in range(6)]
+    threads += [threading.Thread(target=via_capability, args=(i,)) for i in range(6)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    stored = json.loads(settings_file.read_text(encoding="utf-8"))
+    assert {f"router_{i}" for i in range(6)} <= set(stored)
+    assert {f"cap_{i}" for i in range(6)} <= set(stored)
+
+
+@pytest.mark.asyncio
+async def test_ui_endpoints_do_not_freeze_defaults_into_the_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """Changing one preference must not persist every current default alongside it.
+
+    ``load_ui_settings`` returns a defaults-merged view; the endpoints used to
+    save that view straight back, so the first time anyone changed their theme
+    the file gained an explicit copy of every default as it stood that day —
+    and that user silently stopped following later changes to any of them.
+    """
+    settings_file = tmp_path / "interface.json"
+    monkeypatch.setattr(settings_router, "_settings_file", lambda: settings_file)
+
+    await settings_router.update_theme(settings_router.ThemeUpdate(theme="dark"))
+
+    stored = json.loads(settings_file.read_text(encoding="utf-8"))
+    assert stored == {"theme": "dark"}, f"only the changed field belongs on disk: {stored}"
+    # The read path still reports the full picture.
+    assert settings_router.load_ui_settings()["language"] == "en"
+
+
+@pytest.mark.asyncio
+async def test_voice_math_speak_persists_without_freezing_defaults(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    settings_file = tmp_path / "interface.json"
+    monkeypatch.setattr(settings_router, "_settings_file", lambda: settings_file)
+
+    response = await settings_router.update_voice_math_speak(
+        settings_router.VoiceMathSpeakUpdate(voice_math_speak=False)
+    )
+
+    assert response == {"voice_math_speak": False}
+    stored = json.loads(settings_file.read_text(encoding="utf-8"))
+    assert stored == {"voice_math_speak": False}
+    loaded = settings_router.load_ui_settings()
+    assert loaded["voice_math_speak"] is False
+    assert loaded["voice_autoplay"] is False

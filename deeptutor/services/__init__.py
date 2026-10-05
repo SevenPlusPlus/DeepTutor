@@ -55,7 +55,6 @@ __all__ = [
     "config",
     "PathService",
     "get_path_service",
-    "BaseSessionManager",
 ]
 
 
@@ -64,23 +63,19 @@ def __getattr__(name: str):
     import importlib
 
     if name == "llm":
-        return importlib.import_module(f"{__name__}.llm")
+        return importlib.import_module("deeptutor.services.llm")
     if name == "prompt":
-        return importlib.import_module(f"{__name__}.prompt")
+        return importlib.import_module("deeptutor.services.prompt")
     if name == "search":
-        return importlib.import_module(f"{__name__}.search")
+        return importlib.import_module("deeptutor.services.search")
     if name == "setup":
-        return importlib.import_module(f"{__name__}.setup")
+        return importlib.import_module("deeptutor.services.setup")
     if name == "session":
-        return importlib.import_module(f"{__name__}.session")
+        return importlib.import_module("deeptutor.services.session")
     if name == "config":
-        return importlib.import_module(f"{__name__}.config")
+        return importlib.import_module("deeptutor.services.config")
     if name == "rag":
-        return importlib.import_module(f"{__name__}.rag")
+        return importlib.import_module("deeptutor.services.rag")
     if name == "embedding":
-        return importlib.import_module(f"{__name__}.embedding")
-    if name == "BaseSessionManager":
-        from .session import BaseSessionManager
-
-        return BaseSessionManager
+        return importlib.import_module("deeptutor.services.embedding")
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

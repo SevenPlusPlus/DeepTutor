@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import datetime, timezone
 import json
 import logging
@@ -11,7 +12,17 @@ import threading
 from typing import Any
 from uuid import uuid4
 
-from .models import Role
+from deeptutor.services.file_io import atomic_write_text
+from deeptutor.utils.secret_files import write_secret_text
+
+from .book_permission import (
+    BookPermission,
+    canonical_book_permission,
+    normalize_book_permission,
+    public_permission_dict,
+)
+from .learner_profile import normalize_profile
+from .models import VALID_ROLES, AccountPreset, Role, normalize_role
 from .paths import PROJECT_ROOT, SYSTEM_ROOT, migrate_legacy_multi_user_tree
 
 logger = logging.getLogger(__name__)
@@ -58,17 +69,24 @@ def _canonical_record(
     hashed = str(value.get("hash") or value.get("password_hash") or "")
     if not hashed:
         return None
-    role = str(value.get("role") or default_role)
-    if role not in {"admin", "user"}:
-        role = default_role
-    return {
+    role = normalize_role(str(value.get("role") or default_role), default_role)
+    preset = str(value.get("preset") or "standard")
+    if preset not in {"standard", "learner", "custom"}:
+        preset = "standard"
+    record = {
         "id": str(value.get("id") or new_user_id()),
         "hash": hashed,
         "role": role,
         "created_at": str(value.get("created_at") or utc_now()),
         "disabled": bool(value.get("disabled", False)),
         "avatar": str(value.get("avatar") or ""),
+        "preset": preset,
     }
+    if "book_permission" in value:
+        record["book_permission"] = canonical_book_permission(value.get("book_permission"))
+    if "learner_profile" in value:
+        record["learner_profile"] = normalize_profile(value.get("learner_profile"))
+    return record
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -82,7 +100,7 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 def _write_users(users: dict[str, dict[str, Any]]) -> None:
     USERS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    USERS_FILE.write_text(json.dumps(users, indent=2, ensure_ascii=False), encoding="utf-8")
+    atomic_write_text(USERS_FILE, json.dumps(users, indent=2, ensure_ascii=False))
 
 
 def _migrate_legacy_users() -> dict[str, dict[str, Any]] | None:
@@ -92,8 +110,8 @@ def _migrate_legacy_users() -> dict[str, dict[str, Any]] | None:
     users: dict[str, dict[str, Any]] = {}
     for username, value in legacy.items():
         role: Role = "admin" if not users else "user"
-        if isinstance(value, dict) and str(value.get("role") or "") in {"admin", "user"}:
-            role = str(value.get("role"))  # type: ignore[assignment]
+        if isinstance(value, dict):
+            role = normalize_role(str(value.get("role") or ""), role)  # type: ignore[assignment]
         record = _canonical_record(username, value, default_role=role)
         if record is not None:
             users[str(username)] = record
@@ -110,15 +128,49 @@ def _migrate_secret() -> None:
     try:
         secret = LEGACY_SECRET_FILE.read_text(encoding="utf-8").strip()
         if secret:
-            SECRET_FILE.parent.mkdir(parents=True, exist_ok=True)
-            SECRET_FILE.write_text(secret, encoding="utf-8")
-            try:
-                SECRET_FILE.chmod(0o600)
-            except OSError:
-                pass
+            write_secret_text(SECRET_FILE, secret)
             logger.info("Migrated auth secret from %s to %s", LEGACY_SECRET_FILE, SECRET_FILE)
     except Exception as exc:
         logger.warning("Failed to migrate legacy auth secret: %s", exc)
+
+
+def _env_bootstrap_admin() -> tuple[str, str]:
+    """Return ``(username, password_hash)`` for the ``auth.json`` bootstrap admin.
+
+    Both halves are required: the shipped default seeds a username with an
+    empty hash, which cannot authenticate and therefore is not an admin. An
+    empty tuple entry means "no bootstrap admin configured".
+
+    :mod:`deeptutor.services.auth` is imported lazily because it imports this
+    module. Its resolved globals — rather than a fresh settings read — are the
+    source of truth on purpose: they are exactly the credentials
+    ``authenticate()`` accepts, so the promotion gate in :func:`save_user` and
+    the login path can never disagree about whether an admin already exists.
+    """
+    try:
+        from deeptutor.services import auth as auth_service
+
+        username = str(getattr(auth_service, "AUTH_USERNAME", "") or "")
+        password_hash = str(getattr(auth_service, "AUTH_PASSWORD_HASH", "") or "")
+    except Exception as exc:  # pragma: no cover - auth settings unavailable
+        logger.warning("Could not resolve the bootstrap admin credentials: %s", exc)
+        return "", ""
+    if not username or not password_hash:
+        return "", ""
+    return username, password_hash
+
+
+def _env_admin_record(password_hash: str) -> dict[str, Any]:
+    """Build the in-memory record representing the bootstrap admin."""
+    return {
+        "id": "env-admin",
+        "hash": password_hash,
+        "role": "admin",
+        "created_at": "",
+        "disabled": False,
+        "avatar": "",
+        "preset": "standard",
+    }
 
 
 def load_users(  # nosec B107 - empty defaults mean "no env fallback supplied".
@@ -140,8 +192,8 @@ def load_users(  # nosec B107 - empty defaults mean "no env fallback supplied".
     changed = False
     for index, (username, value) in enumerate(users.items()):
         role: Role = "admin" if index == 0 else "user"
-        if isinstance(value, dict) and str(value.get("role") or "") in {"admin", "user"}:
-            role = str(value.get("role"))  # type: ignore[assignment]
+        if isinstance(value, dict):
+            role = normalize_role(str(value.get("role") or ""), role)  # type: ignore[assignment]
         record = _canonical_record(str(username), value, default_role=role)
         if record is None:
             changed = True
@@ -152,31 +204,47 @@ def load_users(  # nosec B107 - empty defaults mean "no env fallback supplied".
     if USERS_FILE.exists() and changed:
         _write_users(canonical)
 
-    if canonical:
-        return canonical
+    # The bootstrap admin is merged in whenever it is configured, not only when
+    # the store is empty. Falling back to it only for an empty store locked the
+    # operator who bootstrapped the deployment out of their own instance the
+    # moment the first real account was written (#849). A stored record with the
+    # same username wins, so the account can later be adopted into the store.
+    # The merge is deliberately in-memory only; no write path passes the env
+    # arguments, so the bootstrap hash is never persisted into ``users.json``
+    # where a rotation of ``auth.json`` could no longer supersede it.
+    if env_username and env_password_hash and env_username not in canonical:
+        merged = {env_username: _env_admin_record(env_password_hash)}
+        merged.update(canonical)
+        return merged
 
-    if env_username and env_password_hash:
-        return {
-            env_username: {
-                "id": "env-admin",
-                "hash": env_password_hash,
-                "role": "admin",
-                "created_at": "",
-                "disabled": False,
-            }
-        }
-
-    return {}
+    return canonical
 
 
-def save_user(username: str, hashed_password: str, role: Role = "user") -> dict[str, Any]:
+def save_user(
+    username: str,
+    hashed_password: str,
+    role: Role = "user",
+    preset: AccountPreset = "standard",
+) -> dict[str, Any]:
     USERS_FILE.parent.mkdir(parents=True, exist_ok=True)
     # Read-modify-write must be atomic so concurrent first-time registrations
     # cannot each see an empty store and each promote themselves to admin.
     with _USERS_WRITE_LOCK:
+        # Called without the env arguments on purpose: ``users`` is written back
+        # to disk below, and the bootstrap admin must stay an in-memory overlay.
         users = load_users()
-        effective_role: Role = "admin" if not users else role
+        env_username, _ = _env_bootstrap_admin()
+        # A configured bootstrap admin counts as an existing account, so the
+        # first account an operator creates from /admin/users is not silently
+        # promoted — that endpoint documents role="user" (#849). Re-saving the
+        # bootstrap admin's own username adopts it into the store instead, and
+        # must keep the admin role.
+        account_exists = bool(users) or (bool(env_username) and env_username != username)
+        effective_role: Role = role if account_exists else "admin"
         existing = users.get(username) or {}
+        effective_preset = str(existing.get("preset") or preset or "standard")
+        if effective_preset not in {"standard", "learner", "custom"}:
+            effective_preset = preset
         record = {
             "id": str(existing.get("id") or new_user_id()),
             "hash": hashed_password,
@@ -184,6 +252,9 @@ def save_user(username: str, hashed_password: str, role: Role = "user") -> dict[
             "created_at": str(existing.get("created_at") or utc_now()),
             "disabled": bool(existing.get("disabled", False)),
             "avatar": str(existing.get("avatar") or ""),
+            "preset": effective_preset,
+            "book_permission": canonical_book_permission(existing.get("book_permission")),
+            "learner_profile": normalize_profile(existing.get("learner_profile")),
         }
         users[username] = record
         _write_users(users)
@@ -202,6 +273,10 @@ def list_user_info(  # nosec B107 - empty defaults mean "no env fallback supplie
             "created_at": record.get("created_at", ""),
             "disabled": bool(record.get("disabled", False)),
             "avatar": str(record.get("avatar") or ""),
+            "preset": str(record.get("preset") or "standard"),
+            "book_permission": public_permission_dict(
+                normalize_book_permission(record.get("book_permission"))
+            ),
         }
         for username, record in load_users(env_username, env_password_hash).items()
     ]
@@ -218,15 +293,111 @@ def get_user_by_id(user_id: str) -> tuple[str, dict[str, Any]] | None:
     return None
 
 
+def get_learner_profile(username: str) -> dict[str, Any] | None:
+    """Return a learner account's structured profile, if present."""
+    record = get_user(username)
+    if record is None or str(record.get("preset") or "standard") != "learner":
+        return None
+    return normalize_profile(record.get("learner_profile"))
+
+
+def set_learner_profile(username: str, profile: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Atomically replace one ordinary user's structured learner profile."""
+    with _USERS_WRITE_LOCK:
+        users = load_users()
+        record = users.get(username)
+        if (
+            record is None
+            or str(record.get("role") or "user") == "admin"
+            or str(record.get("preset") or "standard") != "learner"
+        ):
+            return None
+        record["learner_profile"] = normalize_profile(profile)
+        _write_users(users)
+        return record["learner_profile"]
+
+
+def set_book_permission(username: str, permission: BookPermission) -> bool:
+    """Atomically replace one ordinary user's shared-book permission."""
+
+    if not USERS_FILE.exists():
+        return False
+    with _USERS_WRITE_LOCK:
+        users = load_users()
+        record = users.get(username)
+        if record is None:
+            return False
+        record["book_permission"] = public_permission_dict(permission)
+        _write_users(users)
+    return True
+
+
+def remove_book_permission_overrides(book_id: str) -> list[str]:
+    """Remove a deleted shared book from every explicit ACL.
+
+    Returns affected user ids for the deletion audit summary.
+    """
+
+    if not USERS_FILE.exists():
+        return []
+    affected: list[str] = []
+    with _USERS_WRITE_LOCK:
+        users = load_users()
+        changed = False
+        for record in users.values():
+            permission = normalize_book_permission(record.get("book_permission"))
+            books = permission.books_dict()
+            if book_id not in books:
+                continue
+            books.pop(book_id)
+            record["book_permission"] = public_permission_dict(
+                BookPermission(
+                    create=permission.create,
+                    default=permission.default,
+                    books=tuple(books.items()),
+                )
+            )
+            affected.append(str(record.get("id") or ""))
+            changed = True
+        if changed:
+            _write_users(users)
+    return affected
+
+
 def delete_user(username: str) -> bool:
     if not USERS_FILE.exists():
         return False
-    users = load_users()
-    if username not in users:
-        return False
-    users.pop(username, None)
-    _write_users(users)
+    with _USERS_WRITE_LOCK:
+        users = load_users()
+        record = users.get(username)
+        if record is None:
+            return False
+        user_id = str(record.get("id") or "")
+        users.pop(username, None)
+        _write_users(users)
+    try:
+        from .guardians import revoke_relationships_for_user
+
+        # Route guards also revalidate both accounts, so a rare cleanup failure
+        # can never make a deleted-user relationship usable.
+        revoke_relationships_for_user(user_id, reason="user_deleted")
+    except Exception:
+        logger.exception("Could not revoke guardian relationships after user deletion")
     return True
+
+
+def set_password(username: str, hashed_password: str) -> dict[str, Any] | None:
+    """Replace one account's password hash without changing its identity fields."""
+    if not USERS_FILE.exists():
+        return None
+    with _USERS_WRITE_LOCK:
+        users = load_users()
+        record = users.get(username)
+        if record is None:
+            return None
+        record["hash"] = hashed_password
+        _write_users(users)
+        return deepcopy(record)
 
 
 def set_avatar(username: str, avatar: str) -> bool:
@@ -288,8 +459,8 @@ def delete_avatar_file(user_id: str) -> None:
 
 
 def set_role(username: str, role: Role) -> bool:
-    if role not in {"admin", "user"}:
-        raise ValueError("role must be 'admin' or 'user'")
+    if role not in VALID_ROLES:
+        raise ValueError(f"role must be one of {sorted(VALID_ROLES)}")
     if not USERS_FILE.exists():
         return False
     users = load_users()
@@ -297,6 +468,28 @@ def set_role(username: str, role: Role) -> bool:
         return False
     users[username]["role"] = role
     _write_users(users)
+    return True
+
+
+def set_preset(
+    username: str, preset: AccountPreset, *, expected_user_id: str | None = None
+) -> bool:
+    """Update an account's configuration preset without changing its role."""
+    if preset not in {"standard", "learner", "custom"}:
+        raise ValueError("preset must be 'standard', 'learner', or 'custom'")
+    if not USERS_FILE.exists():
+        return False
+    with _USERS_WRITE_LOCK:
+        users = load_users()
+        if username not in users:
+            return False
+        if (
+            expected_user_id is not None
+            and str(users[username].get("id") or "") != expected_user_id
+        ):
+            return False
+        users[username]["preset"] = preset
+        _write_users(users)
     return True
 
 
@@ -308,13 +501,8 @@ def load_or_create_auth_secret() -> str:
             existing = SECRET_FILE.read_text(encoding="utf-8").strip()
             if existing:
                 return existing
-        SECRET_FILE.parent.mkdir(parents=True, exist_ok=True)
         generated = secrets.token_hex(32)
-        SECRET_FILE.write_text(generated, encoding="utf-8")
-        try:
-            SECRET_FILE.chmod(0o600)
-        except OSError:
-            pass
+        write_secret_text(SECRET_FILE, generated)
         logger.warning(
             "Auth is enabled and no auth_secret file exists. Generated a stable local secret at %s.",
             SECRET_FILE,

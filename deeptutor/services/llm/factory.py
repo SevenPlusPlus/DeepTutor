@@ -9,9 +9,11 @@ from types import SimpleNamespace
 from typing import Any, TypedDict
 
 from deeptutor.config.settings import settings
+from deeptutor.services.keypool import primary_api_key
 from deeptutor.services.provider_registry import (
     PROVIDERS,
     canonical_provider_name,
+    effective_backend,
     find_by_model,
     find_by_name,
     find_gateway,
@@ -21,7 +23,9 @@ from .capabilities import supports_response_format, supports_vision
 from .config import LLMConfig, get_llm_config
 from .error_mapping import map_error
 from .multimodal import prepare_multimodal_messages
-from .provider_factory import get_runtime_provider
+from .provider_core.base import LLMProvider
+from .provider_factory import build_isolated_provider, get_runtime_provider
+from .types import StreamOutcome
 from .utils import is_local_llm_server
 
 DEFAULT_MAX_RETRIES = settings.retry.max_retries
@@ -78,14 +82,14 @@ def _resolve_provider_spec(
     *,
     binding: str | None,
     model: str,
-    api_key: str,
+    api_key: str | list[str],
     base_url: str | None,
     fallback: str | None,
 ):
     explicit = find_by_name(binding)
     gateway = find_gateway(
         provider_name=explicit.name if explicit else None,
-        api_key=api_key or None,
+        api_key=primary_api_key(api_key),
         api_base=base_url or None,
     )
     if explicit and gateway and explicit.name == "openai":
@@ -125,7 +129,7 @@ def _binding_matches_current(binding: str | None, current: LLMConfig) -> bool:
 def _matching_current_config(
     *,
     model: str,
-    api_key: str,
+    api_key: str | list[str],
     base_url: str | None,
     api_version: str | None,
     binding: str | None,
@@ -153,7 +157,7 @@ def _matching_current_config(
 def _resolve_call_config(
     *,
     model: str | None,
-    api_key: str | None,
+    api_key: str | list[str] | None,
     base_url: str | None,
     api_version: str | None,
     binding: str | None,
@@ -201,6 +205,8 @@ def _resolve_call_config(
             provider_mode=provider_mode,
             api_version=api_version,
             extra_headers=merged_headers,
+            wire_api=current.wire_api if current is not None else "auto",
+            api_format=current.api_format if current is not None else "auto",
             reasoning_effort=resolved_reasoning_effort,
         )
         return config, provider_spec
@@ -238,6 +244,8 @@ def _resolve_call_config(
             "provider_mode": provider_mode,
             "api_version": resolved_api_version,
             "extra_headers": merged_headers,
+            "wire_api": current.wire_api,
+            "api_format": current.api_format,
             "reasoning_effort": (
                 reasoning_effort if reasoning_effort is not None else current.reasoning_effort
             ),
@@ -247,9 +255,7 @@ def _resolve_call_config(
 
 
 def _capability_binding(config: LLMConfig, provider_spec: Any) -> str:
-    backend = (
-        getattr(provider_spec, "backend", "openai_compat") if provider_spec else "openai_compat"
-    )
+    backend = effective_backend(provider_spec, config.api_format)
     if backend == "anthropic":
         return "anthropic"
     if backend == "azure_openai":
@@ -324,8 +330,12 @@ def _sanitize_call_kwargs(
         "base_url",
         "api_version",
         "binding",
+        "effective_url",
         "extra_headers",
+        "provider_mode",
+        "provider_name",
         "reasoning_effort",
+        "wire_api",
     ):
         extra_kwargs.pop(key, None)
 
@@ -334,11 +344,75 @@ def _sanitize_call_kwargs(
     return extra_kwargs
 
 
+async def _complete_with_resolved_config(
+    config: LLMConfig,
+    provider_spec: Any,
+    *,
+    prompt: str,
+    system_prompt: str,
+    messages: list[dict[str, Any]] | None,
+    max_retries: int,
+    retry_delay: float,
+    exponential_backoff: bool,
+    allow_image_fallback: bool | None,
+    image_data: str | None,
+    image_mime_type: str,
+    image_filename: str,
+    kwargs: dict[str, Any],
+    provider: LLMProvider | None = None,
+) -> str:
+    """Execute one completion from an already resolved configuration."""
+    provider = provider or get_runtime_provider(config)
+    capability_binding = _capability_binding(config, provider_spec)
+    request_messages = _build_messages(prompt, system_prompt, messages)
+    request_messages = _apply_inline_image_data(
+        request_messages,
+        binding=capability_binding,
+        model=config.model,
+        image_data=image_data,
+        image_mime_type=str(image_mime_type or "image/png"),
+        image_filename=str(image_filename or "image.png"),
+    )
+    retry_delays = _build_retry_delays(max_retries, retry_delay, exponential_backoff)
+    extra_kwargs = _sanitize_call_kwargs(
+        binding=capability_binding, model=config.model, kwargs=kwargs
+    )
+    image_fallback_enabled = (
+        not supports_vision(capability_binding, config.model)
+        if allow_image_fallback is None
+        else allow_image_fallback
+    )
+
+    try:
+        response = await provider.chat_with_retry(
+            messages=request_messages,
+            model=config.model,
+            reasoning_effort=config.reasoning_effort,
+            retry_delays=retry_delays,
+            allow_image_fallback=image_fallback_enabled,
+            **extra_kwargs,
+        )
+    except Exception as exc:
+        raise map_error(exc, provider=config.provider_name) from exc
+
+    if response.finish_reason == "error":
+        raise map_error(
+            RuntimeError(response.content or "LLM request failed"), provider=config.provider_name
+        )
+    # Provider adapters keep hidden reasoning in ``reasoning_content``.  A
+    # few gateways duplicate that field into ``content`` when no visible
+    # answer is present; never let that duplicate become user-facing text.
+    if response.content and response.reasoning_content:
+        if response.content == response.reasoning_content:
+            return ""
+    return response.content or ""
+
+
 async def complete(
     prompt: str,
     system_prompt: str = "You are a helpful assistant.",
     model: str | None = None,
-    api_key: str | None = None,
+    api_key: str | list[str] | None = None,
     base_url: str | None = None,
     api_version: str | None = None,
     binding: str | None = None,
@@ -346,6 +420,7 @@ async def complete(
     max_retries: int = DEFAULT_MAX_RETRIES,
     retry_delay: float = DEFAULT_RETRY_DELAY,
     exponential_backoff: bool = DEFAULT_EXPONENTIAL_BACKOFF,
+    allow_image_fallback: bool | None = None,
     **kwargs: Any,
 ) -> str:
     caller_extra_headers = kwargs.pop("extra_headers", None)
@@ -363,46 +438,89 @@ async def complete(
         extra_headers=caller_extra_headers,
         reasoning_effort=reasoning_effort,
     )
-    provider = get_runtime_provider(config)
-    capability_binding = _capability_binding(config, provider_spec)
-    request_messages = _build_messages(prompt, system_prompt, messages)
-    request_messages = _apply_inline_image_data(
-        request_messages,
-        binding=capability_binding,
-        model=config.model,
+    return await _complete_with_resolved_config(
+        config,
+        provider_spec,
+        prompt=prompt,
+        system_prompt=system_prompt,
+        messages=messages,
+        max_retries=max_retries,
+        retry_delay=retry_delay,
+        exponential_backoff=exponential_backoff,
+        allow_image_fallback=allow_image_fallback,
         image_data=image_data,
         image_mime_type=str(image_mime_type or "image/png"),
         image_filename=str(image_filename or "image.png"),
-    )
-    retry_delays = _build_retry_delays(max_retries, retry_delay, exponential_backoff)
-    extra_kwargs = _sanitize_call_kwargs(
-        binding=capability_binding, model=config.model, kwargs=kwargs
+        kwargs=kwargs,
     )
 
+
+async def complete_with_config(
+    config: LLMConfig,
+    prompt: str,
+    system_prompt: str = "You are a helpful assistant.",
+    messages: list[dict[str, Any]] | None = None,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+    retry_delay: float = DEFAULT_RETRY_DELAY,
+    exponential_backoff: bool = DEFAULT_EXPONENTIAL_BACKOFF,
+    allow_image_fallback: bool | None = None,
+    **kwargs: Any,
+) -> str:
+    """Complete using only the supplied, fully resolved configuration."""
+    forbidden = {
+        "model",
+        "api_key",
+        "base_url",
+        "api_version",
+        "binding",
+        "effective_url",
+        "extra_headers",
+        "provider_mode",
+        "provider_name",
+        "reasoning_effort",
+        "wire_api",
+    }.intersection(kwargs)
+    if forbidden:
+        names = ", ".join(sorted(forbidden))
+        raise TypeError(f"complete_with_config does not accept config overrides: {names}")
+
+    image_data = kwargs.pop("image_data", None)
+    image_mime_type = kwargs.pop("image_mime_type", "image/png")
+    image_filename = kwargs.pop("image_filename", "image.png")
+    provider_spec = _resolve_provider_spec(
+        binding=config.provider_name or config.binding,
+        model=config.model,
+        api_key=config.api_key,
+        base_url=config.effective_url or config.base_url,
+        fallback=config.provider_name or config.binding,
+    )
+    provider = build_isolated_provider(config)
     try:
-        response = await provider.chat_with_retry(
-            messages=request_messages,
-            model=config.model,
-            reasoning_effort=config.reasoning_effort,
-            retry_delays=retry_delays,
-            allow_image_fallback=not supports_vision(capability_binding, config.model),
-            **extra_kwargs,
+        return await _complete_with_resolved_config(
+            config,
+            provider_spec,
+            prompt=prompt,
+            system_prompt=system_prompt,
+            messages=messages,
+            max_retries=max_retries,
+            retry_delay=retry_delay,
+            exponential_backoff=exponential_backoff,
+            allow_image_fallback=allow_image_fallback,
+            image_data=image_data,
+            image_mime_type=str(image_mime_type or "image/png"),
+            image_filename=str(image_filename or "image.png"),
+            kwargs=kwargs,
+            provider=provider,
         )
-    except Exception as exc:
-        raise map_error(exc, provider=config.provider_name) from exc
-
-    if response.finish_reason == "error":
-        raise map_error(
-            RuntimeError(response.content or "LLM request failed"), provider=config.provider_name
-        )
-    return response.content or ""
+    finally:
+        await provider.aclose()
 
 
 async def stream(
     prompt: str,
     system_prompt: str = "You are a helpful assistant.",
     model: str | None = None,
-    api_key: str | None = None,
+    api_key: str | list[str] | None = None,
     base_url: str | None = None,
     api_version: str | None = None,
     binding: str | None = None,
@@ -410,8 +528,16 @@ async def stream(
     max_retries: int = DEFAULT_MAX_RETRIES,
     retry_delay: float = DEFAULT_RETRY_DELAY,
     exponential_backoff: bool = DEFAULT_EXPONENTIAL_BACKOFF,
+    allow_image_fallback: bool | None = None,
+    outcome: StreamOutcome | None = None,
     **kwargs: Any,
 ) -> AsyncGenerator[str, None]:
+    """Stream a completion as text chunks.
+
+    ``outcome``, when given, is filled with the provider's terminal reason and
+    usage once the stream ends. A caller that parses the streamed text needs it
+    to tell a complete response from one cut off at ``max_tokens`` (#1545).
+    """
     caller_extra_headers = kwargs.pop("extra_headers", None)
     reasoning_effort = kwargs.pop("reasoning_effort", None)
     image_data = kwargs.pop("image_data", None)
@@ -448,6 +574,11 @@ async def stream(
     extra_kwargs = _sanitize_call_kwargs(
         binding=capability_binding, model=config.model, kwargs=kwargs
     )
+    image_fallback_enabled = (
+        not supports_vision(capability_binding, config.model)
+        if allow_image_fallback is None
+        else allow_image_fallback
+    )
 
     queue: asyncio.Queue[str | BaseException | None] = asyncio.Queue()
     saw_output = False
@@ -476,7 +607,7 @@ async def stream(
         await queue.put(chunk)
 
     async def _runner() -> None:
-        nonlocal in_think_block
+        nonlocal saw_output, in_think_block
         try:
             response = await provider.chat_stream_with_retry(
                 messages=request_messages,
@@ -485,16 +616,22 @@ async def stream(
                 on_content_delta=_on_content_delta,
                 on_reasoning_delta=_on_reasoning_delta,
                 retry_delays=retry_delays,
-                allow_image_fallback=not supports_vision(capability_binding, config.model),
+                allow_image_fallback=image_fallback_enabled,
                 **extra_kwargs,
             )
+            if outcome is not None:
+                outcome.finish_reason = str(response.finish_reason or "")
+                outcome.usage = dict(response.usage or {})
             if in_think_block:
                 in_think_block = False
                 await queue.put("</think>")
             # Some providers synthesize a final response only after the stream.
-            # Do not replay reasoning_content as user-visible answer text.
+            # Do not replay reasoning_content as user-visible answer text, and
+            # never surface an error-shaped response's operator message as if
+            # the model had written it: that case is raised below instead.
             if (
-                not saw_content
+                response.finish_reason != "error"
+                and not saw_content
                 and response.content
                 and response.content != response.reasoning_content
             ):
@@ -588,9 +725,15 @@ async def stream(
 
 async def fetch_models(
     binding: str,
-    base_url: str,
+    base_url: str = "",
     api_key: str | None = None,
+    api_format: str = "auto",
 ) -> list[str]:
+    if canonical_provider_name(binding) == "codebuddy":
+        from .provider_core.codebuddy_models import fetch_codebuddy_models
+
+        return await fetch_codebuddy_models(api_key)
+
     if is_local_llm_server(base_url):
         from . import local_provider
 
@@ -598,7 +741,7 @@ async def fetch_models(
 
     from . import cloud_provider
 
-    return await cloud_provider.fetch_models(base_url, api_key, binding)
+    return await cloud_provider.fetch_models(base_url, api_key, binding, api_format=api_format)
 
 
 def _build_api_provider_presets() -> dict[str, ApiProviderPreset]:

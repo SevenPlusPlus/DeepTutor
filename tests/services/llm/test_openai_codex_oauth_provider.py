@@ -3,10 +3,13 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator
 
+import httpcore
+import httpx
 import pytest
 
 from deeptutor.services.codex_auth.constants import CODEX_RESPONSES_URL
 from deeptutor.services.codex_auth.contracts import CodexAuthError, CodexToken
+from deeptutor.services.llm.exceptions import LLMProviderTransportError
 from deeptutor.services.llm.provider_core import openai_codex_provider as module
 from deeptutor.services.llm.provider_core.openai_codex_provider import (
     CodexHTTPError,
@@ -25,6 +28,8 @@ class FakeCodexService:
         self.token_calls = 0
         self.guard_entries = 0
         self.recovered_generation: int | None = None
+        self.marked_reauth: bool = False
+        self.runtime_validations: list[tuple[CodexToken, str, str | None]] = []
 
     async def get_token(self) -> CodexToken:
         self.token_calls += 1
@@ -33,6 +38,17 @@ class FakeCodexService:
     async def recover_after_unauthorized(self, generation: int) -> None:
         self.recovered_generation = generation
 
+    def validate_runtime_profile(
+        self,
+        token: CodexToken,
+        model_slug: str,
+        reasoning_effort: str | None,
+    ) -> None:
+        self.runtime_validations.append((token, model_slug, reasoning_effort))
+
+    def mark_reauth_required(self) -> None:
+        self.marked_reauth = True
+
     @asynccontextmanager
     async def inference_guard(self) -> AsyncIterator[None]:
         self.guard_entries += 1
@@ -40,8 +56,14 @@ class FakeCodexService:
 
 
 @pytest.mark.asyncio
-async def test_provider_uses_deeptutor_token_service_and_raw_sol_id(
+@pytest.mark.parametrize(
+    ("model_slug", "reasoning_effort"),
+    [("gpt-5.6-sol", "medium"), ("gpt-5.6-luna", "none")],
+)
+async def test_provider_uses_deeptutor_token_service_and_raw_model_id(
     monkeypatch: pytest.MonkeyPatch,
+    model_slug: str,
+    reasoning_effort: str,
 ) -> None:
     service = FakeCodexService()
     requests: list[tuple[str, dict[str, str], dict[str, Any]]] = []
@@ -58,10 +80,19 @@ async def test_provider_uses_deeptutor_token_service_and_raw_sol_id(
     monkeypatch.setattr(module, "get_codex_oauth_service", lambda: service)
     monkeypatch.setattr(module, "_request_codex", request)
 
+    image_url = "data:image/png;base64,QUJD"
     result = await OpenAICodexProvider().chat(
-        [{"role": "user", "content": "hello"}],
-        model="openai-codex/gpt-5.6-sol",
-        reasoning_effort="medium",
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe"},
+                    {"type": "image_url", "image_url": {"url": image_url}},
+                ],
+            }
+        ],
+        model=f"openai-codex/{model_slug}",
+        reasoning_effort=reasoning_effort,
         tools=[
             {
                 "type": "function",
@@ -78,12 +109,22 @@ async def test_provider_uses_deeptutor_token_service_and_raw_sol_id(
     assert result.finish_reason == "stop"
     assert service.token_calls == 1
     assert service.guard_entries == 1
+    assert service.runtime_validations == [(service.token, model_slug, reasoning_effort)]
     assert url == CODEX_RESPONSES_URL
     assert headers["Authorization"] == "Bearer test-access-token"
     assert headers["chatgpt-account-id"] == "account-123"
-    assert body["model"] == "gpt-5.6-sol"
-    assert body["reasoning"] == {"effort": "medium"}
+    assert body["model"] == model_slug
+    assert body["reasoning"] == {"effort": reasoning_effort}
     assert body["tools"][0]["name"] == "lookup"
+    assert body["input"] == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "describe"},
+                {"type": "input_image", "image_url": image_url, "detail": "auto"},
+            ],
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -144,6 +185,29 @@ async def test_401_with_dead_refresh_token_does_not_promise_a_retry(
 
 
 @pytest.mark.asyncio
+async def test_403_does_not_mark_reauth_required(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 403 may be model access denial, not a revoked OAuth grant."""
+    service = FakeCodexService()
+
+    async def rejected_request(*_args: Any, **_kwargs: Any) -> tuple[str, list[Any], str]:
+        raise CodexHTTPError(403, module._friendly_error(403))
+
+    monkeypatch.setattr(module, "get_codex_oauth_service", lambda: service)
+    monkeypatch.setattr(module, "_request_codex", rejected_request)
+
+    result = await OpenAICodexProvider().chat(
+        [{"role": "user", "content": "hello"}],
+        model="gpt-5.6-sol",
+    )
+
+    assert result.finish_reason == "error"
+    assert "account" in result.content.lower()
+    assert service.marked_reauth is False
+
+
+@pytest.mark.asyncio
 async def test_429_never_reads_openai_api_key_or_falls_back(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -194,6 +258,40 @@ async def test_provider_does_not_expose_network_error_details(
     assert result.finish_reason == "error"
     assert "private proxy" not in result.content
     assert "token" not in result.content.lower()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "transport_error",
+    [
+        httpx.RemoteProtocolError("private proxy host and token"),
+        httpcore.RemoteProtocolError("private proxy host and token"),
+    ],
+)
+async def test_transport_failure_raises_sanitized_retryable_error(
+    monkeypatch: pytest.MonkeyPatch,
+    transport_error: Exception,
+) -> None:
+    service = FakeCodexService()
+    sensitive_message = "private proxy host and token"
+
+    async def transport_failure(
+        *_args: Any,
+        **_kwargs: Any,
+    ) -> tuple[str, list[Any], str]:
+        raise transport_error
+
+    monkeypatch.setattr(module, "get_codex_oauth_service", lambda: service)
+    monkeypatch.setattr(module, "_request_codex", transport_failure)
+
+    with pytest.raises(LLMProviderTransportError) as exc_info:
+        await OpenAICodexProvider().chat(
+            [{"role": "user", "content": "hello"}],
+        )
+
+    assert str(exc_info.value) == "Codex transport request failed."
+    assert sensitive_message not in str(exc_info.value)
+    assert exc_info.value.__cause__ is transport_error
 
 
 def test_provider_source_no_longer_imports_oauth_cli_kit() -> None:

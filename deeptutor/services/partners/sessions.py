@@ -9,6 +9,7 @@ and back the history API, so a flat append-only file per session is enough.
 
 from __future__ import annotations
 
+from collections import deque
 from datetime import datetime
 import json
 import logging
@@ -23,6 +24,27 @@ logger = logging.getLogger(__name__)
 _HISTORY_MAX_MESSAGES = 40
 _HISTORY_MAX_CHARS = 24_000
 _ARCHIVE_PREFIX = "_archived_"
+
+
+# Each chat platform names its own conversation kinds, and the channels
+# already carry that word inbound: Feishu sends ``chat_type`` ("group" /
+# "p2p"), Slack and Mattermost send ``channel_type`` ("im"; "D" / "O" / "P" /
+# "G"). This is the one place those vocabularies become the two words a
+# reader of the conversation list cares about. A value not listed here — a
+# channel that says nothing, or says something new — yields "", and the list
+# stays silent rather than guessing.
+_CONVERSATION_SCOPES: dict[str, dict[str, str]] = {
+    "feishu": {"group": "group", "p2p": "direct"},
+    "slack": {"im": "direct", "channel": "group", "group": "group", "mpim": "group"},
+    "mattermost": {"d": "direct", "o": "group", "p": "group", "g": "group"},
+}
+
+
+def conversation_scope(channel: str, chat_type: str) -> str:
+    """Whether a conversation is a ``group`` chat, a ``direct`` one, or unknown."""
+    return _CONVERSATION_SCOPES.get(channel.strip().lower(), {}).get(
+        str(chat_type or "").strip().lower(), ""
+    )
 
 
 class PartnerSessionStore:
@@ -88,7 +110,9 @@ class PartnerSessionStore:
             return True
         return self.is_archived_key(session_key)
 
-    def set_archived(self, session_key: str, archived: bool) -> None:
+    def set_archived(self, session_key: str, archived: bool) -> bool:
+        if not self._path(session_key).exists():
+            return False
         stem = self._stem(session_key)
         index = self._load_index()
         entry = index.get(stem, {})
@@ -101,6 +125,7 @@ class PartnerSessionStore:
         else:
             index.pop(stem, None)
         self._save_index(index)
+        return True
 
     def delete_session(self, session_key: str) -> bool:
         """Remove a session's file and its index entry. Returns whether it existed."""
@@ -141,6 +166,8 @@ class PartnerSessionStore:
         *,
         channel: str = "",
         sender_id: str = "",
+        chat_id: str = "",
+        scope: str = "",
         metadata: dict[str, Any] | None = None,
         attachments: list[dict[str, Any]] | None = None,
         events: list[dict[str, Any]] | None = None,
@@ -154,6 +181,14 @@ class PartnerSessionStore:
             record["channel"] = channel
         if sender_id:
             record["sender_id"] = sender_id
+        # Which conversation on the platform this turn came from. Written here
+        # because the channel knows it authoritatively at delivery time and
+        # nothing downstream can recover it: the conversation list showed every
+        # Feishu group exactly like a DM (#1229).
+        if chat_id:
+            record["chat_id"] = chat_id
+        if scope:
+            record["scope"] = scope
         if metadata:
             record["metadata"] = metadata
         if attachments:
@@ -256,7 +291,94 @@ class PartnerSessionStore:
 
     def messages(self, session_key: str, *, limit: int = 100) -> list[dict[str, Any]]:
         """Raw records (role/content/timestamp/...) for the history API."""
-        return self._read_records(session_key)[-limit:]
+        from deeptutor.services.session.provider_response_state import (
+            redact_private_message_metadata,
+        )
+
+        records = self._read_records(session_key)[-limit:]
+        redact_private_message_metadata(records)
+        return records
+
+    def messages_page(
+        self, session_key: str, *, before: int | None = None, limit: int = 60
+    ) -> dict[str, Any]:
+        """One bounded history page, oldest first, with a stable older cursor.
+
+        ``before`` is an exclusive record index. Appending new turns therefore
+        cannot shift the cursor while a browser is reading earlier pages.
+        """
+        from deeptutor.services.session.provider_response_state import (
+            redact_private_message_metadata,
+        )
+
+        capped_limit = max(1, min(limit, 200))
+        cursor = None if before is None else max(before, 0)
+        window: deque[dict[str, Any]] = deque(maxlen=capped_limit)
+        total = 0
+        path = self._path(session_key)
+        if path.exists():
+            try:
+                with path.open(encoding="utf-8") as handle:
+                    for line in handle:
+                        try:
+                            record = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if (
+                            not isinstance(record, dict)
+                            or not record.get("role")
+                            or not record.get("content")
+                        ):
+                            continue
+                        if cursor is None or total < cursor:
+                            window.append(record)
+                        total += 1
+            except OSError:
+                logger.exception("Failed to read partner session %s", session_key)
+        end = total if cursor is None else min(cursor, total)
+        start = max(0, end - capped_limit)
+        page = list(window)
+        redact_private_message_metadata(page)
+        return {
+            "messages": page,
+            "next_before": start if start > 0 else None,
+            "start": start,
+            "total": total,
+        }
+
+    def previous_model_turn(self, session_key: str) -> dict[str, Any] | None:
+        """Last private request header, used for tool order and cache diagnostics."""
+        from deeptutor.services.session.model_history import model_turn
+
+        return next(
+            (
+                record
+                for row in reversed(self._read_records(session_key))
+                if (record := model_turn(row)) is not None
+            ),
+            None,
+        )
+
+    def model_history(
+        self, session_key: str, route: dict[str, str] | None = None
+    ) -> list[dict[str, Any]]:
+        """Retain complete model turns within the Partner's existing budget."""
+        from deeptutor.services.session.model_history import history_groups, replay_group
+
+        kept: list[list[dict[str, Any]]] = []
+        chars = 0
+        count = 0
+        for group in reversed(history_groups(self._read_records(session_key))):
+            messages = replay_group(group, route)
+            size = len(json.dumps(messages, ensure_ascii=False))
+            if kept and (
+                chars + size > _HISTORY_MAX_CHARS or count + len(group) > _HISTORY_MAX_MESSAGES
+            ):
+                break
+            kept.insert(0, messages)
+            chars += size
+            count += len(group)
+        return [message for group in kept for message in group]
 
     def merged_messages(
         self, *, limit: int = 100, include_archived: bool = False
@@ -272,7 +394,13 @@ class PartnerSessionStore:
                 merged.append((str(record.get("timestamp", "")), sequence, record))
                 sequence += 1
         merged.sort(key=lambda item: (item[0], item[1]))
-        return [item[2] for item in merged[-limit:]]
+        from deeptutor.services.session.provider_response_state import (
+            redact_private_message_metadata,
+        )
+
+        records = [item[2] for item in merged[-limit:]]
+        redact_private_message_metadata(records)
+        return records
 
     def _session_summary(self, path: Path) -> dict[str, Any]:
         records = self._read_records(path.stem)
@@ -285,7 +413,24 @@ class PartnerSessionStore:
             "updated_at": datetime.fromtimestamp(path.stat().st_mtime).isoformat(),
             "last_message": str(last.get("content", ""))[:200],
             "archived": archived,
+            **self._origin(records),
         }
+
+    @staticmethod
+    def _origin(records: list[dict[str, Any]]) -> dict[str, str]:
+        """Where this conversation happens, from the first turn that recorded it.
+
+        Sessions that predate the origin being written carry none, so the keys
+        are omitted rather than emitted empty — the list then renders exactly
+        as it did before instead of labelling everything "unknown".
+        """
+        for record in records:
+            chat_id = str(record.get("chat_id") or "")
+            if not chat_id:
+                continue
+            scope = str(record.get("scope") or "")
+            return {"chat_id": chat_id, **({"scope": scope} if scope else {})}
+        return {}
 
     @staticmethod
     def _derive_title(records: list[dict[str, Any]]) -> str:

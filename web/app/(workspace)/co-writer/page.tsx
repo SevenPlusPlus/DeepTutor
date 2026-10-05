@@ -1,17 +1,19 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { useTranslation } from "react-i18next";
-import { FileText, Loader2, PenLine, Plus, Trash2 } from "lucide-react";
+import { FileText, Loader2, PenLine, Plus, Trash2, Upload } from "lucide-react";
 import {
   createCoWriterDocument,
   deleteCoWriterDocument,
+  importCoWriterDocx,
   listCoWriterDocuments,
   type CoWriterDocumentSummary,
 } from "@/lib/co-writer-api";
 import { notifyCoWriterChanged } from "@/lib/co-writer-events";
 import { CO_WRITER_SAMPLE_TEMPLATE } from "./sampleTemplate";
+import Tooltip from "@/shared/ui/Tooltip";
 
 function relativeTime(seconds: number): string {
   if (!seconds || Number.isNaN(seconds)) return "";
@@ -35,6 +37,8 @@ export default function CoWriterHomePage() {
   const [documents, setDocuments] = useState<CoWriterDocumentSummary[]>([]);
   const [loading, setLoading] = useState(true);
   const [creating, setCreating] = useState(false);
+  const [importing, setImporting] = useState(false);
+  const importInputRef = useRef<HTMLInputElement>(null);
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [error, setError] = useState("");
@@ -75,6 +79,23 @@ export default function CoWriterHomePage() {
     [creating, router],
   );
 
+  const handleImportDocx = useCallback(
+    async (file: File | undefined) => {
+      if (!file || creating || importing) return;
+      setImporting(true);
+      setError("");
+      try {
+        const document = await importCoWriterDocx(file);
+        notifyCoWriterChanged();
+        router.push(`/co-writer/${document.id}`);
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err));
+        setImporting(false);
+      }
+    },
+    [creating, importing, router],
+  );
+
   const handleDelete = useCallback(
     async (docId: string) => {
       if (deletingId) return;
@@ -111,7 +132,7 @@ export default function CoWriterHomePage() {
         <button
           type="button"
           onClick={() => handleCreate(false)}
-          disabled={creating}
+          disabled={creating || importing}
           className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--primary)] px-3.5 py-2 text-[12.5px] font-medium text-[var(--primary-foreground)] transition-opacity hover:opacity-90 disabled:opacity-60"
         >
           {creating ? (
@@ -124,11 +145,24 @@ export default function CoWriterHomePage() {
         <button
           type="button"
           onClick={() => handleCreate(true)}
-          disabled={creating}
+          disabled={creating || importing}
           className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--border)] px-3.5 py-2 text-[12.5px] font-medium text-[var(--foreground)] transition-colors hover:bg-[var(--muted)] disabled:opacity-60"
         >
           <FileText size={14} />
           {t("Start from template")}
+        </button>
+        <button
+          type="button"
+          onClick={() => importInputRef.current?.click()}
+          disabled={creating || importing}
+          className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--border)] px-3.5 py-2 text-[12.5px] font-medium text-[var(--foreground)] transition-colors hover:bg-[var(--muted)] disabled:opacity-60"
+        >
+          {importing ? (
+            <Loader2 size={14} className="animate-spin" />
+          ) : (
+            <Upload size={14} />
+          )}
+          {t("Import Word")}
         </button>
       </div>
     </div>
@@ -136,6 +170,17 @@ export default function CoWriterHomePage() {
 
   return (
     <div className="h-full overflow-y-auto bg-[var(--background)]">
+      <input
+        ref={importInputRef}
+        type="file"
+        accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        className="hidden"
+        onChange={(event) => {
+          const file = event.target.files?.[0];
+          event.target.value = "";
+          void handleImportDocx(file);
+        }}
+      />
       <div className="mx-auto max-w-5xl px-6 py-8">
         <header className="mb-7 flex items-end justify-between gap-4">
           <div>
@@ -149,8 +194,21 @@ export default function CoWriterHomePage() {
           <div className="flex shrink-0 items-center gap-2">
             <button
               type="button"
+              onClick={() => importInputRef.current?.click()}
+              disabled={creating || importing}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--border)] px-3.5 py-2 text-[12.5px] font-medium text-[var(--foreground)] transition-colors hover:bg-[var(--muted)] disabled:opacity-60"
+            >
+              {importing ? (
+                <Loader2 size={14} className="animate-spin" />
+              ) : (
+                <Upload size={14} />
+              )}
+              {t("Import Word")}
+            </button>
+            <button
+              type="button"
               onClick={() => handleCreate(true)}
-              disabled={creating}
+              disabled={creating || importing}
               className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--border)] px-3.5 py-2 text-[12.5px] font-medium text-[var(--foreground)] transition-colors hover:bg-[var(--muted)] disabled:opacity-60"
             >
               <FileText size={14} />
@@ -159,7 +217,7 @@ export default function CoWriterHomePage() {
             <button
               type="button"
               onClick={() => handleCreate(false)}
-              disabled={creating}
+              disabled={creating || importing}
               className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--primary)] px-3.5 py-2 text-[12.5px] font-medium text-[var(--primary-foreground)] transition-opacity hover:opacity-90 disabled:opacity-60"
             >
               {creating ? (
@@ -223,34 +281,34 @@ export default function CoWriterHomePage() {
                         </div>
                       </div>
                     </div>
-                    <button
-                      type="button"
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        if (isPendingDelete) {
-                          void handleDelete(doc.id);
-                        } else {
-                          setPendingDeleteId(doc.id);
-                        }
-                      }}
-                      disabled={isDeleting}
-                      title={
-                        isPendingDelete
-                          ? t("Click again to confirm")
-                          : t("Delete draft")
-                      }
-                      className={`shrink-0 rounded-md p-1 transition-colors disabled:opacity-50 ${
-                        isPendingDelete
-                          ? "bg-rose-500/15 text-rose-600 dark:text-rose-400"
-                          : "text-[var(--muted-foreground)]/60 opacity-0 hover:bg-rose-500/10 hover:text-rose-600 group-hover:opacity-100 dark:hover:text-rose-400"
-                      }`}
+                    <Tooltip
+                      label={isPendingDelete ? t("Click again to confirm") : t("Delete draft")}
                     >
-                      {isDeleting ? (
-                        <Loader2 size={13} className="animate-spin" />
-                      ) : (
-                        <Trash2 size={13} />
-                      )}
-                    </button>
+                      <button
+                        type="button"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          if (isPendingDelete) {
+                            void handleDelete(doc.id);
+                          } else {
+                            setPendingDeleteId(doc.id);
+                          }
+                        }}
+                        disabled={isDeleting}
+                        aria-label={isPendingDelete ? t("Click again to confirm") : t("Delete draft")}
+                        className={`shrink-0 rounded-md p-1 transition-colors disabled:opacity-50 ${
+                          isPendingDelete
+                            ? "bg-rose-500/15 text-rose-600 dark:text-rose-400"
+                            : "text-[var(--muted-foreground)]/60 hover:bg-rose-500/10 hover:text-rose-600 dark:hover:text-rose-400"
+                        }`}
+                      >
+                        {isDeleting ? (
+                          <Loader2 size={13} className="animate-spin" />
+                        ) : (
+                          <Trash2 size={13} />
+                        )}
+                      </button>
+                    </Tooltip>
                   </div>
                   <p className="mt-2.5 line-clamp-4 flex-1 text-[12px] leading-relaxed text-[var(--muted-foreground)]">
                     {doc.preview || t("Empty draft")}

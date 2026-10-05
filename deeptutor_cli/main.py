@@ -13,6 +13,7 @@ from .book import register as register_book
 from .chat import register as register_chat
 from .common import build_turn_request, console, maybe_run
 from .config_cmd import register as register_config
+from .doctor import register as register_doctor
 from .init_cmd import register as register_init
 from .kb import register as register_kb
 from .memory import register as register_memory
@@ -22,6 +23,7 @@ from .plugin import register as register_plugin
 from .provider_cmd import register as register_provider
 from .session_cmd import register as register_session
 from .skill import register as register_skill
+from .workspace_cmd import register as register_workspace
 
 set_mode(RunMode.CLI)
 configure_logging()
@@ -44,6 +46,7 @@ session_app = typer.Typer(help="Manage shared sessions.")
 notebook_app = typer.Typer(help="Manage notebooks and imported markdown records.")
 provider_app = typer.Typer(help="Manage provider OAuth login.")
 book_app = typer.Typer(help="Manage interactive Books (BookEngine).")
+workspace_app = typer.Typer(help="Manage the user content workspace.")
 
 app.add_typer(partner_app, name="partner")
 app.add_typer(chat_app, name="chat")
@@ -57,6 +60,7 @@ app.add_typer(session_app, name="session")
 app.add_typer(notebook_app, name="notebook")
 app.add_typer(provider_app, name="provider")
 app.add_typer(book_app, name="book")
+app.add_typer(workspace_app, name="workspace")
 
 register_partner(partner_app)
 register_chat(chat_app)
@@ -69,6 +73,8 @@ register_session(session_app)
 register_notebook(notebook_app)
 register_provider(provider_app)
 register_book(book_app)
+register_workspace(workspace_app)
+register_doctor(app)
 register_init(app)
 
 
@@ -83,6 +89,9 @@ def run_capability(
     ),
     message: str = typer.Argument(..., help="Message to send."),
     session: str | None = typer.Option(None, "--session", help="Existing session id."),
+    workspace: str | None = typer.Option(
+        None, "--workspace", help="Registered workspace id; omit for default."
+    ),
     tool: list[str] = typer.Option([], "--tool", "-t", help="Enabled tool(s)."),
     kb: list[str] = typer.Option([], "--kb", help="Knowledge base name."),
     notebook_ref: list[str] = typer.Option([], "--notebook-ref", help="Notebook references."),
@@ -111,17 +120,44 @@ def run_capability(
         notebook_refs=notebook_ref,
         history_refs=history_ref,
     )
-    maybe_run(run_turn_and_render(app=DeepTutorApp(), request=request, fmt=fmt))
+    client = DeepTutorApp(workspace_id=workspace) if workspace is not None else DeepTutorApp()
+    maybe_run(run_turn_and_render(app=client, request=request, fmt=fmt))
 
 
 @app.command()
 def start(
     home: Path | None = typer.Option(None, "--home", help="Runtime workspace root."),
+    dev: bool = typer.Option(
+        False,
+        "--dev",
+        help="Use the Next.js development server for frontend work.",
+    ),
+    detach: bool = typer.Option(
+        False,
+        "--detach",
+        help="Run outside the current console; stop later with `deeptutor stop`.",
+    ),
+    open_browser: bool = typer.Option(
+        True,
+        "--open-browser/--no-browser",
+        help="Open the frontend automatically after startup.",
+    ),
 ) -> None:
-    """Launch backend + frontend together. Press Ctrl+C to stop."""
+    """Launch backend + frontend together. Source installs default to production."""
     from deeptutor.runtime.launcher import start as start_web
 
-    start_web(home=home)
+    start_web(home=home, dev=dev, detach=detach, open_browser=open_browser)
+
+
+@app.command()
+def stop(
+    home: Path | None = typer.Option(None, "--home", help="Runtime workspace root."),
+) -> None:
+    """Stop a DeepTutor launcher started with ``--detach``."""
+    from deeptutor.runtime.launcher import stop as stop_web
+
+    if not stop_web(home=home):
+        raise typer.Exit(code=1)
 
 
 @app.command()
@@ -155,7 +191,16 @@ def serve(
         )
         raise typer.Exit(code=1)
 
-    from deeptutor.services.config import get_ws_max_size
+    from deeptutor.services.config import (
+        HTTP_KEEP_ALIVE_TIMEOUT,
+        get_ws_max_size,
+        load_system_settings,
+    )
+
+    backend_workers = max(1, int(load_system_settings().get("backend_workers") or 1))
+    if reload and backend_workers > 1:
+        console.print("[bold red]Error:[/] --reload cannot be used when backend_workers > 1.")
+        raise typer.Exit(code=2)
 
     # ws_max_size tracks the configured chat-attachment total so base64
     # uploads fit in one WS frame (uvicorn defaults to 16MB).
@@ -164,8 +209,13 @@ def serve(
         host=host,
         port=port,
         reload=reload,
+        workers=backend_workers,
         reload_excludes=["web/*", "data/*"] if reload else None,
+        # Keep request.client tied to the actual peer; XFF is client-controlled
+        # unless the deployment explicitly provides a trusted proxy.
+        proxy_headers=False,
         ws_max_size=get_ws_max_size(),
+        timeout_keep_alive=HTTP_KEEP_ALIVE_TIMEOUT,
     )
 
 

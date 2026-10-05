@@ -7,6 +7,8 @@ single-question shorthand which auto-wraps into a one-element list.
 
 from __future__ import annotations
 
+import pytest
+
 from deeptutor.tools.ask_user import (
     MAX_HEADER_CHARS,
     MAX_OPTION_CHARS,
@@ -15,6 +17,7 @@ from deeptutor.tools.ask_user import (
     MAX_QUESTION_CHARS,
     MAX_QUESTIONS,
     build_ask_user_payload,
+    build_ask_user_preview,
 )
 
 
@@ -282,6 +285,44 @@ def test_v3_drops_model_supplied_other_option() -> None:
     assert _labels(payload.questions[0]) == ("A", "B")
 
 
+@pytest.mark.parametrize(
+    ("options", "expected"),
+    [
+        (["First answer", " first   ANSWER "], ("First answer",)),
+        (["Straße", "STRASSE"], ("Straße",)),
+        (
+            [
+                {"label": "First answer", "description": "keep"},
+                {"label": "  first\tanswer  ", "description": "drop"},
+            ],
+            ("First answer",),
+        ),
+    ],
+)
+def test_ask_user_drops_duplicate_labels_like_mastery_quiz(options, expected) -> None:
+    """A visible duplicate makes an interactive question unanswerable (#1409)."""
+    payload, err = build_ask_user_payload(
+        questions=[{"prompt": "Which answer?", "options": options}]
+    )
+    assert err is None
+    assert payload is not None
+    assert _labels(payload.questions[0]) == expected
+
+
+def test_ask_user_deduplicates_even_when_free_text_is_disabled() -> None:
+    payload, _ = build_ask_user_payload(
+        questions=[
+            {
+                "prompt": "Which answer?",
+                "options": ["Answer", " answer "],
+                "allow_free_text": False,
+            }
+        ]
+    )
+    assert payload is not None
+    assert _labels(payload.questions[0]) == ("Answer",)
+
+
 def test_v3_keeps_other_option_when_free_text_disabled() -> None:
     """Without the automatic free-text row there is no duplicate to drop."""
     payload, _ = build_ask_user_payload(
@@ -289,6 +330,69 @@ def test_v3_keeps_other_option_when_free_text_disabled() -> None:
     )
     assert payload is not None
     assert _labels(payload.questions[0]) == ("A", "Other")
+
+
+def test_v3_drops_an_option_whose_body_duplicates_another() -> None:
+    """Two options with the same visible text leave the learner nothing to
+    pick between (#1409: a duplicated choice makes the question unanswerable).
+
+    The mastery quiz contract already refuses duplicate bodies at
+    registration; the clarification-card channel gets the same rule here.
+    """
+    payload, _ = build_ask_user_payload(
+        questions=[
+            {
+                "prompt": "x",
+                "options": [
+                    {"label": "B", "description": "8"},
+                    {"label": "C", "description": "8"},
+                    {"label": "D", "description": "-2"},
+                ],
+            }
+        ]
+    )
+    assert payload is not None
+    assert _labels(payload.questions[0]) == ("B", "D")
+
+
+def test_v3_duplicate_body_comparison_ignores_case_and_spacing() -> None:
+    """Near-duplicates that differ only by case or spacing read as the same
+    choice to a learner, so the same rule applies to them."""
+    payload, _ = build_ask_user_payload(
+        questions=[
+            {
+                "prompt": "x",
+                "options": [
+                    {"label": "A", "description": "Rerank  the query."},
+                    {"label": "B", "description": "  rerank the query.  "},
+                    {"label": "C", "description": "Rewrite the query."},
+                ],
+            }
+        ]
+    )
+    assert payload is not None
+    assert _labels(payload.questions[0]) == ("A", "C")
+
+
+def test_v3_label_only_options_are_never_body_deduped() -> None:
+    """An option with no body is its label; distinct labels are distinct
+    choices even though every description is empty."""
+    payload, _ = build_ask_user_payload(questions=[{"prompt": "x", "options": ["A", "B", "C"]}])
+    assert payload is not None
+    assert _labels(payload.questions[0]) == ("A", "B", "C")
+
+
+def test_v3_duplicate_body_check_is_per_question() -> None:
+    """Two different questions may offer the same answer text."""
+    payload, _ = build_ask_user_payload(
+        questions=[
+            {"prompt": "x", "options": [{"label": "A", "description": "same"}]},
+            {"prompt": "y", "options": [{"label": "A", "description": "same"}]},
+        ]
+    )
+    assert payload is not None
+    assert _labels(payload.questions[0]) == ("A",)
+    assert _labels(payload.questions[1]) == ("A",)
 
 
 # ------------------------- frontend contract shape ------------------------
@@ -344,3 +448,116 @@ def test_to_dict_legacy_path_also_emits_v3() -> None:
         {"label": "a", "description": None},
         {"label": "b", "description": None},
     ]
+
+
+def test_prompt_decodes_dense_unicode_escapes() -> None:
+    """Regression for #973: model tool args can carry literal \\uXXXX stems."""
+    escaped = "\\u300c\\u6570\\u5236\\u8f6c\\u6362\\u300d"
+    payload, err = build_ask_user_payload(
+        questions=[{"prompt": escaped, "options": ["A", "B"]}],
+        intro=escaped,
+    )
+    assert err is None
+    assert payload is not None
+    assert payload.intro == "「数制转换」"
+    assert payload.questions[0].prompt == "「数制转换」"
+
+
+# --------------------------- streaming previews ---------------------------
+
+_STREAMED = (
+    '{"intro": "Which path?", "questions": [{"id": "which", "prompt": '
+    '"Where to?", "options": [{"label": "Advanced", "description": "15 goals"}, '
+    '{"label": "Core", "description": "4 goals"}]}]}'
+)
+
+
+def test_preview_ignores_text_with_nothing_to_render() -> None:
+    assert build_ask_user_preview("") is None
+    assert build_ask_user_preview("{") is None
+    assert build_ask_user_preview("not json at all") is None
+
+
+def test_preview_shows_the_intro_before_any_question_arrives() -> None:
+    preview = build_ask_user_preview('{"intro": "Which pa')
+    assert preview == {"intro": "Which pa", "questions": []}
+
+
+def test_preview_grows_monotonically_with_the_argument_text() -> None:
+    """Every prefix renders, and never loses ground it already had."""
+    shapes: list[tuple[int, int]] = []
+    for cut in range(1, len(_STREAMED) + 1):
+        preview = build_ask_user_preview(_STREAMED[:cut])
+        if preview is None:
+            continue
+        questions = preview["questions"]
+        shapes.append((len(questions), sum(len(q["options"]) for q in questions)))
+
+    assert shapes, "no prefix produced a preview"
+    assert shapes[-1] == (1, 2)
+    # Individual frames may dip (json_repair can momentarily read an
+    # unfinished key as unrenderable); what matters is that the finished
+    # text is complete and that no frame ever exceeds it.
+    assert max(shapes) == (1, 2)
+
+
+def test_preview_drops_the_option_repair_invents_from_a_half_written_key() -> None:
+    """``{"labe`` is closed as ``["labe"]``, which is not an option."""
+    truncated = _STREAMED[: _STREAMED.index('{"label": "Core"') + len('{"labe')]
+    preview = build_ask_user_preview(truncated)
+
+    assert preview is not None
+    labels = [option["label"] for option in preview["questions"][0]["options"]]
+    assert labels == ["Advanced"]
+
+
+def test_preview_matches_the_dispatched_payload_once_complete() -> None:
+    payload, err = build_ask_user_payload(
+        intro="Which path?",
+        questions=[
+            {
+                "id": "which",
+                "prompt": "Where to?",
+                "options": [
+                    {"label": "Advanced", "description": "15 goals"},
+                    {"label": "Core", "description": "4 goals"},
+                ],
+            }
+        ],
+    )
+    assert err is None and payload is not None
+    assert build_ask_user_preview(_STREAMED) == payload.to_dict()
+
+
+def test_a_dispatched_call_drops_the_artefact_of_a_cut_off_option() -> None:
+    """Truncated arguments reach the tool, not just the preview.
+
+    A provider that runs out of token budget mid-key leaves ``json_repair``
+    closing the fragment as a list (``["label"]``). The preview already
+    dropped that; the dispatched payload used to stringify it into a real,
+    pickable ``['label']`` choice — an answer the model never wrote, which
+    then became the learner's recorded reply.
+    """
+    payload, err = build_ask_user_payload(
+        questions=[
+            {
+                "question": "Which reducer?",
+                "options": [
+                    {"label": "operator.add", "description": "Appends."},
+                    ["label"],
+                ],
+            }
+        ],
+    )
+
+    assert err is None and payload is not None
+    assert _labels(payload.questions[0]) == ("operator.add",)
+
+
+def test_a_question_whose_every_option_was_cut_off_still_reads_as_free_text() -> None:
+    payload, err = build_ask_user_payload(
+        questions=[{"question": "Which reducer?", "options": [["labe"]]}],
+    )
+
+    assert err is None and payload is not None
+    assert _labels(payload.questions[0]) == ()

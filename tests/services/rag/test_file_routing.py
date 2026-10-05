@@ -22,12 +22,26 @@ class TestExtensionClassification:
             ("notes.md", DocumentType.TEXT),
             ("readme.MARKDOWN", DocumentType.TEXT),
             ("data.json", DocumentType.TEXT),
+            ("references.bib", DocumentType.TEXT),
+            ("REFERENCES.BIB", DocumentType.TEXT),
             ("script.py", DocumentType.TEXT),
             ("config.yaml", DocumentType.TEXT),
             ("paper.docx", DocumentType.DOCX),
             ("sheet.xlsx", DocumentType.SPREADSHEET),
             ("deck.pptx", DocumentType.PRESENTATION),
+            ("book.epub", DocumentType.EPUB),
+            ("BOOK.EPUB", DocumentType.EPUB),
             ("photo.png", DocumentType.IMAGE),
+            ("letter.eml", DocumentType.DOCUMENT),
+            ("slides.odp", DocumentType.DOCUMENT),
+            ("recording.mp3", DocumentType.DOCUMENT),
+            ("bundle.tar.gz", DocumentType.DOCUMENT),
+            ("document.dclg.xml", DocumentType.DOCUMENT),
+            ("notebook.ipynb", DocumentType.DOCUMENT),
+            ("comic.cbz", DocumentType.DOCUMENT),
+            ("presentation.key", DocumentType.DOCUMENT),
+            ("diagram.vsdx", DocumentType.DOCUMENT),
+            ("database.sqlite3", DocumentType.DOCUMENT),
         ],
     )
     def test_known_extensions(self, filename: str, expected: DocumentType) -> None:
@@ -45,6 +59,18 @@ class TestUnknownExtensionFallback:
         path.write_bytes(b"\x00\x01\x02\xff")
         assert FileTypeRouter.get_document_type(str(path)) == DocumentType.UNKNOWN
 
+    def test_unbounded_active_parser_receives_unknown_binary(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = tmp_path / "blob.vendor-format"
+        path.write_bytes(b"\x00\x01\x02\xff")
+        monkeypatch.setattr(
+            FileTypeRouter, "active_parser_accepts_any_format", classmethod(lambda cls: True)
+        )
+
+        assert FileTypeRouter.get_document_type(str(path)) == DocumentType.DOCUMENT
+        assert FileTypeRouter.has_supported_extension(path) is True
+
 
 class TestClassifyFiles:
     def test_routes_pdf_to_parser_text_to_text(self, tmp_path: Path) -> None:
@@ -56,15 +82,17 @@ class TestClassifyFiles:
         xlsx.write_bytes(b"PK\x03\x04")
         pptx = tmp_path / "a.pptx"
         pptx.write_bytes(b"PK\x03\x04")
+        epub = tmp_path / "a.epub"
+        epub.write_bytes(b"PK\x03\x04")
         txt = tmp_path / "a.txt"
         txt.write_text("hi")
         png = tmp_path / "a.png"
         png.write_bytes(b"\x89PNG\r\n")
 
         cls = FileTypeRouter.classify_files(
-            [str(pdf), str(docx), str(xlsx), str(pptx), str(txt), str(png)]
+            [str(pdf), str(docx), str(xlsx), str(pptx), str(epub), str(txt), str(png)]
         )
-        assert cls.parser_files == [str(pdf), str(docx), str(xlsx), str(pptx)]
+        assert cls.parser_files == [str(pdf), str(docx), str(xlsx), str(pptx), str(epub)]
         assert cls.text_files == [str(txt)]
         assert cls.image_files == [str(png)]
         assert cls.unsupported == []
@@ -86,7 +114,18 @@ class TestSupportedExtensionsAndGlobs:
         assert ".pptx" in exts
         assert ".md" in exts
         assert ".txt" in exts
+        assert ".epub" in exts
         assert ".png" in exts
+        assert ".pages" in exts
+        assert ".mp4" in exts
+        assert ".dclg.xml" in exts
+        assert ".tar.gz" in exts
+        # Formats contributed by MarkItDown, PyMuPDF4LLM, LiteParse and Tika.
+        assert ".ipynb" in exts
+        assert ".cbz" in exts
+        assert ".key" in exts
+        assert ".vsdx" in exts
+        assert ".sqlite3" in exts
 
     def test_glob_patterns_match_supported_extensions(self) -> None:
         exts = FileTypeRouter.get_supported_extensions()
@@ -119,6 +158,17 @@ class TestSupportedExtensionsAndGlobs:
             path.name for path in FileTypeRouter.collect_supported_files(tmp_path, recursive=True)
         ] == ["DECK.PPTX", "image.PNG", "README.MD", "notes.md", "REPORT.PDF"]
 
+    def test_collect_supported_files_delegates_unknown_suffixes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        custom = tmp_path / "document.vendor-format"
+        custom.write_bytes(b"\x00vendor")
+        monkeypatch.setattr(
+            FileTypeRouter, "active_parser_accepts_any_format", classmethod(lambda cls: True)
+        )
+
+        assert FileTypeRouter.collect_supported_files(tmp_path) == [custom]
+
 
 class TestQuickHelpers:
     def test_needs_parser_for_pdf(self) -> None:
@@ -129,8 +179,21 @@ class TestQuickHelpers:
         assert FileTypeRouter.needs_parser("sheet.xlsx") is True
         assert FileTypeRouter.needs_parser("deck.pptx") is True
 
+    def test_needs_parser_for_epub(self) -> None:
+        assert FileTypeRouter.needs_parser("book.epub") is True
+        assert FileTypeRouter.needs_parser("BOOK.EPUB") is True
+
     def test_needs_parser_false_for_text(self) -> None:
         assert FileTypeRouter.needs_parser("notes.md") is False
+
+    def test_needs_parser_for_current_optional_engine_formats(self) -> None:
+        assert FileTypeRouter.needs_parser("mail.eml") is True
+        assert FileTypeRouter.needs_parser("movie.mp4") is True
+        assert FileTypeRouter.needs_parser("pages.pages") is True
+        assert FileTypeRouter.needs_parser("archive.tar.gz") is True
+        assert FileTypeRouter.needs_parser("notebook.ipynb") is True
+        assert FileTypeRouter.needs_parser("comic.cbz") is True
+        assert FileTypeRouter.needs_parser("diagram.vsdx") is True
 
     def test_is_text_readable_for_text(self) -> None:
         assert FileTypeRouter.is_text_readable("readme.md") is True
@@ -151,3 +214,12 @@ class TestReadTextFile:
         path.write_bytes("中文测试".encode("gbk"))
         content = asyncio.run(FileTypeRouter.read_text_file(str(path)))
         assert "中文" in content
+
+
+def test_bibtex_uses_readable_reference_text_in_direct_rag_route(tmp_path: Path) -> None:
+    path = tmp_path / "references.bib"
+    path.write_text("@article{example, title={A Test Paper}, author={Doe, Jane}, year={2026}}")
+    content = asyncio.run(FileTypeRouter.read_text_file(str(path)))
+    assert "A Test Paper" in content
+    assert "Jane Doe" in content
+    assert "@article" not in content

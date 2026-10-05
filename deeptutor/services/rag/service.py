@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import importlib
-import inspect
 import logging
 import os
 from pathlib import Path
@@ -14,6 +12,7 @@ from typing import Any, Dict, List, Optional
 
 from deeptutor.runtime.home import get_runtime_data_root
 
+from .embedding_binding import with_kb_embedding
 from .factory import DEFAULT_PROVIDER, get_pipeline, list_pipelines, normalize_provider_name
 from .provider_binding import resolve_bound_provider
 
@@ -65,12 +64,14 @@ class RAGService:
             self._pipelines[provider] = get_pipeline(name=provider, kb_base_dir=self.kb_base_dir)
         return self._pipelines[provider]
 
+    @with_kb_embedding
     async def initialize(self, kb_name: str, file_paths: List[str], **kwargs) -> bool:
         provider = self._resolve_provider(kb_name)
         self.logger.info(f"Initializing KB '{kb_name}' (provider={provider})")
         pipeline = self._get_pipeline(provider)
         return await pipeline.initialize(kb_name=kb_name, file_paths=file_paths, **kwargs)
 
+    @with_kb_embedding
     async def add_documents(self, kb_name: str, file_paths: List[str], **kwargs) -> bool:
         provider = self._resolve_provider(kb_name)
         self.logger.info(
@@ -81,6 +82,7 @@ class RAGService:
             return await pipeline.initialize(kb_name=kb_name, file_paths=file_paths, **kwargs)
         return await pipeline.add_documents(kb_name=kb_name, file_paths=file_paths, **kwargs)
 
+    @with_kb_embedding
     async def search(
         self,
         query: str,
@@ -89,6 +91,21 @@ class RAGService:
         **kwargs,
     ) -> Dict[str, Any]:
         provider = self._resolve_provider(kb_name)
+        from .factory import PAGEINDEX_OSS_PROVIDER, PAGEINDEX_PROVIDER
+
+        if provider in {PAGEINDEX_PROVIDER, PAGEINDEX_OSS_PROVIDER}:
+            message = (
+                "PageIndex uses Reasoning as Retrieval. Read this knowledge base with "
+                "its PageIndex tools inside an agent loop instead of RAGService.search()."
+            )
+            return {
+                "query": query,
+                "answer": message,
+                "content": "",
+                "sources": [],
+                "provider": provider,
+                "error_type": "reasoning_as_retrieval_required",
+            }
         with self._capture_raw_logs(event_sink):
             await self._emit_tool_event(
                 event_sink,
@@ -184,12 +201,7 @@ class RAGService:
             return contextlib.nullcontext()
 
         from deeptutor.logging import ProcessLogEvent, capture_process_logs
-        from deeptutor.logging.formatters import ContextFilter
-
-        try:
-            target_loop = asyncio.get_running_loop()
-        except RuntimeError:
-            target_loop = None
+        from deeptutor.logging.process_stream import ProcessLogHandler
 
         def should_skip_noisy_retrieve_log(event: ProcessLogEvent) -> bool:
             if event.level != "INFO":
@@ -227,26 +239,6 @@ class RAGService:
                 },
             )
 
-        class _NamedRawLogHandler(logging.Handler):
-            def __init__(self) -> None:
-                super().__init__(logging.INFO)
-                self.addFilter(ContextFilter())
-
-            def emit(self, record: logging.LogRecord) -> None:
-                try:
-                    result = emit(ProcessLogEvent.from_record(record))
-                    if not inspect.isawaitable(result):
-                        return
-                    try:
-                        loop = asyncio.get_running_loop()
-                    except RuntimeError:
-                        if target_loop and target_loop.is_running():
-                            asyncio.run_coroutine_threadsafe(result, target_loop)
-                        return
-                    asyncio.ensure_future(result, loop=loop)
-                except Exception:
-                    self.handleError(record)
-
         @contextlib.contextmanager
         def capture_non_propagating_logs():
             handlers: list[tuple[logging.Logger, logging.Handler]] = []
@@ -257,7 +249,7 @@ class RAGService:
                 source_logger = logging.getLogger(logger_name)
                 if source_logger.propagate:
                     continue
-                handler = _NamedRawLogHandler()
+                handler = ProcessLogHandler(emit, min_level=logging.INFO)
                 source_logger.addHandler(handler)
                 handlers.append((source_logger, handler))
             try:

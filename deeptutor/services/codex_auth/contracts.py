@@ -3,12 +3,26 @@
 from __future__ import annotations
 
 import base64
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 import json
+import re
 from typing import Any, Literal
 
+from .constants import CODEX_STABLE_VERSION_PATTERN
+
 CatalogSource = Literal["live", "fresh-cache", "revalidated-cache", "stale-cache"]
+
+
+def normalize_codex_reasoning_levels(
+    model_slug: str,
+    levels: Iterable[str],
+) -> tuple[str, ...]:
+    """Apply the provider compatibility contract to live and stored catalogs."""
+    normalized = tuple(dict.fromkeys(level for level in levels if level))
+    if model_slug == "gpt-5.6-luna" and "none" not in normalized:
+        return ("none", *normalized)
+    return normalized
 
 
 class CodexAuthError(RuntimeError):
@@ -125,6 +139,8 @@ class CodexModel:
     supports_reasoning_summary: bool
     supports_parallel_tool_calls: bool
     use_responses_lite: bool
+    context_window: int | None = None
+    max_context_window: int | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -137,6 +153,8 @@ class CodexModel:
             "supports_reasoning_summary": self.supports_reasoning_summary,
             "supports_parallel_tool_calls": self.supports_parallel_tool_calls,
             "use_responses_lite": self.use_responses_lite,
+            "context_window": self.context_window,
+            "max_context_window": self.max_context_window,
         }
 
     @classmethod
@@ -145,8 +163,9 @@ class CodexModel:
             reasoning_levels = payload["supported_reasoning_levels"]
             if not isinstance(reasoning_levels, list):
                 raise TypeError
+            slug = str(payload["slug"])
             return cls(
-                slug=str(payload["slug"]),
+                slug=slug,
                 display_name=str(payload["display_name"]),
                 priority=int(payload["priority"]),
                 visibility=str(payload["visibility"]),
@@ -155,10 +174,17 @@ class CodexModel:
                     if payload.get("default_reasoning_level") is not None
                     else None
                 ),
-                supported_reasoning_levels=tuple(str(item) for item in reasoning_levels),
+                supported_reasoning_levels=normalize_codex_reasoning_levels(
+                    slug,
+                    (str(item) for item in reasoning_levels),
+                ),
                 supports_reasoning_summary=bool(payload["supports_reasoning_summary"]),
                 supports_parallel_tool_calls=bool(payload["supports_parallel_tool_calls"]),
                 use_responses_lite=bool(payload["use_responses_lite"]),
+                context_window=_require_optional_positive_int(payload.get("context_window")),
+                max_context_window=_require_optional_positive_int(
+                    payload.get("max_context_window")
+                ),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise CodexAuthError(
@@ -168,14 +194,34 @@ class CodexModel:
             ) from exc
 
 
+def _require_optional_positive_int(value: object) -> int | None:
+    """Validate a cached context window, rejecting anything malformed.
+
+    Deliberately stricter than ``catalog._optional_positive_int``, which drops
+    junk from a *live* API response so one odd field can't fail the whole sync.
+    Here the payload is our own cache: a value we never could have written means
+    the file is corrupt, so the ``ValueError`` is caught by ``from_dict`` above
+    and reported as ``catalog_corrupt`` rather than silently read as "unknown".
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError
+    return value
+
+
 @dataclass(frozen=True)
 class CatalogSnapshot:
+    """A catalog plus account-bound version history, retained after auth invalidation."""
+
     models: tuple[CodexModel, ...]
     source: CatalogSource
     fetched_at: int
     etag: str | None
     generation: int
     account_hash: str
+    client_version: str | None = None
+    models_valid: bool = True
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -185,6 +231,8 @@ class CatalogSnapshot:
             "etag": self.etag,
             "generation": self.generation,
             "account_hash": self.account_hash,
+            "client_version": self.client_version,
+            "models_valid": self.models_valid,
         }
 
     @classmethod
@@ -192,6 +240,15 @@ class CatalogSnapshot:
         try:
             models = payload["models"]
             source = payload["source"]
+            client_version = payload.get("client_version")
+            models_valid = payload.get("models_valid", True)
+            if not isinstance(models_valid, bool):
+                raise ValueError
+            if client_version is not None and (
+                not isinstance(client_version, str)
+                or re.fullmatch(CODEX_STABLE_VERSION_PATTERN, client_version) is None
+            ):
+                raise ValueError
             if not isinstance(models, list):
                 raise TypeError
             if source not in {"live", "fresh-cache", "revalidated-cache", "stale-cache"}:
@@ -203,6 +260,8 @@ class CatalogSnapshot:
                 etag=str(payload["etag"]) if payload.get("etag") is not None else None,
                 generation=int(payload["generation"]),
                 account_hash=str(payload["account_hash"]),
+                client_version=client_version,
+                models_valid=models_valid,
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise CodexAuthError(

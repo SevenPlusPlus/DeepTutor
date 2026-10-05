@@ -1,6 +1,6 @@
 """Tests for the CLI turn-stream renderer against the chat-loop protocol.
 
-The chat agent loop (deeptutor/agents/chat/agent_loop.py) streams every
+The shared agent loop (deeptutor/agents/loop/agent_loop.py) streams every
 round's text as ``content`` chunks with ``trace_kind=llm_chunk`` and labels
 the round afterwards via a ``call_status`` marker carrying ``call_role``
 (``narration`` | ``finish``). These tests feed that exact event shape into
@@ -144,6 +144,32 @@ def test_narration_renders_before_tools_and_finish_is_answer(monkeypatch) -> Non
     assert narration_at < tool_at < answer_at
     # The chat wrapper stage emits no banner.
     assert "▶ responding" not in result.output
+
+
+def test_dsml_clean_content_uses_answer_rendering(monkeypatch) -> None:
+    events = [
+        {"type": "stage_start", "stage": "responding", "source": "chat"},
+        _running("r1"),
+        _chunk("r1", "Tutor says **well done**."),
+        {
+            **_marker("r1", "narration"),
+            "metadata": {
+                **_marker("r1", "narration")["metadata"],
+                "answer_visible": True,
+            },
+        },
+        {"type": "stage_end", "stage": "responding", "source": "chat"},
+        {"type": "done"},
+    ]
+    _install_fake_runtime(monkeypatch, events)
+
+    result = runner.invoke(app, ["run", "chat", "hello"])
+
+    assert result.exit_code == 0, result.output
+    assert "Tutor says well done." in result.output
+    # Plain narration uses Text and would retain the Markdown markers; the
+    # DSML-visible marker settles this round through the answer renderer.
+    assert "**well done**" not in result.output
 
 
 def test_done_summary_line_includes_rounds_tools_tokens_cost(monkeypatch) -> None:

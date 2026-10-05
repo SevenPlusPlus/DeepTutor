@@ -1,6 +1,7 @@
 /** @type {import('next').NextConfig} */
 
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 
 function readJsonFile(filePath) {
@@ -27,6 +28,20 @@ function normalizeBoolean(value) {
   return ["1", "true", "yes", "on"].includes(String(value).trim().toLowerCase())
     ? "true"
     : "false";
+}
+
+/** This machine's non-loopback IPv4 addresses — the hosts `next dev` prints
+ *  as "Network:", i.e. the ones a phone on the same WiFi actually types. */
+function localNetworkHosts() {
+  const hosts = [];
+  for (const addresses of Object.values(os.networkInterfaces())) {
+    for (const address of addresses ?? []) {
+      if (address.family === "IPv4" && !address.internal) {
+        hosts.push(address.address);
+      }
+    }
+  }
+  return hosts;
 }
 
 const SETTINGS_DIR = path.resolve(__dirname, "..", "data", "user", "settings");
@@ -76,6 +91,18 @@ const APP_VERSION = (() => {
 })();
 
 const nextConfig = {
+  // Keep the production build used by `deeptutor start` separate from the
+  // `.next` development cache used by the explicit `deeptutor start --dev`.
+  // Without separate directories either command can invalidate the other
+  // process while it is running.
+  distDir: process.env.DEEPTUTOR_NEXT_DIST_DIR || ".next",
+
+  // Build/typecheck wrappers can point Next at a process-local config so a
+  // production build never rewrites the tsconfig watched by a live dev server.
+  typescript: {
+    tsconfigPath: process.env.DEEPTUTOR_NEXT_TSCONFIG || "tsconfig.json",
+  },
+
   // Expose the build-time version to the browser so the sidebar badge
   // can compare it against GitHub's latest release.
   env: {
@@ -88,14 +115,21 @@ const nextConfig = {
   // This eliminates the need to copy the full node_modules into Docker production images
   output: "standalone",
 
-  // web/proxy.ts (the Next.js middleware) forwards /api/* and /ws/* to the
-  // backend by buffering and re-issuing the request. Next caps the buffered
-  // request body at 10MB by default, but the backend accepts uploads up to
-  // 200MB (DocumentValidator.MAX_FILE_SIZE). Raise the proxy cap to match (plus
-  // multipart overhead headroom) so knowledge-base document uploads aren't
-  // silently truncated when they pass through the proxy.
+  // Keep the standalone bundle rooted at this frontend directory. Without an
+  // explicit root, Next.js can mirror the absolute checkout path inside
+  // `.next-deeptutor/standalone`, while the DeepTutor launcher expects
+  // `.next-deeptutor/standalone/server.js` directly.
+  outputFileTracingRoot: __dirname,
+
+  // web/proxy.ts clones request bodies before rewriting them. Keep enough room
+  // for individual large-body endpoints that still use Proxy. Knowledge-base
+  // create/upload batches use dedicated streaming route handlers instead, so
+  // their total size is not coupled to this in-memory clone limit.
   experimental: {
     proxyClientMaxBodySize: 210 * 1024 * 1024,
+    // Agentic reads and full-draft edits routinely exceed Next's 30-second
+    // rewrite default; the browser remains responsible for cancelling them.
+    proxyTimeout: 30 * 60 * 1000,
   },
 
   // Move dev indicator to bottom-right corner
@@ -106,12 +140,38 @@ const nextConfig = {
   // Transpile mermaid and related packages for proper ESM handling
   transpilePackages: ["mermaid"],
 
+  // Compatibility lives here; every rendered link uses learning-routes.ts.
+  async redirects() {
+    return [
+      // The workspace root has one destination; sessions live under /chat.
+      // Kept out of a page component on purpose: a page that only calls
+      // redirect() throws mid-render, and React 19.2's dev performance track
+      // then measures that aborted render with a negative end time — the
+      // "cannot have a negative time stamp" overlay (vercel/next.js#86060).
+      { source: "/", destination: "/chat", permanent: false },
+      { source: "/mastery/:pathId/study", destination: "/learning/mastery/:pathId/sessions", statusCode: 301 },
+      { source: "/mastery/:pathId/study/:sessionId", destination: "/learning/mastery/:pathId/sessions/:sessionId", statusCode: 301 },
+      ...["books", "mastery", "reading", "watching"].map((surface) => ({
+        source: `/${surface}/:path*`,
+        destination: `/learning/${surface}/:path*`,
+        statusCode: 301,
+      })),
+    ];
+  },
+
   // Next.js 16 blocks cross-origin access to /_next/* dev resources (HMR
   // WebSocket, fonts, dev-only scripts) unless the request host is on this
   // allow-list. Without it, browsing http://127.0.0.1:<port>/ against a dev
   // server bound to localhost silently breaks client hydration — the SSR HTML
   // renders, but no React event handlers or effects ever attach.
-  allowedDevOrigins: ["127.0.0.1"],
+  // The same applies to a phone or tablet on the LAN: `next dev` advertises a
+  // "Network: http://<lan-ip>:<port>" address, and that host has to be on the
+  // list too or the device gets the identical hydrated-nothing shell — a
+  // top bar with an empty page under it. Detected rather than hard-coded so it
+  // follows whatever network this machine is on. Dev-only: `allowedDevOrigins`
+  // has no effect on `next build`/`next start`, and anyone who can reach the
+  // dev server on these addresses is already inside the LAN.
+  allowedDevOrigins: ["127.0.0.1", ...localNetworkHosts()],
 
   // Turbopack configuration (used when running `npm run dev:turbo`)
   turbopack: {
@@ -124,6 +184,11 @@ const nextConfig = {
   // Webpack configuration (used for production builds - next build)
   webpack: (config) => {
     const path = require("path");
+    config.module.rules.push({
+      test: /locales[/\\]en[/\\]app\.json$/,
+      type: "javascript/auto",
+      use: path.resolve(__dirname, "scripts/compact-locale-loader.cjs"),
+    });
     config.resolve.alias = {
       ...config.resolve.alias,
       cytoscape: path.resolve(

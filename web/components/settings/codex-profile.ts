@@ -2,7 +2,7 @@ import type {
   CatalogProfile,
   ProviderOption,
   ServiceName,
-} from "./SettingsContext";
+} from "@/features/settings/store/SettingsStore";
 
 /** The tag the backend stamps on the profile its Codex OAuth service owns. */
 export const CODEX_MANAGED_BY = "openai_codex_oauth";
@@ -12,6 +12,20 @@ export function isManagedCodexProfile(
   profile: Pick<CatalogProfile, "managed_by"> | null | undefined,
 ): boolean {
   return profile?.managed_by === CODEX_MANAGED_BY;
+}
+
+/** A managed profile may accept reasoning overrides only after an account-bound refresh. */
+export function isBoundManagedCodexProfile(
+  profile:
+    | Pick<CatalogProfile, "managed_by" | "codex_account_binding">
+    | null
+    | undefined,
+): boolean {
+  return (
+    isManagedCodexProfile(profile) &&
+    typeof profile?.codex_account_binding === "string" &&
+    Boolean(profile.codex_account_binding.trim())
+  );
 }
 
 /**

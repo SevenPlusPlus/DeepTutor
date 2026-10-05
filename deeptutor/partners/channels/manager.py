@@ -9,7 +9,7 @@ from typing import Any
 
 from deeptutor.partners.bus.events import OutboundMessage
 from deeptutor.partners.bus.queue import MessageBus
-from deeptutor.partners.channels.base import BaseChannel
+from deeptutor.partners.channels.base import BaseChannel, constructing_for, deliver_outbound
 from deeptutor.partners.config.schema import ChannelsConfig
 
 
@@ -44,11 +44,14 @@ class ChannelManager:
         channels_config: ChannelsConfig,
         bus: MessageBus,
         groq_api_key: str = "",
+        partner_id: str = "",
     ):
         self.channels_config = channels_config
         self.bus = bus
         self._groq_api_key = groq_api_key
+        self._partner_id = str(partner_id or "")
         self.channels: dict[str, BaseChannel] = {}
+        self._configured_status: dict[str, dict[str, Any]] = {}
         self._dispatch_task: asyncio.Task | None = None
         self._origin_reply_fingerprints: dict[tuple[str, str, str], str] = {}
 
@@ -56,12 +59,12 @@ class ChannelManager:
 
     def _init_channels(self) -> None:
         """Initialize channels discovered via pkgutil scan + entry_points plugins."""
-        from deeptutor.partners.channels.registry import discover_all
+        from deeptutor.partners.channels.registry import discover_all_with_errors
 
-        for name, cls in discover_all().items():
-            section = getattr(self.channels_config, name, None)
-            if section is None:
-                continue
+        discovered, import_errors = discover_all_with_errors()
+        configured = dict(self.channels_config.model_extra or {})
+
+        for name, section in configured.items():
             enabled = (
                 section.get("enabled", False)
                 if isinstance(section, dict)
@@ -69,8 +72,24 @@ class ChannelManager:
             )
             if not enabled:
                 continue
+            self._configured_status[name] = {
+                "enabled": True,
+                "running": False,
+                "setup": {},
+            }
+
+            cls = discovered.get(name)
+            if cls is None:
+                reason = import_errors.get(name)
+                self._configured_status[name]["setup"] = {
+                    "status": "unavailable",
+                    "message": reason or "Channel implementation is not installed.",
+                }
+                continue
             try:
-                channel = cls(section, self.bus)
+                with constructing_for(self._partner_id):
+                    channel = cls(section, self.bus)
+                channel.partner_id = self._partner_id
                 channel.transcription_api_key = self._groq_api_key
                 # Effective delivery flags are per-channel only. Historical
                 # top-level channel config keys are ignored at runtime.
@@ -80,12 +99,24 @@ class ChannelManager:
                 channel.send_tool_hints = self._resolve_bool_override(
                     section, "send_tool_hints", default=True
                 )
+                if getattr(channel.config, "allow_from", None) == []:
+                    _logger().warning(
+                        'Skipping channel "{}": allowFrom is empty (denies all)',
+                        name,
+                    )
+                    self._configured_status[name]["setup"] = {
+                        "status": "action_required",
+                        "message": "Add at least one allowed sender before starting this channel.",
+                    }
+                    continue
                 self.channels[name] = channel
                 _logger().info("{} channel enabled", cls.display_name)
             except Exception as e:
                 _logger().warning("{} channel not available: {}", name, e)
-
-        self._validate_allow_from()
+                self._configured_status[name]["setup"] = {
+                    "status": "error",
+                    "message": f"Channel initialization failed ({type(e).__name__}).",
+                }
 
     @staticmethod
     def _resolve_bool_override(section: Any, key: str, *, default: bool) -> bool:
@@ -105,19 +136,47 @@ class ChannelManager:
         value = getattr(section, key, None)
         return value if isinstance(value, bool) else default
 
-    def _validate_allow_from(self) -> None:
-        for name, ch in self.channels.items():
-            if getattr(ch.config, "allow_from", None) == []:
-                raise SystemExit(
-                    f'Error: "{name}" has empty allowFrom (denies all). '
-                    f'Set ["*"] to allow everyone, or add specific user IDs.'
-                )
-
     async def _start_channel(self, name: str, channel: BaseChannel) -> None:
+        channel.set_setup_state("connecting")
+        manager_revision = channel.setup_revision
+        start_task = asyncio.create_task(channel.start())
         try:
-            await channel.start()
+            # Most implementations set `_running` synchronously before their
+            # first network await. If the channel did not publish a more
+            # precise state of its own, report that its listener is alive —
+            # not that external authentication has necessarily succeeded.
+            await asyncio.sleep(0)
+            if (
+                channel.is_running
+                and channel.setup_revision == manager_revision
+                and not start_task.done()
+            ):
+                channel.set_setup_state("running")
+                manager_revision = channel.setup_revision
+            await start_task
+            if channel.setup_revision == manager_revision:
+                if channel.is_running:
+                    channel.set_setup_state("running")
+                else:
+                    channel.set_setup_state(
+                        "action_required",
+                        message=(
+                            "The channel did not start. Check its required fields "
+                            "and optional dependencies."
+                        ),
+                    )
+        except asyncio.CancelledError:
+            start_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await start_task
+            raise
         except Exception as e:
             _logger().error("Failed to start channel {}: {}", name, e)
+            channel._running = False
+            channel.set_setup_state(
+                "error",
+                message=f"Channel startup failed ({type(e).__name__}).",
+            )
 
     async def start_all(self) -> None:
         """Start all channels and the outbound dispatcher."""
@@ -146,6 +205,7 @@ class ChannelManager:
         for name, channel in self.channels.items():
             try:
                 await channel.stop()
+                channel.set_setup_state("disconnected")
                 _logger().info("Stopped {} channel", name)
             except Exception as e:
                 _logger().error("Error stopping {}: {}", name, e)
@@ -239,12 +299,7 @@ class ChannelManager:
     @staticmethod
     async def _send_once(channel: BaseChannel, msg: OutboundMessage) -> None:
         """Send one outbound message without retry policy."""
-        if msg.metadata.get("_stream_delta") or msg.metadata.get("_stream_end"):
-            await channel.send_delta(msg.chat_id, msg.content, msg.metadata)
-        elif not msg.metadata.get("_streamed"):
-            # ``_streamed`` marks a final reply already delivered live via
-            # send_delta — skip the plain send to avoid a duplicate message.
-            await channel.send(msg)
+        await deliver_outbound(channel, msg)
 
     def _coalesce_stream_deltas(
         self, first_msg: OutboundMessage
@@ -279,6 +334,8 @@ class ChannelManager:
                 combined_content += next_msg.content
                 if is_end:
                     final_metadata["_stream_end"] = True
+                    if next_meta.get("_stream_final"):
+                        final_metadata["_stream_final"] = True
                     break
             else:
                 # First non-matching message defines the coalescing boundary.
@@ -330,10 +387,25 @@ class ChannelManager:
         return self.channels.get(name)
 
     def get_status(self) -> dict[str, Any]:
-        return {
-            name: {"enabled": True, "running": channel.is_running}
-            for name, channel in self.channels.items()
+        status = {
+            name: {
+                "enabled": bool(state.get("enabled")),
+                "running": bool(state.get("running")),
+                "setup": dict(state.get("setup") or {}),
+            }
+            for name, state in self._configured_status.items()
         }
+        status.update(
+            {
+                name: {
+                    "enabled": True,
+                    "running": channel.is_running,
+                    "setup": channel.setup_state,
+                }
+                for name, channel in self.channels.items()
+            }
+        )
+        return status
 
     @property
     def enabled_channels(self) -> list[str]:

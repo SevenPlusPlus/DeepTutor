@@ -27,7 +27,6 @@ from websockets.asyncio.client import connect as ws_connect
 from deeptutor.partners.bus.events import OutboundMessage
 from deeptutor.partners.bus.queue import MessageBus
 from deeptutor.partners.channels.base import BaseChannel
-from deeptutor.partners.config.paths import get_media_dir
 from deeptutor.partners.config.schema import DeliveryOverrides
 from deeptutor.partners.helpers import safe_filename
 from deeptutor.partners.network import validate_url_target
@@ -89,6 +88,13 @@ class NapcatChannel(BaseChannel):
     async def start(self) -> None:
         if not self.config.ws_url:
             logger.error("napcat: ws_url not configured")
+            self.set_setup_state(
+                "action_required",
+                message=(
+                    "Required fields are missing. Complete the channel configuration "
+                    "and save again."
+                ),
+            )
             return
 
         self._running = True
@@ -103,6 +109,10 @@ class NapcatChannel(BaseChannel):
                 raise
             except Exception as e:
                 logger.warning("napcat: connection lost: {}", e)
+                self.set_setup_state(
+                    "error",
+                    message="Channel connection failed; the listener will retry.",
+                )
             if self._running:
                 await asyncio.sleep(next(backoff, 30))
 
@@ -112,6 +122,7 @@ class NapcatChannel(BaseChannel):
             headers.append(("Authorization", f"Bearer {self.config.access_token}"))
 
         logger.info("napcat: connecting to {}", self.config.ws_url)
+        self.set_setup_state("connecting")
         async with ws_connect(self.config.ws_url, additional_headers=headers) as ws:
             self._ws = ws
             logger.info("napcat: connected")
@@ -143,6 +154,7 @@ class NapcatChannel(BaseChannel):
                             data.get("nickname"),
                             data.get("user_id"),
                         )
+                        self.set_setup_state("connected")
                         break
                     await self._dispatch_frame(raw)
 
@@ -573,7 +585,7 @@ class NapcatChannel(BaseChannel):
             name = f"{int(time.time() * 1000)}.jpg"
         # Resolved lazily (not in __init__) so constructing the channel never
         # touches the partners data tree.
-        path = get_media_dir("napcat") / name
+        path = self.media_dir() / name
         try:
             await asyncio.to_thread(path.write_bytes, data)
         except OSError as e:

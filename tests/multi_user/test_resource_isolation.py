@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 
 def test_book_session_ids_are_scoped_per_user(as_user) -> None:
     from deeptutor.book.storage import BookStorage
@@ -31,7 +33,7 @@ def test_partner_data_is_admin_anchored_not_user_scoped(as_user) -> None:
     request user's scope: partner runtimes execute inside a synthetic partner
     scope whose own workspace lives below ``data/partners``, so resolving the
     base dir through the contextvar would recurse the layout. Access control
-    is enforced at the API layer instead (the /api/v1/partners router is
+    is enforced at the API layer instead (the /api/partners router is
     admin-gated in ``api/main.py``).
     """
     from deeptutor.services.partners.manager import PartnerManager
@@ -44,5 +46,5 @@ def test_partner_data_is_admin_anchored_not_user_scoped(as_user) -> None:
         attacker_dir = manager._partners_dir
 
     assert victim_dir == attacker_dir
-    assert str(victim_dir).endswith("data/partners")
+    assert Path(victim_dir).as_posix().endswith("data/partners")
     assert "u_victim" not in str(victim_dir)

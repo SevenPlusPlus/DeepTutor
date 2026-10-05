@@ -1,23 +1,42 @@
-"""
-Build bounded conversation history for unified chat sessions.
-"""
+"""Build budgeted conversation history for unified chat sessions."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from typing import Any, Awaitable, Callable
 
 from deeptutor.agents.base_agent import BaseAgent
 from deeptutor.core.stream import StreamEvent, StreamEventType
 from deeptutor.core.trace import build_trace_metadata, merge_trace_metadata, new_call_id
 from deeptutor.services.llm.config import LLMConfig
-from deeptutor.services.llm.context_window import resolve_effective_context_window
+from deeptutor.services.llm.context_window import (
+    coerce_positive_int,
+    resolve_effective_context_window,
+)
+from deeptutor.services.prompt.language import language_label
 
+from .ask_user_trace import (
+    extract_ask_user_clarification_blocks,
+    extract_ask_user_clarifications,
+)
+from .model_history import history_groups, model_turn, replay_history
 from .protocol import SessionStoreProtocol
+from .provider_response_state import normalize_provider_response_state
 
 #: When the summarizer's output lands within this fraction of its hard token
 #: cap, assume the provider cut it mid-sentence and trim the partial tail.
 TRUNCATION_GUARD_RATIO = 0.95
+
+# Ratio-only budgets become impractical for models with very large context
+# windows: a 1M-token window would otherwise reserve hundreds of thousands of
+# tokens for chat history and ask the summarizer for a six-figure response.
+# Keep the rolling-summary strategy, but bound its history plan, summary
+# output, and raw-rebuild eligibility threshold. The summary ceiling is also
+# constrained by the active generation limit when that setting is lower.
+MAX_HISTORY_PLAN_TOKENS = 131_072
+MAX_SUMMARY_OUTPUT_TOKENS = 16_384
+MAX_RAW_REBUILD_TOKENS = 131_072
 
 
 def count_tokens(text: str) -> int:
@@ -45,6 +64,29 @@ def trim_incomplete_tail(text: str) -> str:
     return text.rstrip()
 
 
+def expand_message_context(message: dict[str, Any]) -> list[dict[str, Any]]:
+    """Expand one stored row into its true assistant/user chronology."""
+    role = str(message.get("role", "user"))
+    content = str(message.get("content", "") or "")
+    blocks = extract_ask_user_clarification_blocks(message)
+    if role != "assistant" or not blocks:
+        return [{"role": role, "content": content}] if content.strip() else []
+
+    expanded: list[dict[str, str]] = []
+    cursor = 0
+    for raw_offset, clarification in blocks:
+        offset = min(len(content), max(cursor, raw_offset))
+        prefix = content[cursor:offset]
+        if prefix.strip():
+            expanded.append({"role": "assistant", "content": prefix})
+        expanded.append({"role": "user", "content": clarification})
+        cursor = offset
+    suffix = content[cursor:]
+    if suffix.strip():
+        expanded.append({"role": "assistant", "content": suffix})
+    return expanded
+
+
 def format_messages_as_transcript(messages: list[dict[str, Any]]) -> str:
     lines: list[str] = []
     role_map = {
@@ -53,11 +95,10 @@ def format_messages_as_transcript(messages: list[dict[str, Any]]) -> str:
         "system": "System",
     }
     for item in messages:
-        content = str(item.get("content", "") or "").strip()
-        if not content:
-            continue
-        role = role_map.get(str(item.get("role", "user")), "User")
-        lines.append(f"{role}: {content}")
+        for expanded in expand_message_context(item):
+            content = expanded["content"].strip()
+            role = role_map.get(expanded["role"], "User")
+            lines.append(f"{role}: {content}")
     return "\n\n".join(lines)
 
 
@@ -77,6 +118,20 @@ def build_history_text(history: list[dict[str, Any]]) -> str:
     return "\n\n".join(lines)
 
 
+def _provider_response_state_tokens(message: dict[str, Any]) -> int:
+    metadata = message.get("metadata")
+    state = normalize_provider_response_state(
+        metadata.get("provider_response_state") if isinstance(metadata, dict) else None
+    )
+    if state is None:
+        return 0
+    try:
+        serialized = json.dumps(state, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError):
+        serialized = str(state)
+    return count_tokens(serialized)
+
+
 @dataclass
 class ContextBuildResult:
     conversation_history: list[dict[str, Any]]
@@ -85,6 +140,8 @@ class ContextBuildResult:
     events: list[StreamEvent]
     token_count: int
     budget: int
+    model_history: list[dict[str, Any]] | None = None
+    previous_model_turn: dict[str, Any] | None = None
 
 
 class _ContextSummaryAgent(BaseAgent):
@@ -102,7 +159,11 @@ class _ContextSummaryAgent(BaseAgent):
 
 
 class ContextBuilder:
-    """Construct a bounded conversation history plus optional summary trace."""
+    """Construct history against a bounded plan plus optional summary trace.
+
+    The budget is a planning target, not destructive truncation: the newest
+    non-empty message is retained even when that single message exceeds it.
+    """
 
     def __init__(
         self,
@@ -123,33 +184,52 @@ class ContextBuilder:
 
     def _history_budget(self, llm_config: LLMConfig) -> int:
         effective_context_window = self._effective_context_window(llm_config)
-        return max(256, int(effective_context_window * self.history_budget_ratio))
+        ratio_budget = max(256, int(effective_context_window * self.history_budget_ratio))
+        return min(ratio_budget, MAX_HISTORY_PLAN_TOKENS)
 
-    def _summary_budget(self, budget: int) -> int:
-        return max(96, int(budget * self.summary_target_ratio))
+    def _summary_budget(self, budget: int, llm_config: LLMConfig | None = None) -> int:
+        ratio_budget = max(96, int(budget * self.summary_target_ratio))
+        output_cap = MAX_SUMMARY_OUTPUT_TOKENS
+        if llm_config is not None:
+            generation_limit = coerce_positive_int(getattr(llm_config, "max_tokens", None))
+            if generation_limit is not None:
+                output_cap = min(output_cap, generation_limit)
+        return min(ratio_budget, output_cap)
 
     def _recent_budget(self, budget: int) -> int:
-        return max(128, budget - self._summary_budget(budget))
+        # Keep the original ratio-based split independent of the summarizer's
+        # output cap. Otherwise lowering that cap expands the verbatim tail and
+        # leaves almost no headroom before the next compaction.
+        return max(128, int(budget * (1 - self.summary_target_ratio)))
 
     def _rebuild_source_budget(self, llm_config: LLMConfig) -> int:
-        # Raw-rebuild input may use up to half the effective context window;
-        # beyond that we degrade to fold-in (existing summary + new turns).
-        return max(1024, self._effective_context_window(llm_config) // 2)
+        # A raw prefix is eligible for drift-free rebuild up to this threshold;
+        # beyond it we degrade to fold-in (existing summary + new turns).
+        ratio_budget = max(1024, self._effective_context_window(llm_config) // 2)
+        return min(ratio_budget, MAX_RAW_REBUILD_TOKENS)
 
     def _build_history(self, summary: str, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         history: list[dict[str, Any]] = []
         cleaned_summary = summary.strip()
         if cleaned_summary:
             history.append({"role": "system", "content": cleaned_summary})
-        history.extend(
-            {
-                "role": item.get("role", "user"),
-                "content": str(item.get("content", "") or ""),
-            }
-            for item in messages
-            if item.get("role") in {"user", "assistant"}
-            and str(item.get("content", "") or "").strip()
-        )
+        for item in messages:
+            expanded_start = len(history)
+            for expanded in expand_message_context(item):
+                if expanded["role"] in {"user", "assistant"}:
+                    history.append(expanded)
+            if item.get("role") != "assistant":
+                continue
+            metadata = item.get("metadata")
+            provider_state = normalize_provider_response_state(
+                metadata.get("provider_response_state") if isinstance(metadata, dict) else None
+            )
+            if provider_state is None:
+                continue
+            for expanded in reversed(history[expanded_start:]):
+                if expanded.get("role") == "assistant" and expanded.get("content"):
+                    expanded["_provider_response_state"] = provider_state
+                    break
         return history
 
     async def _append_event(
@@ -169,15 +249,31 @@ class ContextBuilder:
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         selected: list[dict[str, Any]] = []
         total = 0
-        for item in reversed(messages):
-            content = str(item.get("content", "") or "")
-            tokens = count_tokens(content)
+        for group in reversed(history_groups(messages)):
+            if any(model_turn(row) is not None for row in group):
+                tokens = self._model_tokens(group)
+            else:
+                tokens = 0
+                for item in group:
+                    content = str(item.get("content", "") or "")
+                    clarification = extract_ask_user_clarifications(item)
+                    tokens += count_tokens(
+                        f"{content}\n{clarification}" if clarification else content
+                    )
+                    tokens += _provider_response_state_tokens(item)
             if selected and total + tokens > recent_budget:
                 break
-            selected.insert(0, item)
+            selected[0:0] = group
             total += tokens
         cutoff = len(messages) - len(selected)
         return messages[:cutoff], selected
+
+    def _model_tokens(self, messages: list[dict[str, Any]], summary: str = "") -> int:
+        if any(model_turn(row) is not None for row in messages):
+            return count_tokens(json.dumps(replay_history(messages, summary), ensure_ascii=False))
+        return count_tokens(build_history_text(self._build_history(summary, messages))) + sum(
+            _provider_response_state_tokens(row) for row in messages
+        )
 
     async def _summarize(
         self,
@@ -187,6 +283,7 @@ class ContextBuilder:
         source_text: str,
         summary_budget: int,
         on_event: Callable[[StreamEvent], Awaitable[None]] | None = None,
+        replay_request: dict[str, Any] | None = None,
     ) -> tuple[str, list[StreamEvent]]:
         events: list[StreamEvent] = []
         if not source_text.strip():
@@ -282,7 +379,13 @@ class ContextBuilder:
         )
         # The instruction targets ~80% of the hard cap so the model's own
         # length control — not the max_tokens cut — is the binding limit.
-        target_tokens = max(96, int(summary_budget * 0.8))
+        target_tokens = max(1, int(summary_budget * 0.8))
+        # The summary is replayed as a system row on every later turn, so the
+        # language it is written in keeps steering the answer long after the
+        # turns it condensed have scrolled out. Unstated, a summary of a
+        # foreign-language session comes back in the default language and the
+        # reply follows it — #1511's drift "after a few rounds".
+        summary_language = language_label(language)
         system_prompt = (
             "You maintain a running summary of a conversation so future turns can "
             "continue seamlessly. Rewrite the summary from the material provided, "
@@ -297,7 +400,8 @@ class ContextBuilder:
             "Carry forward still-relevant entries from the existing summary unchanged "
             "unless new information contradicts them; drop only what is obsolete. "
             "Prefer concrete details (numbers, identifiers, exact terms) over "
-            "abstract restatement. Never invent information."
+            "abstract restatement. Never invent information. "
+            f"Write the summary itself in {summary_language}."
         )
         if language.startswith("zh"):
             system_prompt = (
@@ -310,6 +414,7 @@ class ContextBuilder:
                 "- 待办事项：未回答的问题、未完成的任务、已知阻塞\n"
                 "已有摘要中仍然有效的条目应原样保留，仅在新信息与之矛盾时修改，只删除确已过时"
                 "的内容。优先保留具体细节（数字、标识符、确切措辞），不要抽象转述，绝不虚构。"
+                f"摘要正文本身请使用{summary_language}撰写。"
             )
         user_prompt = (
             f"Update the summary using the material below. "
@@ -321,12 +426,28 @@ class ContextBuilder:
             )
         try:
             _chunks: list[str] = []
+            replay_kwargs: dict[str, Any] = {}
+            if replay_request is not None:
+                # Reuse the conversation's warm prefix; only the instruction
+                # is new. Tools are present for cache identity, never executed.
+                instruction = (
+                    f"{system_prompt}\n\nSummarize the conversation above in at most "
+                    f"{target_tokens} tokens. Output only the summary; do not call tools."
+                )
+                replay_kwargs = {
+                    "messages": [
+                        *replay_request["messages"],
+                        {"role": "user", "content": instruction},
+                    ],
+                    "tools": replay_request.get("tools"),
+                }
             async for _c in agent.stream_llm(
                 user_prompt=user_prompt,
                 system_prompt=system_prompt,
                 max_tokens=summary_budget,
                 stage="summarize_context",
                 trace_meta=trace_meta,
+                **replay_kwargs,
             ):
                 _chunks.append(_c)
             summary = "".join(_chunks).strip()
@@ -365,7 +486,7 @@ class ContextBuilder:
             return ContextBuildResult([], "", "", [], 0, self._history_budget(llm_config))
 
         budget = self._history_budget(llm_config)
-        summary_budget = self._summary_budget(budget)
+        summary_budget = self._summary_budget(budget, llm_config)
         recent_budget = self._recent_budget(budget)
 
         stored_summary = str(session.get("compressed_summary", "") or "").strip()
@@ -384,7 +505,15 @@ class ContextBuilder:
         ]
 
         current_history = self._build_history(stored_summary, unsummarized)
-        current_tokens = count_tokens(build_history_text(current_history))
+        current_tokens = self._model_tokens(unsummarized, stored_summary)
+        previous_model_turn = next(
+            (record for row in reversed(messages) if (record := model_turn(row)) is not None),
+            None,
+        )
+        binding = getattr(llm_config, "binding", None)
+        route = (
+            {"provider": binding, "model": llm_config.model} if isinstance(binding, str) else None
+        )
         if current_tokens <= budget:
             return ContextBuildResult(
                 conversation_history=current_history,
@@ -393,6 +522,8 @@ class ContextBuilder:
                 events=[],
                 token_count=current_tokens,
                 budget=budget,
+                model_history=replay_history(unsummarized, stored_summary, route),
+                previous_model_turn=previous_model_turn,
             )
 
         older_unsummarized, recent_messages = self._select_recent_messages(
@@ -423,6 +554,24 @@ class ContextBuilder:
             merge_parts.append(format_messages_as_transcript(recent_messages))
 
         summarize_ok = True
+        replay_request = None
+        if (
+            previous_model_turn
+            and older_unsummarized
+            and isinstance(previous_model_turn.get("system"), str)
+        ):
+            # The current retained prefix is authoritative once model turns
+            # exist; legacy sessions keep their raw-transcript rebuild path.
+            replay_request = {
+                "messages": [
+                    {"role": "system", "content": previous_model_turn["system"]},
+                    *[
+                        {key: value for key, value in message.items() if key != "_context_snapshot"}
+                        for message in replay_history(older_unsummarized, stored_summary, route)
+                    ],
+                ],
+                "tools": previous_model_turn.get("tools"),
+            }
         try:
             new_summary, events = await self._summarize(
                 session_id=session_id,
@@ -430,6 +579,7 @@ class ContextBuilder:
                 source_text="\n\n".join(part for part in merge_parts if part.strip()),
                 summary_budget=summary_budget,
                 on_event=on_event,
+                **({"replay_request": replay_request} if replay_request else {}),
             )
         except Exception:
             summarize_ok = False
@@ -444,17 +594,19 @@ class ContextBuilder:
                 up_to_msg_id = max(summary_up_to_msg_id, int(prefix_messages[-1].get("id", 0) or 0))
             await self.store.update_summary(session_id, new_summary, up_to_msg_id)
             stored_summary = new_summary
-            final_history = self._build_history(stored_summary, recent_messages)
+            retained_rows = recent_messages
         else:
             # Degrade for this turn only: keep the stale summary and as many
             # unsummarized turns as fit; nothing is marked as summarized, so
             # the next turn retries with the full material.
-            final_history = self._build_history(stored_summary, unsummarized)
-        while len(final_history) > 1 and count_tokens(build_history_text(final_history)) > budget:
-            summary_prefix = 1 if final_history and final_history[0].get("role") == "system" else 0
-            if len(final_history) <= summary_prefix + 1:
-                break
-            final_history.pop(summary_prefix)
+            retained_rows = unsummarized
+        retained_groups = history_groups(retained_rows)
+        while (
+            len(retained_groups) > 1 and self._model_tokens(retained_rows, stored_summary) > budget
+        ):
+            retained_groups.pop(0)
+            retained_rows = [row for group in retained_groups for row in group]
+        final_history = self._build_history(stored_summary, retained_rows)
 
         final_text = build_history_text(final_history)
         return ContextBuildResult(
@@ -462,8 +614,10 @@ class ContextBuilder:
             conversation_summary=stored_summary,
             context_text=final_text,
             events=events,
-            token_count=count_tokens(final_text),
+            token_count=self._model_tokens(retained_rows, stored_summary),
             budget=budget,
+            model_history=replay_history(retained_rows, stored_summary, route),
+            previous_model_turn=previous_model_turn,
         )
 
 
@@ -474,5 +628,6 @@ __all__ = [
     "build_history_text",
     "count_tokens",
     "format_messages_as_transcript",
+    "extract_ask_user_clarifications",
     "trim_incomplete_tail",
 ]

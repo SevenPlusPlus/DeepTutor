@@ -31,6 +31,10 @@ _CAPABILITY_DESCRIPTIONS: dict[str, dict[str, str]] = {
         "en": "Create visual explanations such as SVG, charts, Mermaid, HTML, or Manim.",
         "zh": "生成 SVG、图表、Mermaid、HTML 或 Manim 等可视化讲解。",
     },
+    "immersive_reading": {
+        "en": "Read a document with the assistant, cited page by page.",
+        "zh": "与助手一起阅读文档，逐页标明出处。",
+    },
 }
 
 _TOOL_DESCRIPTIONS: dict[str, dict[str, str]] = {
@@ -38,13 +42,9 @@ _TOOL_DESCRIPTIONS: dict[str, dict[str, str]] = {
         "en": "Explore ideas broadly and organize them with rationale.",
         "zh": "广泛发散想法，并按理由组织结果。",
     },
-    "code_execution": {
-        "en": "Run sandboxed Python code for computation and data exploration.",
-        "zh": "在沙箱中运行 Python，用于计算和数据探索。",
-    },
     "exec": {
-        "en": "Run shell commands inside an isolated sandbox workspace.",
-        "zh": "在隔离沙箱工作区中运行 shell 命令。",
+        "en": "Run source code or shell scripts inside an isolated workspace.",
+        "zh": "在隔离工作区中运行源码或 shell 脚本。",
     },
     "kb_files": {
         "en": "List the documents a knowledge base holds, with the total count.",
@@ -53,6 +53,10 @@ _TOOL_DESCRIPTIONS: dict[str, dict[str, str]] = {
     "paper_search": {
         "en": "Search arXiv preprints and return paper metadata.",
         "zh": "搜索 arXiv 预印本并返回论文元数据。",
+    },
+    "zotero_search": {
+        "en": "Search a user-supplied Zotero library for references.",
+        "zh": "搜索用户提供的 Zotero 文献库。",
     },
     "reason": {
         "en": "Use a dedicated reasoning model call for hard reasoning tasks.",

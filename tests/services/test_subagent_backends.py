@@ -13,6 +13,7 @@ import sys
 
 import pytest
 
+from deeptutor.services.subagent import process as process_mod
 from deeptutor.services.subagent.claude_code import ClaudeCodeBackend
 from deeptutor.services.subagent.codex import CodexBackend
 from deeptutor.services.subagent.config import (
@@ -22,7 +23,7 @@ from deeptutor.services.subagent.config import (
     SubagentSettings,
     settings_from_dict,
 )
-from deeptutor.services.subagent.process import stream_process_lines
+from deeptutor.services.subagent.process import resolve_cli_command, stream_process_lines
 from deeptutor.services.subagent.types import ConsultResult
 
 # ---- command building --------------------------------------------------------
@@ -113,6 +114,250 @@ def test_codex_command_attaches_images_with_repeated_flag() -> None:
     assert cmd.count("-i") == 2
     assert cmd[cmd.index("-i") + 1] == "/tmp/dt-y/00_a.png"
     assert cmd[-1] == "look"  # prompt stays the trailing positional
+
+
+# ---- Hermes Agent / OpenClaw / DeepSeek Harness -----------------------------
+
+
+def test_hermes_command_builds_quiet_resumable_run() -> None:
+    from deeptutor.services.subagent.hermes import HermesBackend
+
+    backend = HermesBackend()
+    fresh = backend._build_command(
+        "inspect",
+        session_id=None,
+        config=BackendConfig(
+            model="openrouter/anthropic/claude-sonnet-4",
+            effort="high",
+            system_prompt="Be concise",
+            auto_approve=True,
+            extra_args=["--toolsets", "terminal"],
+        ),
+        images=["/tmp/screenshot.png"],
+    )
+    assert fresh[:3] == ["hermes", "chat", "--quiet"]
+    assert "--yolo" in fresh
+    assert fresh[fresh.index("--model") + 1] == "openrouter/anthropic/claude-sonnet-4"
+    assert fresh[fresh.index("--reasoning") + 1] == "high"
+    assert fresh[fresh.index("--image") + 1] == "/tmp/screenshot.png"
+    assert fresh[-2:] == ["--query", "Be concise\n\ninspect"]
+
+    resumed = backend._build_command(
+        "again",
+        session_id="hermes-session-1",
+        config=BackendConfig(system_prompt="Do not repeat"),
+    )
+    assert resumed[resumed.index("--resume") + 1] == "hermes-session-1"
+    assert resumed[-1] == "again"
+
+
+@pytest.mark.asyncio
+async def test_hermes_consult_captures_answer_and_session(monkeypatch) -> None:
+    from deeptutor.services.subagent import hermes as hermes_mod
+
+    async def fake_stream(cmd, *, cwd=None):
+        assert cmd[:3] == ["hermes", "chat", "--quiet"]
+        assert cwd == "/repo"
+        yield "stdout", "First line"
+        yield "stdout", "second line"
+        yield "stderr", "session_id: hs-42"
+        yield "exit", "0"
+
+    monkeypatch.setattr(hermes_mod, "stream_process_lines", fake_stream)
+    events = []
+
+    async def on_event(event):
+        events.append(event)
+
+    result = await hermes_mod.HermesBackend().consult("q", on_event=on_event, cwd="/repo")
+    assert result.success is True
+    assert result.session_id == "hs-42"
+    assert result.final_text == "First line\nsecond line"
+    assert events[-1].meta["merge_id"] == "hermes:final"
+
+
+def test_openclaw_command_owns_stable_session_key() -> None:
+    from deeptutor.services.subagent.openclaw import OpenClawBackend
+
+    cmd = OpenClawBackend()._build_command(
+        "inspect",
+        session_id="deeptutor-abc",
+        fresh_session=True,
+        config=BackendConfig(
+            model="openai/gpt-5.6-sol",
+            effort="high",
+            system_prompt="Be concise",
+            extra_args=["--local"],
+        ),
+    )
+    assert cmd[:2] == ["openclaw", "agent"]
+    assert cmd[cmd.index("--session-key") + 1] == "deeptutor-abc"
+    assert cmd[cmd.index("--timeout") + 1] == "0"
+    assert cmd[cmd.index("--thinking") + 1] == "high"
+    assert "--local" in cmd
+    assert cmd[-2:] == ["--message", "Be concise\n\ninspect"]
+
+
+@pytest.mark.asyncio
+async def test_openclaw_consult_parses_gateway_json(monkeypatch) -> None:
+    from deeptutor.services.subagent import openclaw as openclaw_mod
+
+    async def fake_stream(cmd, *, cwd=None):
+        assert "--json" in cmd and "--session-key" in cmd
+        yield "stderr", "Gateway connected"
+        yield "stdout", '{"status":"ok","result":{"payloads":[{"text":"Done."}]}}'
+        yield "exit", "0"
+
+    monkeypatch.setattr(openclaw_mod, "stream_process_lines", fake_stream)
+    events = []
+
+    async def on_event(event):
+        events.append(event)
+
+    result = await openclaw_mod.OpenClawBackend().consult("q", on_event=on_event)
+    assert result.success is True
+    assert result.session_id.startswith("deeptutor-")
+    assert result.final_text == "Done."
+    assert [event.kind for event in events] == ["log", "text"]
+
+
+@pytest.mark.asyncio
+async def test_deepseek_headless_fallback_streams_reasoning(monkeypatch) -> None:
+    from deeptutor.services.subagent import deepseek_harness as dsh_mod
+
+    async def fake_stream(cmd, *, cwd=None):
+        assert cmd[:3] == ["dsh", "--profile", "headless"]
+        yield "stderr", "dsh: reasoning:"
+        yield "stderr", "check the files"
+        yield "stdout", "Implemented."
+        yield "exit", "0"
+
+    monkeypatch.setattr(dsh_mod, "_sdk_available", lambda: False)
+    monkeypatch.setattr(dsh_mod, "stream_process_lines", fake_stream)
+    events = []
+
+    async def on_event(event):
+        events.append(event)
+
+    result = await dsh_mod.DeepSeekHarnessBackend().consult("q", on_event=on_event)
+    assert result.success is True
+    assert result.session_id is None  # headless makes no false resume promise
+    assert result.final_text == "Implemented."
+    assert [event.kind for event in events] == ["reasoning", "text"]
+
+
+def test_deepseek_sdk_notification_mapping() -> None:
+    from types import SimpleNamespace
+
+    from deeptutor.services.subagent.deepseek_harness import _sdk_notification_events
+
+    state = {"text": {}, "reasoning": {}}
+
+    def notification(event):
+        return SimpleNamespace(
+            method="session.event",
+            payload={"sessionId": "s1", "event": event},
+        )
+
+    text = _sdk_notification_events(
+        notification(
+            {
+                "type": "assistant/chunk",
+                "data": {"step": 1, "chunk": {"type": "text-delta", "text": "Hi"}},
+            }
+        ),
+        state,
+    )
+    reasoning = _sdk_notification_events(
+        notification(
+            {
+                "type": "assistant/chunk",
+                "data": {
+                    "step": 1,
+                    "chunk": {"type": "reasoning-delta", "text": "Plan"},
+                },
+            }
+        ),
+        state,
+    )
+    tool = _sdk_notification_events(
+        notification(
+            {
+                "type": "tool/call",
+                "data": {"step": 1, "name": "bash", "arguments": '{"cmd":"pwd"}'},
+            }
+        ),
+        state,
+    )
+    assert text[0].kind == "text" and text[0].text == "Hi"
+    assert reasoning[0].kind == "reasoning" and reasoning[0].text == "Plan"
+    assert tool[0].kind == "tool" and tool[0].text.startswith("bash(")
+
+
+@pytest.mark.asyncio
+async def test_deepseek_sdk_consult_streams_and_resumes(monkeypatch, tmp_path) -> None:
+    from types import ModuleType, SimpleNamespace
+
+    from deeptutor.services.subagent.deepseek_harness import DeepSeekHarnessBackend
+
+    calls = []
+
+    class FakeHarness:
+        def __init__(self, **kwargs):
+            calls.append({"kwargs": kwargs})
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def run(self, prompt, *, session_id, on_notification):
+            calls[-1].update({"prompt": prompt, "session_id": session_id})
+            on_notification(
+                SimpleNamespace(
+                    method="session.event",
+                    payload={
+                        "event": {
+                            "type": "assistant/chunk",
+                            "data": {
+                                "step": 1,
+                                "chunk": {"type": "text-delta", "text": "SDK answer"},
+                            },
+                        }
+                    },
+                )
+            )
+            return SimpleNamespace(
+                session_id=session_id,
+                final_response="SDK answer",
+                finish_reason="completed",
+            )
+
+    fake_module = ModuleType("deepseek_harness")
+    fake_module.DeepSeekHarness = FakeHarness
+    monkeypatch.setitem(sys.modules, "deepseek_harness", fake_module)
+    monkeypatch.setenv("DSH_HOME", str(tmp_path / "dsh"))
+    events = []
+
+    async def on_event(event):
+        events.append(event)
+
+    result = await DeepSeekHarnessBackend()._consult_sdk(
+        "again",
+        on_event=on_event,
+        cwd=str(tmp_path),
+        session_id="deepseek-session-7",
+        config=BackendConfig(model="deepseek-v4", effort="high"),
+        images=None,
+    )
+    assert result.success is True
+    assert result.session_id == "deepseek-session-7"
+    assert result.final_text == "SDK answer"
+    assert [event.kind for event in events] == ["text"]
+    assert calls[0]["session_id"] == "deepseek-session-7"
+    assert calls[0]["kwargs"]["model"] == "deepseek-v4"
+    assert calls[0]["kwargs"]["reasoning_effort"] == "high"
 
 
 # ---- Claude Code event parsing -----------------------------------------------
@@ -393,6 +638,52 @@ async def test_stream_process_lines_reports_nonzero_exit() -> None:
     assert seen[-1] == ("exit", "3")
 
 
+# ---- command resolution (Windows .cmd shim fix, issue #759) -------------------
+
+
+def test_resolve_cli_command_passes_empty_through() -> None:
+    assert resolve_cli_command([]) == []
+
+
+def test_resolve_cli_command_returns_absolute_path_unchanged() -> None:
+    # An absolute path that exists (sys.executable) resolves back to itself,
+    # so the live-subprocess tests above are unaffected by the resolve step.
+    resolved = resolve_cli_command([sys.executable, "--version"])
+    assert resolved[0] == sys.executable
+    assert resolved[1] == "--version"
+
+
+def test_resolve_cli_command_resolves_bare_name_to_full_path(monkeypatch) -> None:
+    # On Windows, a bare npm-installed CLI name resolves only via PATHEXT to a
+    # ``.cmd`` shim; shutil.which is what honors PATHEXT, so we monkeypatch it
+    # to stand in for "the shim was found on PATH".
+    monkeypatch.setattr(process_mod.shutil, "which", lambda name, path=None: r"C:\npm\claude.cmd")
+    resolved = resolve_cli_command(["claude", "--version"])
+    assert resolved == [r"C:\npm\claude.cmd", "--version"]
+
+
+def test_resolve_cli_command_falls_back_when_unresolvable(monkeypatch) -> None:
+    # Nothing on PATH matches → return the command unchanged so the OS spawn
+    # (and its FileNotFoundError) behaves exactly as before the fix.
+    monkeypatch.setattr(process_mod.shutil, "which", lambda name, path=None: None)
+    resolved = resolve_cli_command(["nonexistent-cli", "--version"])
+    assert resolved == ["nonexistent-cli", "--version"]
+
+
+def test_resolve_cli_command_honors_caller_supplied_path(monkeypatch) -> None:
+    # stream_process_lines / _spawn pass the child env's PATH so a custom PATH
+    # is honored during resolution rather than only the parent process's PATH.
+    seen: dict[str, str | None] = {}
+
+    def fake_which(name: str, path: str | None = None) -> None:
+        seen["path"] = path
+        return None
+
+    monkeypatch.setattr(process_mod.shutil, "which", fake_which)
+    resolve_cli_command(["claude"], path="/custom/bin")
+    assert seen["path"] == "/custom/bin"
+
+
 # ---- settings ----------------------------------------------------------------
 
 
@@ -597,6 +888,11 @@ async def test_list_backend_options_reads_codex_cache(monkeypatch, tmp_path) -> 
     assert {m.slug for m in claude.models} >= {"opus", "sonnet", "haiku"}
     assert "high" in claude.efforts
 
+    assert options["hermes"].allow_custom_model is True
+    assert "ultra" in options["hermes"].efforts
+    assert "xhigh" in options["openclaw"].efforts
+    assert "max" in options["deepseek_harness"].efforts
+
 
 @pytest.mark.asyncio
 async def test_codex_options_tolerate_missing_cache(monkeypatch, tmp_path) -> None:
@@ -620,13 +916,11 @@ async def test_codex_options_tolerate_missing_cache(monkeypatch, tmp_path) -> No
 # ---- registry: partner backend is registered but not a local CLI -------------
 
 
-def test_registry_partner_is_non_cli_backend() -> None:
+def test_registry_excludes_direct_partner_consultations() -> None:
     from deeptutor.services.subagent import PARTNER_BACKEND_KIND, get_backend, list_backend_kinds
 
-    assert PARTNER_BACKEND_KIND in list_backend_kinds()
-    backend = get_backend(PARTNER_BACKEND_KIND)
-    assert backend is not None
-    assert backend.local_cli is False
+    assert PARTNER_BACKEND_KIND not in list_backend_kinds()
+    assert get_backend(PARTNER_BACKEND_KIND) is None
     assert get_backend("claude_code").local_cli is True
 
 
@@ -636,7 +930,19 @@ async def test_detect_all_excludes_partner_backend() -> None:
 
     kinds = {d.kind for d in await detect_all()}
     assert "partner" not in kinds
-    assert kinds <= {"claude_code", "codex", "gemini", "kimi", "opencode", "mimo"}
+    assert kinds <= {
+        "claude_code",
+        "codex",
+        "grok",
+        "antigravity",
+        "kimi",
+        "opencode",
+        "mimo",
+        "hermes",
+        "openclaw",
+        "deepseek_harness",
+        "hermes_remote",
+    }
 
 
 # ---- partner backend: drive a partner as a subagent --------------------------
@@ -660,6 +966,11 @@ class _FakePartnerManager:
         self.sent: list[dict] = []
         self._trace: list = []
 
+    def owner_id(self, partner_id: str) -> str:
+        # These partners are admin-created, so the access check falls through
+        # to the grant rather than short-circuiting on ownership.
+        return ""
+
     def script_trace(self, events: list) -> None:
         self._trace = events
 
@@ -673,6 +984,21 @@ class _FakePartnerManager:
         self.started.append(pid)
         self._running = True
         return _FakePartnerInstance(True)
+
+    def subscribe_web_turn(self, pid, session_key):
+        return None
+
+    def start_web_turn(self, pid, session_key, content, media=None):
+        import asyncio
+
+        from deeptutor.services.partners.manager import LiveTurn, PartnerManager
+
+        turn = LiveTurn(user_content=content)
+        turn.task = asyncio.create_task(
+            PartnerManager._drive_web_turn(self, pid, session_key, content, media or [], turn)
+        )
+        self.live = turn
+        return turn
 
     async def send_message(self, pid, content, *, session_key, media=None, on_event=None):
         self.sent.append(
@@ -713,9 +1039,12 @@ async def test_partner_consult_mints_session_key_and_returns_reply(monkeypatch) 
     _patch_manager(monkeypatch, manager)
 
     emitted: list[tuple[str, str]] = []
+    identities = []
 
     async def on_event(ev):
         emitted.append((ev.kind, ev.text))
+        if ev.meta.get("partner_session_key"):
+            identities.append(ev.meta)
 
     result = await PartnerBackend().consult("hello", on_event=on_event, partner_id="paul")
 
@@ -730,6 +1059,9 @@ async def test_partner_consult_mints_session_key_and_returns_reply(monkeypatch) 
     kinds = [k for k, _ in emitted]
     assert "reasoning" in kinds and "tool" in kinds and "text" in kinds
     assert result.event_count == 3
+    assert identities == [{"partner_id": "paul", "partner_session_key": result.session_id}]
+    assert manager.live.done
+    assert not manager.live.subscribers
 
 
 @pytest.mark.asyncio
@@ -789,6 +1121,35 @@ async def test_partner_consult_unknown_partner(monkeypatch) -> None:
     result = await PartnerBackend().consult("q", on_event=on_event, partner_id="ghost")
     assert result.success is False
     assert manager.sent == []  # never messaged a non-existent partner
+
+
+@pytest.mark.asyncio
+async def test_partner_consult_rechecks_revoked_grant(monkeypatch, tmp_path) -> None:
+    from deeptutor.multi_user.models import CurrentUser, UserScope
+    import deeptutor.multi_user.partner_access as partner_access
+    from deeptutor.multi_user.paths import user_context
+    from deeptutor.services.subagent.partner import PartnerBackend
+
+    manager = _FakePartnerManager()
+    _patch_manager(monkeypatch, manager)
+    monkeypatch.setattr(partner_access, "load_grant", lambda uid: {"partners": []})
+    user = CurrentUser(
+        "u_alice",
+        "alice",
+        "user",
+        UserScope("user", "u_alice", (tmp_path / "u_alice").resolve()),
+    )
+
+    async def on_event(ev):
+        pass
+
+    with user_context(user):
+        result = await PartnerBackend().consult("q", on_event=on_event, partner_id="paul")
+
+    assert result.success is False
+    assert "not assigned" in result.error
+    assert manager.started == []
+    assert manager.sent == []
 
 
 @pytest.mark.asyncio
@@ -898,112 +1259,6 @@ def test_partner_content_accumulates_cumulatively() -> None:
     )
     assert a[0].text == "The " and b[0].text == "The answer"
     assert a[0].meta["merge_id"] == b[0].meta["merge_id"] == "text:f1"
-
-
-# ---- Gemini CLI: command building + event parsing -----------------------------
-
-
-def test_gemini_command_build_fresh_resume_and_approval_mapping() -> None:
-    from deeptutor.services.subagent.gemini import GeminiBackend
-
-    backend = GeminiBackend()
-    fresh = backend._build_command(
-        "hi", session_id=None, config=BackendConfig(system_prompt="be brief")
-    )
-    assert fresh[:3] == ["gemini", "-p", "be brief\n\nhi"]  # instruction only on fresh
-    assert "--output-format" in fresh and "stream-json" in fresh
-    # Canonical CC spelling maps onto gemini's approval modes (default → yolo).
-    assert fresh[fresh.index("--approval-mode") + 1] == "yolo"
-    assert "--resume" not in fresh
-
-    resumed = backend._build_command(
-        "again",
-        session_id="s1",
-        config=BackendConfig(
-            system_prompt="be brief", permission_mode="acceptEdits", model="flash"
-        ),
-    )
-    assert resumed[1:3] == ["-p", "again"]  # no instruction prefix on resume
-    assert resumed[resumed.index("--approval-mode") + 1] == "auto_edit"
-    assert "--resume" in resumed and "s1" in resumed
-    assert resumed[resumed.index("--model") + 1] == "flash"
-
-
-def test_gemini_command_attaches_images_via_at_syntax() -> None:
-    from deeptutor.services.subagent.gemini import GeminiBackend
-
-    backend = GeminiBackend()
-    cmd = backend._build_command(
-        "look", session_id=None, config=BackendConfig(), images=["/tmp/stage/a.png"]
-    )
-    assert "@/tmp/stage/a.png" in cmd[2]  # rides inside the prompt text
-    assert cmd[cmd.index("--include-directories") + 1] == "/tmp/stage"
-
-
-async def _drive_gemini(events):
-    from deeptutor.services.subagent.gemini import GeminiBackend
-
-    backend = GeminiBackend()
-    result = ConsultResult()
-    stream: dict = {"blocks": [], "open": False}
-    emitted: list[tuple[str, str, dict]] = []
-
-    async def emit(kind, text, raw, meta=None):
-        emitted.append((kind, text, meta or {}))
-
-    for ev in events:
-        await backend._handle_event(ev, result, stream, emit)
-    if not result.final_text:
-        result.final_text = "\n\n".join(b for b in stream["blocks"] if b.strip()).strip()
-    return result, emitted
-
-
-@pytest.mark.asyncio
-async def test_gemini_deltas_accumulate_and_tools_split_blocks() -> None:
-    events = [
-        {"type": "init", "timestamp": "t", "session_id": "g1", "model": "gemini-pro"},
-        {"type": "message", "role": "user", "content": "the echoed prompt"},
-        {"type": "message", "role": "assistant", "content": "Let me ", "delta": True},
-        {"type": "message", "role": "assistant", "content": "check.", "delta": True},
-        {
-            "type": "tool_use",
-            "tool_name": "Shell",
-            "tool_id": "c1",
-            "parameters": {"command": "ls"},
-        },
-        {"type": "tool_result", "tool_id": "c1", "status": "success", "output": "a.py"},
-        {"type": "message", "role": "assistant", "content": "Found it.", "delta": True},
-        {"type": "result", "timestamp": "t", "status": "success"},
-    ]
-    result, emitted = await _drive_gemini(events)
-
-    assert result.session_id == "g1"
-    # The user echo is dropped; deltas grow one row per block.
-    texts = [(t, m.get("merge_id")) for k, t, m in emitted if k == "text"]
-    assert texts == [
-        ("Let me", "txt:0"),
-        ("Let me check.", "txt:0"),
-        ("Found it.", "txt:1"),  # the tool_use closed block 0
-    ]
-    assert ("tool", "Shell(ls)") in [(k, t) for k, t, _ in emitted]
-    assert ("tool_result", "a.py") in [(k, t) for k, t, _ in emitted]
-    # No aggregated message event exists — the final answer is the joined blocks.
-    assert result.final_text == "Let me check.\n\nFound it."
-    assert result.success is True
-
-
-@pytest.mark.asyncio
-async def test_gemini_warning_is_log_and_error_result_fails() -> None:
-    events = [
-        {"type": "error", "severity": "warning", "message": "slow network"},
-        {"type": "error", "severity": "error", "message": "quota exhausted"},
-        {"type": "result", "status": "error", "error": {"type": "x", "message": "quota exhausted"}},
-    ]
-    result, emitted = await _drive_gemini(events)
-    kinds = [k for k, _, _ in emitted]
-    assert kinds == ["log", "error"]
-    assert result.success is False
-    assert "quota" in result.error
 
 
 # ---- Kimi CLI: command building + line parsing --------------------------------
@@ -1357,3 +1612,45 @@ async def test_server_registry_shutdown_terminates_everything() -> None:
     await srv.shutdown_servers()
     assert srv._servers == {}
     assert proc.terminated is True
+
+
+@pytest.mark.asyncio
+async def test_native_partner_consult_stop_and_parent_cancellation(monkeypatch):
+    import asyncio
+
+    from deeptutor.services.subagent.partner import PartnerBackend
+
+    manager = _FakePartnerManager()
+    entered = asyncio.Event()
+
+    async def slow(*args, **kwargs):
+        entered.set()
+        await asyncio.Event().wait()
+
+    manager.send_message = slow
+    _patch_manager(monkeypatch, manager)
+
+    async def on_event(event):
+        pass
+
+    task = asyncio.create_task(
+        PartnerBackend().consult("question", partner_id="paul", on_event=on_event)
+    )
+    await entered.wait()
+    # Native Stop cancels the same turn the consultation is awaiting.
+    manager.live.task.cancel()
+    result = await asyncio.wait_for(task, 1)
+    assert not result.success
+    assert "stopped" in result.error.lower()
+    assert not manager.live.subscribers
+
+    entered.clear()
+    task = asyncio.create_task(
+        PartnerBackend().consult("again", partner_id="paul", on_event=on_event)
+    )
+    await entered.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert manager.live.task.cancelled()
+    assert not manager.live.subscribers

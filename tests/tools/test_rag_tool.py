@@ -44,9 +44,12 @@ class TestPipelineFactory:
         assert {p["id"] for p in pipelines} == {
             DEFAULT_PROVIDER,
             "pageindex",
+            "pageindex-oss",
             "graphrag",
             "lightrag",
             "lightrag-server",
+            "ima",
+            "weknora",
         }
 
     def test_get_pipeline_returns_singleton(self) -> None:
@@ -79,9 +82,12 @@ class TestRAGServiceClassHelpers:
         assert {p["id"] for p in providers} == {
             DEFAULT_PROVIDER,
             "pageindex",
+            "pageindex-oss",
             "graphrag",
             "lightrag",
             "lightrag-server",
+            "ima",
+            "weknora",
         }
 
     def test_has_provider_default_true(self) -> None:

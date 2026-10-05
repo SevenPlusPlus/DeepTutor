@@ -135,6 +135,33 @@ async def test_non_numeric_catalog_dim_does_not_block_probe() -> None:
 
 
 @pytest.mark.asyncio
+async def test_probe_event_redacts_endpoint_query_credentials() -> None:
+    runner = ConfigTestRunner()
+    run = _make_run()
+    catalog: dict[str, Any] = {}
+    model: dict[str, Any] = {"dimension": ""}
+    resolved = _resolved_stub(dim=0)
+    resolved.base_url = "https://api.example.test/v1/embeddings?key=secret"
+    resolved.effective_url = resolved.base_url
+    fake_client = MagicMock()
+    fake_client.embed = AsyncMock(return_value=[[0.5] * 8, [0.6] * 8])
+
+    with (
+        patch(
+            "deeptutor.services.config.test_runner.resolve_embedding_runtime_config",
+            return_value=resolved,
+        ),
+        patch("deeptutor.services.embedding.client.EmbeddingClient", return_value=fake_client),
+        patch.object(runner, "_persist_embedding_dimension", return_value=catalog),
+    ):
+        await runner._test_embedding(run, model, catalog)
+
+    messages = "\n".join(str(event.get("message", "")) for event in run.events)
+    assert "secret" not in messages
+    assert "%5BREDACTED%5D" in messages
+
+
+@pytest.mark.asyncio
 async def test_empty_vector_still_fatal() -> None:
     runner = ConfigTestRunner()
     run = _make_run()
@@ -414,3 +441,35 @@ async def test_capabilities_event_carries_active_dim_source() -> None:
     payload = caps[0]
     assert payload["active_dim"] == 1024
     assert payload["active_dim_source"] == "detected"
+
+
+@pytest.mark.asyncio
+async def test_draft_probe_does_not_save_or_return_a_replacement_catalog() -> None:
+    """Testing another provider must not apply it or erase unrelated pending edits."""
+    runner = ConfigTestRunner()
+    run = TestRun(id="draft-run", service="embedding", persist_results=False)
+    model = {"model": "draft-model", "dimension": "3072"}
+    catalog = {"future_field": "preserved"}
+    client = MagicMock()
+    client.embed = AsyncMock(return_value=[[0.1] * 1024, [0.2] * 1024])
+    with (
+        patch(
+            "deeptutor.services.config.test_runner.resolve_embedding_runtime_config",
+            return_value=_resolved_stub(),
+        ),
+        patch("deeptutor.services.embedding.client.EmbeddingClient", return_value=client),
+        patch.object(runner, "_persist_embedding_dimension") as persist,
+    ):
+        await runner._test_embedding(run, model, catalog)
+    persist.assert_not_called()
+    assert not any(event["type"] == "catalog" for event in run.events)
+    assert any(event.get("detected_dim") == 1024 for event in run.events)
+    assert model["dimension"] == "3072"
+    assert catalog == {"future_field": "preserved"}
+
+
+def test_supplied_catalog_marks_the_entire_run_as_a_draft() -> None:
+    runner = ConfigTestRunner()
+    with patch("deeptutor.services.config.test_runner.threading.Thread"):
+        run = runner.start("embedding", {"services": {}})
+    assert run.persist_results is False

@@ -1,8 +1,9 @@
 """Subagent settings — the consult budget and per-backend permission knobs.
 
 Stored as ``data/user/settings/subagent.json`` (same convention as the other
-runtime settings files). Everything has a safe default so the feature works the
-moment a CLI is detected, with no configuration step required.
+runtime settings files). Everything has a safe default so local backends work
+the moment a CLI is detected; remote backends remain unavailable until their
+endpoint and credential source are configured.
 
 * ``consult_budget`` — the user-facing "max rounds": the maximum number of times
   DeepTutor may put a question to the subagent in one turn. Enforced
@@ -36,17 +37,18 @@ CONSULT_BUDGET_MAX = 12
 @dataclass(slots=True)
 class BackendConfig:
     enabled: bool = True
-    # Model + reasoning effort the agent runs with. Empty = the CLI's own
-    # default. Set from the /settings page; the option lists are synced live
-    # from the CLI (models/efforts change over time). CC: --model / --effort;
-    # Codex: -m / -c model_reasoning_effort.
+    # Model + reasoning effort the agent runs with. Empty = the backend's own
+    # default. Set from the /settings page; local option lists can be synced
+    # live because models/efforts change over time. CC: --model / --effort;
+    # Codex: -m / -c model_reasoning_effort; Hermes remote: request fields.
     model: str = ""
     effort: str = ""
     # Instruction injected so the agent knows it's being consulted
     # programmatically (be concise, self-contained, don't ask follow-ups).
     # CC: --append-system-prompt. Empty = none.
     system_prompt: str = ""
-    # Claude Code: --permission-mode value. "bypassPermissions" never stalls and
+    # Claude Code / Grok CLI: --permission-mode. Grok defaults to "dontAsk"
+    # through default_backend_config. Claude's "bypassPermissions" never stalls and
     # lets the agent act autonomously on the user's own machine (the explicit
     # trust model of "connect my local CLI"). Codex ignores this field.
     permission_mode: str = "bypassPermissions"
@@ -59,18 +61,26 @@ class BackendConfig:
     network_access: bool = False
     # Codex: --ephemeral — don't persist the session under ~/.codex/sessions.
     ephemeral: bool = False
-    # Kimi / opencode / MiMo: answer the CLI's permission asks affirmatively so
-    # a headless run never stalls (kimi --yolo; the opencode family's
-    # permission.asked replies). Same trust model as CC's bypassPermissions.
+    # Kimi / Hermes / opencode / MiMo: answer the CLI's permission asks
+    # affirmatively so a headless run never stalls (kimi/hermes --yolo; the
+    # opencode family's permission.asked replies). Same trust model as CC's
+    # bypassPermissions.
     auto_approve: bool = True
     # Kimi: stream the model's thinking (--thinking / --no-thinking). The
     # opencode family always streams reasoning over its event bus.
     thinking: bool = True
     # Forward image attachments from the chat turn to the agent (CC image input
-    # / Codex -i / Gemini @path / opencode-family file parts). Off by default —
-    # the user opts in per backend. Kimi has no headless image input.
+    # / Codex -i / Hermes --image / opencode-family file parts).
+    # Off by default — the user opts in per backend. Kimi has no headless image
+    # input; OpenClaw and DeepSeek receive opted-in paths as file references.
     forward_images: bool = False
     extra_args: list[str] = field(default_factory=list)
+    # Remote Hermes gateway connection. Credentials stay in the environment;
+    # ``api_key_env`` is only the name read at request time.
+    base_url: str = ""
+    api_key_env: str = "DEEPTUTOR_HERMES_REMOTE_API_KEY"
+    profile: str = ""
+    idle_timeout_seconds: int = 600
 
 
 @dataclass(slots=True)
@@ -79,17 +89,17 @@ class SubagentSettings:
     backends: dict[str, BackendConfig] = field(default_factory=dict)
 
     def backend(self, kind: str) -> BackendConfig:
-        return self.backends.get(kind, BackendConfig())
+        return self.backends.get(kind, default_backend_config(kind))
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "consult_budget": self.consult_budget,
-            "backends": {kind: _backend_to_dict(cfg) for kind, cfg in self.backends.items()},
+            "backends": {kind: _backend_to_dict(kind, cfg) for kind, cfg in self.backends.items()},
         }
 
 
-def _backend_to_dict(cfg: BackendConfig) -> dict[str, Any]:
-    return {
+def _backend_to_dict(kind: str, cfg: BackendConfig) -> dict[str, Any]:
+    payload = {
         "enabled": cfg.enabled,
         "model": cfg.model,
         "effort": cfg.effort,
@@ -104,6 +114,16 @@ def _backend_to_dict(cfg: BackendConfig) -> dict[str, Any]:
         "forward_images": cfg.forward_images,
         "extra_args": list(cfg.extra_args),
     }
+    if kind == "hermes_remote":
+        payload.update(
+            {
+                "base_url": cfg.base_url,
+                "api_key_env": cfg.api_key_env,
+                "profile": cfg.profile,
+                "idle_timeout_seconds": cfg.idle_timeout_seconds,
+            }
+        )
+    return payload
 
 
 def _coerce_budget(value: Any) -> int:
@@ -114,11 +134,20 @@ def _coerce_budget(value: Any) -> int:
     return max(CONSULT_BUDGET_MIN, min(CONSULT_BUDGET_MAX, n))
 
 
-def _coerce_backend(raw: Any) -> BackendConfig:
-    base = BackendConfig()
+def default_backend_config(kind: str) -> BackendConfig:
+    """Backend-specific defaults without changing existing CLI permissions."""
+    return BackendConfig(permission_mode="dontAsk") if kind == "grok" else BackendConfig()
+
+
+def _coerce_backend(raw: Any, kind: str = "") -> BackendConfig:
+    base = default_backend_config(kind)
     if not isinstance(raw, dict):
         return base
     extra = raw.get("extra_args")
+    try:
+        idle_timeout = int(raw.get("idle_timeout_seconds", base.idle_timeout_seconds))
+    except (TypeError, ValueError):
+        idle_timeout = base.idle_timeout_seconds
     return BackendConfig(
         enabled=bool(raw.get("enabled", base.enabled)),
         model=str(raw.get("model") or "").strip(),
@@ -133,6 +162,10 @@ def _coerce_backend(raw: Any) -> BackendConfig:
         thinking=bool(raw.get("thinking", base.thinking)),
         forward_images=bool(raw.get("forward_images", base.forward_images)),
         extra_args=[str(a) for a in extra] if isinstance(extra, list) else [],
+        base_url=str(raw.get("base_url") or "").strip(),
+        api_key_env=str(raw.get("api_key_env") or base.api_key_env).strip() or base.api_key_env,
+        profile=str(raw.get("profile") or "").strip(),
+        idle_timeout_seconds=max(1, min(86_400, idle_timeout)),
     )
 
 
@@ -146,7 +179,7 @@ def settings_from_dict(raw: Any) -> SubagentSettings:
     backends: dict[str, BackendConfig] = {}
     if isinstance(backends_raw, dict):
         for kind, cfg in backends_raw.items():
-            backends[str(kind)] = _coerce_backend(cfg)
+            backends[str(kind)] = _coerce_backend(cfg, str(kind))
     return SubagentSettings(
         consult_budget=_coerce_budget(raw.get("consult_budget") if isinstance(raw, dict) else None),
         backends=backends,
@@ -178,6 +211,7 @@ def get_consult_budget() -> int:
 
 __all__ = [
     "BackendConfig",
+    "default_backend_config",
     "SubagentSettings",
     "DEFAULT_CONSULT_BUDGET",
     "CONSULT_BUDGET_MIN",

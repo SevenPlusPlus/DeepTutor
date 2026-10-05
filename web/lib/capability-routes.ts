@@ -1,3 +1,4 @@
+import { LEARNING_HUB } from "@/lib/learning-routes";
 /**
  * Model capability a feature depends on. As of the multi-user release, the only
  * per-user-grantable model capability is the LLM — embedding/search are shared
@@ -19,18 +20,16 @@ export const ROUTE_CAPABILITIES: ReadonlyArray<{
   prefix: string;
   capability: Capability;
 }> = [
-  { prefix: "/home", capability: "llm" },
+  { prefix: "/chat", capability: "llm" },
   { prefix: "/partners", capability: "llm" },
   { prefix: "/co-writer", capability: "llm" },
-  { prefix: "/book", capability: "llm" },
-  { prefix: "/space/learning", capability: "llm" }, // Mastery Path
-  { prefix: "/playground", capability: "llm" },
+  { prefix: LEARNING_HUB, capability: "llm" },
 ];
 
 /**
  * Returns the capability required for a pathname, or null if none is needed.
  * Matches on a path-segment boundary (exact, or prefix followed by "/") so a
- * sibling route like "/booket" can never be swallowed by the "/book" prefix.
+ * sibling route like "/booket" can never be swallowed by the BOOKS_HOME prefix.
  */
 export function capabilityForPath(pathname: string): Capability | null {
   const match = ROUTE_CAPABILITIES.find(

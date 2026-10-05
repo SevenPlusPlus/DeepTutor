@@ -8,6 +8,24 @@ from typing import Any
 
 from deeptutor.services.provider_registry import find_by_name
 
+# What a conversation-level override (#641) is allowed to ask for. This is a
+# request-validation vocabulary, deliberately the union of every level any
+# provider understands — `services/llm/reasoning_params.py` is what maps a
+# level onto a given provider's actual knob, and the per-backend `efforts`
+# lists in `services/subagent/models.py` describe what each subagent CLI
+# accepts. Neither of those is interchangeable with this one. Not every
+# provider/model supports every value, so callers that can offer a narrower,
+# model-specific list should filter before submitting a selection.
+VALID_REASONING_EFFORTS: tuple[str, ...] = (
+    "none",
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+)
+
 
 @dataclass(frozen=True, slots=True)
 class LLMSelection:
@@ -15,10 +33,17 @@ class LLMSelection:
 
     The selection intentionally carries IDs only. Provider secrets stay in the
     server-side catalog and are resolved only at runtime.
+
+    ``reasoning_effort`` is an optional per-conversation override (#641):
+    when set, it takes precedence over the profile/model's own
+    ``reasoning_effort`` default for calls made with this selection. ``None``
+    means "no override" — the existing profile/global/provider default
+    resolution applies unchanged.
     """
 
     profile_id: str
     model_id: str
+    reasoning_effort: str | None = None
 
     @classmethod
     def from_payload(cls, value: Any) -> "LLMSelection | None":
@@ -35,10 +60,21 @@ class LLMSelection:
             return None
         if not profile_id or not model_id:
             raise ValueError("Invalid LLM selection: profile_id and model_id are required.")
-        return cls(profile_id=profile_id, model_id=model_id)
+
+        reasoning_effort = str(value.get("reasoning_effort") or "").strip().lower() or None
+        if reasoning_effort is not None and reasoning_effort not in VALID_REASONING_EFFORTS:
+            raise ValueError(
+                "Invalid LLM selection: unsupported reasoning_effort "
+                f"{reasoning_effort!r}. Expected one of "
+                f"{', '.join(VALID_REASONING_EFFORTS)}."
+            )
+        return cls(profile_id=profile_id, model_id=model_id, reasoning_effort=reasoning_effort)
 
     def to_dict(self) -> dict[str, str]:
-        return {"profile_id": self.profile_id, "model_id": self.model_id}
+        payload = {"profile_id": self.profile_id, "model_id": self.model_id}
+        if self.reasoning_effort:
+            payload["reasoning_effort"] = self.reasoning_effort
+        return payload
 
 
 def _coerce_int(value: Any) -> int | None:
@@ -84,14 +120,21 @@ def list_llm_options(catalog: dict[str, Any]) -> dict[str, Any]:
             if not model_id or not model_value:
                 continue
 
+            from deeptutor.services.config.provider_links import resolve_profile_provider
+
+            effective = resolve_profile_provider(catalog, "llm", profile, model)
+            model_provider = str(effective.get("binding") or provider)
+            model_spec = find_by_name(model_provider)
             option: dict[str, Any] = {
                 "profile_id": profile_id,
                 "model_id": model_id,
-                "profile_name": profile_name,
+                "profile_name": str(effective.get("name") or profile_name),
                 "model_name": str(model.get("name") or model_value).strip(),
                 "model": model_value,
-                "provider": provider,
-                "provider_label": provider_label,
+                "provider": model_provider,
+                "provider_label": model_spec.label
+                if model_spec
+                else model_provider or provider_label,
                 "is_active_default": (
                     profile_id == active_profile_id and model_id == active_model_id
                 ),
@@ -101,6 +144,18 @@ def list_llm_options(catalog: dict[str, Any]) -> dict[str, Any]:
                 context_window = _coerce_int(model.get("context_window_tokens"))
             if context_window is not None:
                 option["context_window"] = context_window
+            reasoning_effort = str(model.get("reasoning_effort") or "").strip().lower()
+            if reasoning_effort:
+                option["reasoning_effort"] = reasoning_effort
+            supported_levels = model.get("codex_supported_reasoning_levels")
+            if isinstance(supported_levels, list):
+                option["supported_reasoning_efforts"] = [
+                    str(level).strip().lower() for level in supported_levels if str(level).strip()
+                ]
+            declared = model.get("capabilities") or {}
+            for capability in ("reasoning", "vision"):
+                if type(declared.get(capability)) is bool:
+                    option[f"declared_{capability}"] = declared[capability]
             options.append(option)
 
     return {
@@ -135,4 +190,9 @@ def apply_llm_selection_to_catalog(
     raise ValueError("Invalid LLM selection: selected profile/model was not found.")
 
 
-__all__ = ["LLMSelection", "apply_llm_selection_to_catalog", "list_llm_options"]
+__all__ = [
+    "LLMSelection",
+    "VALID_REASONING_EFFORTS",
+    "apply_llm_selection_to_catalog",
+    "list_llm_options",
+]

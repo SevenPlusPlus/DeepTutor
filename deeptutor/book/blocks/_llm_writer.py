@@ -18,6 +18,12 @@ from deeptutor.services.llm import (
 from deeptutor.services.llm import (
     complete as llm_complete,
 )
+from deeptutor.services.llm import (
+    stream as llm_stream,
+)
+from deeptutor.services.llm.reasoning_params import RETRY_REASONING_EFFORT
+from deeptutor.services.llm.structured_retry import json_payload_is_usable
+from deeptutor.services.llm.types import StreamOutcome
 from deeptutor.services.prompt.language import append_language_directive
 from deeptutor.utils.json_parser import parse_json_response
 
@@ -31,6 +37,7 @@ async def llm_text(
     response_format: dict[str, Any] | None = None,
     language: str | None = None,
     reasoning_effort: str | None = None,
+    outcome: StreamOutcome | None = None,
 ) -> str:
     """Run an LLM completion for a Book block / agent.
 
@@ -52,16 +59,21 @@ async def llm_text(
         kwargs["response_format"] = response_format
     if reasoning_effort is not None:
         kwargs["reasoning_effort"] = reasoning_effort
-    response = await llm_complete(
-        prompt=user_prompt,
-        system_prompt=system_prompt,
-        model=model,
-        api_key=config.api_key,
-        base_url=config.base_url,
-        api_version=getattr(config, "api_version", None),
-        binding=binding,
+    call_kwargs = {
+        "prompt": user_prompt,
+        "system_prompt": system_prompt,
+        "model": model,
+        "api_key": config.api_key,
+        "base_url": config.base_url,
+        "api_version": getattr(config, "api_version", None),
+        "binding": binding,
         **kwargs,
-    )
+    }
+    if outcome is None:
+        response = await llm_complete(**call_kwargs)
+    else:
+        chunks = [chunk async for chunk in llm_stream(**call_kwargs, outcome=outcome)]
+        response = "".join(chunks)
     return clean_thinking_tags(response, binding, model).strip()
 
 
@@ -79,15 +91,6 @@ def _normalize_json_payload(data: Any, expected_key: str | None = None) -> dict[
             return data[0]
 
     return {}
-
-
-def _json_has_expected(data: dict[str, Any], expected_key: str | None) -> bool:
-    if not data:
-        return False
-    if expected_key is None:
-        return True
-    value = data.get(expected_key)
-    return bool(value)
 
 
 def _strip_thinking_preamble(text: str) -> str:
@@ -139,21 +142,28 @@ async def llm_json(
     temperature: float = 0.4,
     language: str | None = None,
     expected_key: str | None = None,
+    reasoning_effort: str | None = None,
 ) -> dict[str, Any]:
     """Run a structured JSON LLM call with robust parsing and one safe retry.
 
     Reasoning models can spend the whole response budget on hidden/scratchpad
     tokens and leave the visible JSON object empty. For structured book blocks
     we first honor the configured reasoning mode, then retry once with low
-    reasoning effort if parsing fails or the expected top-level key is missing.
-    ("low" rather than "minimal": local/Qwen models served via vLLM reject
-    "minimal", and "minimal" disables thinking entirely.)
+    reasoning effort if the provider stops at the output cap, parsing fails,
+    or the expected top-level key is missing
+    — the same rule the Book pipeline agents apply via
+    :func:`deeptutor.services.llm.structured_retry.json_with_reasoning_retry`.
+
+    A caller that supplies an effort of its own (book reader-facing blocks pass
+    ``"none"``) keeps that value on the retry, so a round that was deliberately
+    run without thinking cannot silently re-enable it.
 
     Also strips thinking/reasoning preamble text (common with local models)
     before JSON parsing.
     """
 
     async def _once(reasoning_effort: str | None) -> dict[str, Any]:
+        outcome = StreamOutcome()
         raw = await llm_text(
             user_prompt=user_prompt,
             system_prompt=system_prompt,
@@ -162,7 +172,10 @@ async def llm_json(
             temperature=temperature,
             language=language,
             reasoning_effort=reasoning_effort,
+            outcome=outcome,
         )
+        if outcome.truncated:
+            return {}
         # First pass: strip thinking preamble (Qwen outputs thinking text
         # even with json_object format), then let parse_json_response handle
         # what remains via its json-repair fallback.
@@ -175,13 +188,14 @@ async def llm_json(
         recovered = parse_json_response(raw, fallback={})
         return _normalize_json_payload(recovered, expected_key=expected_key)
 
-    data = await _once(None)
-    if _json_has_expected(data, expected_key):
+    data = await _once(reasoning_effort)
+    if json_payload_is_usable(data, expected_key):
         return data
 
-    retry_data = await _once("low")
-    if _json_has_expected(retry_data, expected_key):
-        retry_data.setdefault("_metadata", {})["reasoning_retry"] = "low"
+    retry_effort = RETRY_REASONING_EFFORT if reasoning_effort is None else reasoning_effort
+    retry_data = await _once(retry_effort)
+    if json_payload_is_usable(retry_data, expected_key):
+        retry_data.setdefault("_metadata", {})["reasoning_retry"] = retry_effort
         return retry_data
     return data or retry_data
 

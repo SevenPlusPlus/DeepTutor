@@ -6,6 +6,8 @@ from typing import Any, Dict
 
 import httpx
 
+from deeptutor.services.embedding.request_options import should_send_embedding_dimensions
+from deeptutor.services.llm.error_mapping import parse_retry_after_seconds
 from deeptutor.services.llm.openai_http_client import disable_ssl_verify_enabled
 
 from .base import (
@@ -19,6 +21,29 @@ from .base import (
 logger = logging.getLogger(__name__)
 
 
+def rejects_absent_encoding_format(status_code: int, body: str) -> bool:
+    """Whether *body* is a gateway refusing the request for lacking the param.
+
+    Two gateways impose opposite requirements and neither can be satisfied by
+    picking a default: SiliconFlow rejects `encoding_format` when it is
+    present (#651, which is why it is omitted), and ModelScope rejects it when
+    absent — it reads the missing field as `''` and answers `encoding_format
+    must be 'float' or 'base64', got ''` (#934). Both constraints belong to
+    the gateway, not to the model, so a model-family rule would key off the
+    wrong thing: the same Qwen3-Embedding weights are served by gateways on
+    both sides of the disagreement.
+
+    Recover from what the provider actually said instead. The body must name
+    the parameter *and* name the value we are about to send, so a gateway
+    complaining that `encoding_format` is unsupported does not trigger a retry
+    that would fail the same way.
+    """
+    if status_code != 400:
+        return False
+    lowered = body.lower()
+    return "encoding_format" in lowered and "float" in lowered
+
+
 class OpenAICompatibleEmbeddingAdapter(BaseEmbeddingAdapter):
     NO_KEY_SENTINEL = "sk-no-key-required"
 
@@ -30,10 +55,16 @@ class OpenAICompatibleEmbeddingAdapter(BaseEmbeddingAdapter):
 
     def _auth_api_key(self) -> str:
         """Return a real API key, suppressing local-provider placeholder keys."""
-        key = str(self.api_key or "").strip()
+        key = self._key_pool.next() if self._key_pool else str(self.api_key or "").strip()
         if key == self.NO_KEY_SENTINEL:
             return ""
         return key
+
+    def _set_auth_header(self, headers: dict[str, str], api_key: str) -> None:
+        header = "api-key" if self.api_version else "Authorization"
+        headers.pop(header, None)
+        if api_key:
+            headers[header] = api_key if self.api_version else f"Bearer {api_key}"
 
     @staticmethod
     def _extract_embeddings_from_response(data: Any) -> list[list[float]]:
@@ -127,29 +158,22 @@ class OpenAICompatibleEmbeddingAdapter(BaseEmbeddingAdapter):
           OpenAI-style ``dimensions`` parameter — OpenAI ``text-embedding-3*``,
           Qwen3-Embedding, Qwen3-VL-Embedding.
         """
-        if self.send_dimensions is True:
-            return True
-        if self.send_dimensions is False:
-            return False
-        if not model_name:
-            return False
-        lname = model_name.lower()
-        if lname.startswith("text-embedding-3"):
-            return True
-        if "qwen3-embedding" in lname or "qwen3-vl-embedding" in lname:
-            return True
-        return False
+        return should_send_embedding_dimensions(
+            binding=None,
+            model=model_name,
+            # ``embed`` only calls this hook when a request dimension exists.
+            # Keep the historical one-argument override contract used by
+            # provider adapters such as Gemini.
+            dimension=self.dimensions or 1,
+            send_dimensions=self.send_dimensions,
+        )
 
     async def embed(self, request: EmbeddingRequest) -> EmbeddingResponse:
         import asyncio
 
         headers = {"Content-Type": "application/json"}
         api_key = self._auth_api_key()
-        if self.api_version:
-            if api_key:
-                headers["api-key"] = api_key
-        elif api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
+        self._set_auth_header(headers, api_key)
         headers.update({str(k): str(v) for k, v in self.extra_headers.items()})
 
         # Multimodal: pass `contents` through as `input` only for model names
@@ -171,6 +195,9 @@ class OpenAICompatibleEmbeddingAdapter(BaseEmbeddingAdapter):
         # `encoding_format` is opt-in: omit it by default (request default is
         # None) because several OpenAI-compatible gateways (e.g. SiliconFlow)
         # reject the param with HTTP 400. Only forward an explicit choice.
+        # Do not add a default here for the gateways that require the param —
+        # that trades #934 for #651. The retry below recovers those from the
+        # provider's own refusal, leaving every working config untouched.
         if request.encoding_format:
             payload["encoding_format"] = request.encoding_format
 
@@ -201,7 +228,11 @@ class OpenAICompatibleEmbeddingAdapter(BaseEmbeddingAdapter):
             pool=10.0,
         )
         last_exc: Exception | None = None
-        for attempt in range(1 + self._MAX_RETRIES):
+        rate_limit_retries = 0
+        # 槽位必须 > 限流重试上限：429 的 continue 也消耗 attempt，若循环
+        # 先耗尽而 last_exc 仍为 None，会静默落到循环外的 data 引用上
+        # （UnboundLocalError）。多给 4 个槽位兜住 8 轮限流 + 网络重试。
+        for attempt in range(1 + max(self._MAX_RETRIES, 10)):
             try:
                 async with httpx.AsyncClient(
                     timeout=timeout, verify=not disable_ssl_verify_enabled()
@@ -210,18 +241,49 @@ class OpenAICompatibleEmbeddingAdapter(BaseEmbeddingAdapter):
 
                     # Handle rate limiting (429) with retry
                     if response.status_code == 429:
-                        retry_after = float(response.headers.get("Retry-After", 0))
-                        wait = max(retry_after, self._RATE_LIMIT_BACKOFF * (2**attempt))
-                        logger.warning(
-                            f"Rate limited (429) on attempt {attempt + 1}/{1 + self._MAX_RETRIES}, "
-                            f"retrying in {wait:.1f}s..."
+                        if self._key_pool:
+                            self._key_pool.mark_429(api_key)
+                        # 滑动窗口 429 是瞬态的：长跑（全库 reindex 数小时）里
+                        # 单次 429 不该报废整跑。最多 8 轮，每轮等窗口滑过
+                        # （Retry-After 优先，无头保守 60s）。月度额度耗尽的
+                        # 429 会连挂 8 轮后仍然 raise，不会无限空转。
+                        if rate_limit_retries < 8:
+                            rate_limit_retries += 1
+                            retry_after = parse_retry_after_seconds(
+                                response.headers.get("Retry-After")
+                            )
+                            await asyncio.sleep(max(retry_after or 0.0, 60))
+                            try:
+                                api_key = self._auth_api_key()
+                            except RuntimeError:
+                                # 池内 key 全在冷却（KeyPool 冷却 60s）。
+                                # 等冷却期过后再取一次；仍取不到才认输。
+                                await asyncio.sleep(65)
+                                api_key = self._auth_api_key()
+                            self._set_auth_header(headers, api_key)
+                            continue
+                        retry_after = parse_retry_after_seconds(response.headers.get("Retry-After"))
+                        raise EmbeddingProviderError(
+                            "Embedding provider remained rate limited after key rotation"
+                            + (f" (Retry-After: {retry_after:g}s)" if retry_after else ""),
+                            status=429,
+                            model=model,
+                            url=url,
+                            provider="openai_compat",
                         )
-                        await asyncio.sleep(wait)
-                        last_exc = Exception("HTTP 429 Too Many Requests")
-                        continue
 
                     if response.status_code >= 400:
                         body_text = response.text
+                        if "encoding_format" not in payload and rejects_absent_encoding_format(
+                            response.status_code, body_text
+                        ):
+                            payload["encoding_format"] = "float"
+                            logger.info(
+                                "Gateway requires an explicit `encoding_format`; "
+                                "retrying once with 'float' (%s)",
+                                url,
+                            )
+                            continue
                         logger.error(f"HTTP {response.status_code} from {url}: {body_text[:2000]}")
                         raise EmbeddingProviderError(
                             f"Embedding provider returned HTTP {response.status_code}",

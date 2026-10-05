@@ -24,7 +24,9 @@ class DocumentType(Enum):
     DOCX = "docx"
     SPREADSHEET = "spreadsheet"
     PRESENTATION = "presentation"
+    EPUB = "epub"
     IMAGE = "image"
+    DOCUMENT = "document"
     UNKNOWN = "unknown"
 
 
@@ -42,14 +44,15 @@ class FileTypeRouter:
     """File type router for the RAG pipeline.
 
     Classifies files before processing to route them to appropriate handlers:
-    - PDF / Office files -> parser-based text extraction
+    - PDF / Office / EPUB files -> parser-based text extraction
     - Text files -> Direct read (fast, simple)
     - Unsupported -> Skip with warning
     """
 
     PDF_EXTENSIONS = {".pdf"}
     OFFICE_EXTENSIONS = {".docx", ".xlsx", ".pptx"}
-    PARSER_EXTENSIONS = PDF_EXTENSIONS | OFFICE_EXTENSIONS
+    EPUB_EXTENSIONS = {".epub"}
+    PARSER_EXTENSIONS = PDF_EXTENSIONS | OFFICE_EXTENSIONS | EPUB_EXTENSIONS
 
     TEXT_EXTENSIONS = {
         # Plain text & docs
@@ -179,7 +182,7 @@ class FileTypeRouter:
     @classmethod
     def get_document_type(cls, file_path: str) -> DocumentType:
         """Classify a single file by its type."""
-        ext = Path(file_path).suffix.lower()
+        ext = cls.get_extension(file_path)
 
         if ext in cls.PDF_EXTENSIONS:
             return DocumentType.PDF
@@ -191,11 +194,19 @@ class FileTypeRouter:
             return DocumentType.SPREADSHEET
         elif ext == ".pptx":
             return DocumentType.PRESENTATION
+        elif ext in cls.EPUB_EXTENSIONS:
+            return DocumentType.EPUB
         elif ext in cls.IMAGE_EXTENSIONS:
             return DocumentType.IMAGE
+        elif ext in cls.get_parser_extensions():
+            # Formats added by optional rich parsers, such as OpenDocument,
+            # legacy Office, mail, archives, audio/video and scientific data.
+            return DocumentType.DOCUMENT
         else:
             if cls._is_text_file(file_path):
                 return DocumentType.TEXT
+            if cls.active_parser_accepts_any_format():
+                return DocumentType.DOCUMENT
             return DocumentType.UNKNOWN
 
     @classmethod
@@ -229,6 +240,8 @@ class FileTypeRouter:
                 DocumentType.DOCX,
                 DocumentType.SPREADSHEET,
                 DocumentType.PRESENTATION,
+                DocumentType.EPUB,
+                DocumentType.DOCUMENT,
             ):
                 parser_files.append(path)
             elif doc_type in (DocumentType.TEXT, DocumentType.MARKDOWN):
@@ -281,12 +294,20 @@ class FileTypeRouter:
         for encoding in cls.TEXT_DECODING_CANDIDATES:
             try:
                 with open(file_path, "r", encoding=encoding) as f:
-                    return f.read()
+                    text = f.read()
+                break
             except UnicodeDecodeError:
                 continue
 
-        with open(file_path, "rb") as f:
-            return f.read().decode("utf-8", errors="replace")
+        else:
+            with open(file_path, "rb") as f:
+                text = f.read().decode("utf-8", errors="replace")
+
+        if Path(file_path).suffix.lower() == ".bib":
+            from deeptutor.utils.bibtex_converter import bibtex_to_markdown
+
+            return bibtex_to_markdown(text, Path(file_path).stem)
+        return text
 
     @classmethod
     def needs_parser(cls, file_path: str) -> bool:
@@ -297,7 +318,9 @@ class FileTypeRouter:
             DocumentType.DOCX,
             DocumentType.SPREADSHEET,
             DocumentType.PRESENTATION,
+            DocumentType.EPUB,
             DocumentType.IMAGE,
+            DocumentType.DOCUMENT,
         )
 
     @classmethod
@@ -309,7 +332,43 @@ class FileTypeRouter:
     @classmethod
     def get_supported_extensions(cls) -> set[str]:
         """Get the set of all supported file extensions."""
-        return cls.PARSER_EXTENSIONS | cls.TEXT_EXTENSIONS | cls.IMAGE_EXTENSIONS
+        return cls.get_parser_extensions() | cls.TEXT_EXTENSIONS | cls.IMAGE_EXTENSIONS
+
+    @classmethod
+    def get_parser_extensions(cls) -> set[str]:
+        """Parser-backed formats accepted by the knowledge-base pipeline.
+
+        The built-in set remains separate because ``document_extractor`` uses
+        it for text-only parsing. Lightweight format helpers contribute every
+        adapter's current upstream list without importing optional engines.
+        """
+        from deeptutor.services.parsing.engines.formats import known_parser_formats
+
+        return cls.PARSER_EXTENSIONS | set(known_parser_formats())
+
+    @classmethod
+    def active_parser_accepts_any_format(cls) -> bool:
+        """Whether the selected engine delegates format detection at runtime."""
+        try:
+            from deeptutor.services.parsing.engines.factory import get_parser
+            from deeptutor.services.parsing.service import get_parse_service
+
+            service = get_parse_service()
+            return not get_parser(service.active_engine()).supported_formats()
+        except Exception:
+            return False
+
+    @classmethod
+    def get_extension(
+        cls, file_path: str | Path, extensions: set[str] | frozenset[str] | None = None
+    ) -> str:
+        """Return the longest recognized suffix, including compound suffixes."""
+        name = Path(file_path).name.lower()
+        candidates = extensions if extensions is not None else cls.get_supported_extensions()
+        matches = [
+            extension.lower() for extension in candidates if name.endswith(extension.lower())
+        ]
+        return max(matches, key=len) if matches else Path(file_path).suffix.lower()
 
     @classmethod
     def has_supported_extension(cls, file_path: str | Path) -> bool:
@@ -318,7 +377,10 @@ class FileTypeRouter:
         The check is case-insensitive so files such as ``Report.PDF`` are
         discovered consistently across upload, CLI, folder sync, and reindex.
         """
-        return Path(file_path).suffix.lower() in cls.get_supported_extensions()
+        if cls.active_parser_accepts_any_format():
+            return True
+        supported = cls.get_supported_extensions()
+        return cls.get_extension(file_path, supported) in supported
 
     @classmethod
     def collect_supported_files(cls, directory: str | Path, recursive: bool = False) -> list[Path]:

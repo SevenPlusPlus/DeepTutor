@@ -29,7 +29,6 @@ import websockets
 from deeptutor.partners.bus.events import OutboundMessage
 from deeptutor.partners.bus.queue import MessageBus
 from deeptutor.partners.channels.base import BaseChannel
-from deeptutor.partners.config.paths import get_media_dir
 from deeptutor.partners.config.schema import DeliveryOverrides
 from deeptutor.partners.helpers import split_message
 
@@ -117,6 +116,13 @@ class MattermostChannel(BaseChannel):
         """Connect to the Mattermost WebSocket, reconnecting on drop."""
         if not self.config.server_url or not self.config.bot_token:
             logger.error("Mattermost serverUrl/botToken not configured")
+            self.set_setup_state(
+                "action_required",
+                message=(
+                    "Required fields are missing. Complete the channel configuration "
+                    "and save again."
+                ),
+            )
             return
 
         self._running = True
@@ -131,6 +137,7 @@ class MattermostChannel(BaseChannel):
 
         while self._running:
             try:
+                self.set_setup_state("connecting")
                 # Resolve our own identity first — we must know it to skip our
                 # own posts (echo loop) and to detect @-mentions.
                 if not await self._ensure_bot_identity():
@@ -143,11 +150,16 @@ class MattermostChannel(BaseChannel):
                     self._ws = ws
                     await self._authenticate()
                     logger.info("Mattermost WebSocket connected as @{}", self._bot_username)
+                    self.set_setup_state("connected")
                     await self._event_loop()
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.warning("Mattermost WebSocket error: {}", e)
+                self.set_setup_state(
+                    "error",
+                    message="Channel connection failed; the listener will retry.",
+                )
             finally:
                 self._ws = None
 
@@ -323,7 +335,7 @@ class MattermostChannel(BaseChannel):
         file_ids = post.get("file_ids") or []
         if not file_ids or not self._http:
             return []
-        media_dir = get_media_dir("mattermost")
+        media_dir = self.media_dir()
         paths: list[str] = []
         for file_id in file_ids:
             local = await self._download_file(str(file_id), media_dir)

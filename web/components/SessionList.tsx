@@ -5,20 +5,18 @@ import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { type SessionSummary } from "@/lib/session-api";
 import { normalizeMessageContent, truncateText } from "@/lib/message-content";
-import { SessionAvatar } from "@/components/sidebar/SessionAvatar";
+import {
+  deriveSessionMark,
+  sessionKindOf,
+  SessionAvatar,
+} from "@/components/sidebar/SessionAvatar";
+import { useUnreadSessions } from "@/lib/session-unread";
 import {
   formatRelativeTime,
   getDayGroupKey,
   type DayGroupKey,
 } from "@/lib/relative-time";
-
-type SessionRuntimeStatus =
-  | "idle"
-  | "running"
-  | "completed"
-  | "failed"
-  | "cancelled"
-  | "rejected";
+import { isPlaceholderSessionTitle } from "@/lib/session-title";
 
 interface SessionListProps {
   sessions: SessionSummary[];
@@ -28,45 +26,6 @@ interface SessionListProps {
   onSelect: (sessionId: string) => void | Promise<void>;
   onRename: (sessionId: string, title: string) => void | Promise<void>;
   onDelete: (sessionId: string) => void | Promise<void>;
-}
-
-function StatusIndicator({ status }: { status?: SessionRuntimeStatus }) {
-  if (!status || status === "idle") return null;
-
-  if (status === "running") {
-    return (
-      <span className="relative ml-1.5 inline-flex shrink-0">
-        <span className="session-pulse absolute inline-flex h-2 w-2 rounded-full bg-blue-400/60" />
-        <span className="relative inline-flex h-2 w-2 rounded-full bg-blue-500" />
-      </span>
-    );
-  }
-
-  if (status === "completed") {
-    return (
-      <span className="ml-1.5 inline-flex h-2 w-2 shrink-0 rounded-full bg-emerald-400/50 ring-1 ring-emerald-400/10" />
-    );
-  }
-
-  if (status === "failed") {
-    return (
-      <span className="ml-1.5 inline-flex h-2 w-2 shrink-0 rounded-full bg-rose-500/80 ring-1 ring-rose-500/20" />
-    );
-  }
-
-  if (status === "rejected") {
-    return (
-      <span className="ml-1.5 inline-flex h-2 w-2 shrink-0 rounded-full bg-fuchsia-500/80 ring-1 ring-fuchsia-500/20" />
-    );
-  }
-
-  if (status === "cancelled") {
-    return (
-      <span className="ml-1.5 inline-flex h-2 w-2 shrink-0 rounded-full bg-amber-500/70 ring-1 ring-amber-500/20" />
-    );
-  }
-
-  return null;
 }
 
 export default function SessionList({
@@ -82,15 +41,16 @@ export default function SessionList({
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draftTitle, setDraftTitle] = useState("");
 
+  // Reads the set only. `WorkspaceSidebar` owns keeping it current, because
+  // it holds the runtime status map this is derived from and it outlives every
+  // list that renders from it.
+  const unread = useUnreadSessions();
+
   // The sentinel the backend writes when a session is created and not
   // yet renamed by the LLM title generator. We swap it for a localized
   // "New chat" string with a breathing animation so the sidebar shows
   // something "alive" while the title is being generated in the
   // background instead of a literal English sentinel.
-  const isPlaceholderTitle = (raw: string | null | undefined): boolean => {
-    const value = (raw ?? "").trim();
-    return value === "" || value === "New conversation";
-  };
   const placeholderLabel = t("New chat");
 
   // The group-key tokens stay stable; only the translated labels change.
@@ -140,7 +100,7 @@ export default function SessionList({
           {[1, 2, 3].map((i) => (
             <div
               key={i}
-              className="h-4 w-3/4 animate-pulse rounded bg-[var(--muted)]/40"
+              className="h-4 w-3/4 animate-pulse rounded bg-muted/40"
             />
           ))}
         </div>
@@ -151,7 +111,7 @@ export default function SessionList({
         {[1, 2, 3].map((i) => (
           <div
             key={i}
-            className="h-10 animate-pulse rounded-md bg-[var(--muted)]/60"
+            className="h-10 animate-pulse rounded-md bg-muted/60"
           />
         ))}
       </div>
@@ -161,13 +121,13 @@ export default function SessionList({
   if (sessions.length === 0) {
     if (compact) {
       return (
-        <div className="px-3 py-4 text-center text-[11px] text-[var(--muted-foreground)]/70">
+        <div className="px-3 py-4 text-center text-[11px] text-muted-foreground/70">
           {t("No conversations yet")}
         </div>
       );
     }
     return (
-      <div className="px-3 py-4 text-center text-[11px] text-[var(--muted-foreground)]/70">
+      <div className="px-3 py-4 text-center text-[11px] text-muted-foreground/70">
         {t("No conversations yet")}
       </div>
     );
@@ -194,15 +154,16 @@ export default function SessionList({
               tabIndex={0}
               className={`group flex items-center gap-2 rounded-lg px-2.5 py-1.5 transition-colors ${
                 active
-                  ? "bg-[var(--background)]/50 text-[var(--foreground)]"
-                  : "text-[var(--muted-foreground)] hover:bg-[var(--background)]/40 hover:text-[var(--foreground)]"
+                  ? "bg-background/50 text-[var(--foreground)]"
+                  : "text-[var(--foreground)] hover:bg-background/40"
               }`}
             >
               <SessionAvatar
                 sessionId={session.session_id}
-                running={session.status === "running"}
+                mark={deriveSessionMark(session, undefined, unread)}
+                kind={sessionKindOf(session)}
                 className={
-                  session.status === "running" ? "text-blue-500" : "opacity-70"
+                  session.status === "running" ? "opacity-100" : "opacity-80"
                 }
               />
               {isEditing ? (
@@ -219,11 +180,11 @@ export default function SessionList({
                     }
                   }}
                   onClick={(event) => event.stopPropagation()}
-                  className="min-w-0 flex-1 rounded border border-[var(--border)] bg-[var(--background)] px-1.5 py-px text-[12px] text-[var(--foreground)] outline-none focus:ring-1 focus:ring-[var(--primary)]/40"
+                  className="min-w-0 flex-1 rounded border border-[var(--border)] bg-[var(--background)] px-1.5 py-px text-[12px] text-[var(--foreground)] outline-none focus:ring-1 focus:ring-primary/40"
                 />
-              ) : isPlaceholderTitle(session.title) ? (
+              ) : isPlaceholderSessionTitle(session.title) ? (
                 <span
-                  className={`dt-breathing-text min-w-0 flex-1 truncate text-[13px] italic text-[var(--muted-foreground)] ${active ? "font-medium" : ""}`}
+                  className={`dt-breathing-text min-w-0 flex-1 truncate text-[13px] italic text-[var(--foreground)] ${active ? "font-medium" : ""}`}
                 >
                   {placeholderLabel}
                 </span>
@@ -284,7 +245,7 @@ export default function SessionList({
           <div className="mb-1.5 px-2 text-[11px] font-semibold uppercase tracking-widest text-[var(--muted-foreground)]">
             {groupLabels[key]}
           </div>
-          <div className="divide-y divide-[var(--border)]/45 overflow-hidden rounded-lg border border-[var(--border)]/45 bg-[var(--card)]/50">
+          <div className="divide-y divide-border/45 overflow-hidden rounded-lg border border-border/45 bg-card/50">
             {items.map((session) => {
               const active = activeSessionId === session.session_id;
               const isEditing = editingId === session.session_id;
@@ -302,8 +263,8 @@ export default function SessionList({
                   tabIndex={0}
                   className={`group relative w-full px-3 py-2.5 text-left transition-colors duration-150 ${
                     active
-                      ? "bg-[var(--background)]/70 text-[var(--foreground)]"
-                      : "text-[var(--muted-foreground)] hover:bg-[var(--background)]/50 hover:text-[var(--foreground)]"
+                      ? "bg-background/70 text-[var(--foreground)]"
+                      : "text-[var(--foreground)] hover:bg-background/50"
                   }`}
                 >
                   {active && (
@@ -327,13 +288,13 @@ export default function SessionList({
                             }
                           }}
                           onClick={(event) => event.stopPropagation()}
-                          className="w-full rounded border border-[var(--border)] bg-[var(--background)] px-2 py-0.5 text-[12px] text-[var(--foreground)] outline-none focus:ring-1 focus:ring-[var(--primary)]/40"
+                          className="w-full rounded border border-[var(--border)] bg-[var(--background)] px-2 py-0.5 text-[12px] text-[var(--foreground)] outline-none focus:ring-1 focus:ring-primary/40"
                         />
                       ) : (
                         <div className="flex items-center">
-                          {isPlaceholderTitle(session.title) ? (
+                          {isPlaceholderSessionTitle(session.title) ? (
                             <span
-                              className={`dt-breathing-text line-clamp-1 min-w-0 flex-1 text-[12px] italic leading-snug text-[var(--muted-foreground)] ${
+                              className={`dt-breathing-text line-clamp-1 min-w-0 flex-1 text-[12px] italic leading-snug text-[var(--foreground)] ${
                                 active ? "font-medium" : "font-normal"
                               }`}
                             >
@@ -348,7 +309,6 @@ export default function SessionList({
                               {session.title}
                             </span>
                           )}
-                          <StatusIndicator status={session.status} />
                         </div>
                       )}
                       {!isEditing && (

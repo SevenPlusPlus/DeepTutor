@@ -3,7 +3,10 @@ from __future__ import annotations
 import importlib.util
 import json
 from pathlib import Path
+import re
 import sys
+
+import yaml
 
 
 def _load_module():
@@ -62,6 +65,25 @@ def test_render_docker_env_uses_defaults_for_missing_or_invalid_json(tmp_path: P
     assert values["DEEPTUTOR_DOCKER_POCKETBASE_PORT"] == "8090"
 
 
+def test_workspace_host_prepares_nested_outputs(tmp_path: Path) -> None:
+    module = _load_module()
+    root = module.ensure_workspace_host(str(tmp_path / "chosen"))
+
+    assert root == (tmp_path / "chosen").resolve()
+    assert (root / "outputs").is_dir()
+
+
+def test_compose_maps_one_stable_content_workspace() -> None:
+    root = Path(__file__).resolve().parents[2]
+    source = (root / "docker-compose.yml").read_text(encoding="utf-8")
+
+    assert "DEEPTUTOR_WORKSPACE_HOST:-./data/user/workspace" in source
+    assert "DEEPTUTOR_WORKSPACE_ROOT=/workspace" in source
+    assert ':/workspace:ro"' in source
+    assert '/outputs:/workspace/outputs"' in source
+    assert "DEEPTUTOR_RUNNER_ALLOWED_WORKDIRS=/workspace/outputs" in source
+
+
 def test_compose_files_do_not_consume_legacy_env_names() -> None:
     root = Path(__file__).resolve().parents[2]
     for name in ("docker-compose.yml", "docker-compose.ghcr.yml"):
@@ -71,6 +93,77 @@ def test_compose_files_do_not_consume_legacy_env_names() -> None:
         assert "\n      - BACKEND_PORT" not in content
         assert "\n      - AUTH_ENABLED" not in content
         assert "DEEPTUTOR_DOCKER_BACKEND_PORT" in content
+
+
+def _compose_service(root: Path, name: str) -> dict:
+    content = yaml.safe_load((root / name).read_text(encoding="utf-8"))
+    return content["services"]["deeptutor"]
+
+
+def _volume_targets(root: Path, name: str) -> set[str | None]:
+    volumes = _compose_service(root, name).get("volumes", [])
+    return {
+        (volume.get("target") if isinstance(volume, dict) else str(volume).split(":")[1])
+        for volume in volumes
+    }
+
+
+def test_default_compose_files_do_not_reserve_codex_callback_ports() -> None:
+    """The fixed Codex callback ports are opt-in because other clients use them."""
+    root = Path(__file__).resolve().parents[2]
+    for name in ("docker-compose.yml", "docker-compose.ghcr.yml", "compose.yaml"):
+        ports = _compose_service(root, name).get("ports", [])
+        assert not any(re.search(r"(^|:)145[57]:", str(port)) for port in ports), name
+
+
+def test_codex_oauth_overlay_forwards_loopback_callbacks_to_frontend() -> None:
+    """The temporary overlay routes browser callbacks through the Web broker."""
+    root = Path(__file__).resolve().parents[2]
+    ports = _compose_service(root, "compose.codex-oauth.yaml")["ports"]
+
+    assert set(ports) == {
+        "127.0.0.1:1455:${DEEPTUTOR_DOCKER_FRONTEND_PORT:-3782}",
+        "127.0.0.1:1457:${DEEPTUTOR_DOCKER_FRONTEND_PORT:-3782}",
+    }
+
+
+def test_official_container_manifests_persist_codex_credentials() -> None:
+    """Container recreation must retain data/system, where Codex tokens live."""
+    root = Path(__file__).resolve().parents[2]
+    for name in ("docker-compose.yml", "docker-compose.ghcr.yml", "compose.yaml"):
+        targets = _volume_targets(root, name)
+        assert "/app/data" in targets or "/app/data/system" in targets, name
+
+
+def test_ghcr_compose_persists_complete_data_tree() -> None:
+    """Forced recreation must retain every workspace as well as OAuth tokens."""
+    root = Path(__file__).resolve().parents[2]
+    volumes = _compose_service(root, "docker-compose.ghcr.yml")["volumes"]
+
+    assert "./data:/app/data" in volumes
+
+
+def test_container_docs_use_temporary_codex_oauth_bridge() -> None:
+    """README links to the canonical guide, which owns the exact commands."""
+    root = Path(__file__).resolve().parents[2]
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    guide = (root / "docs-for-user" / "CONTAINERIZATION.md").read_text(encoding="utf-8")
+    heading = "### Temporary local Codex OAuth bridge"
+    assert heading in guide, f"{heading} was renamed; update this test with it"
+    section = guide.split(heading, 1)[1].split("\n### ", 1)[0]
+    normalized_section = " ".join(section.replace("\\\n", " ").split())
+
+    assert "docs-for-user/CONTAINERIZATION.md#temporary-local-codex-oauth-bridge" in readme
+    assert "127.0.0.1:1455:3782" in section
+    assert "127.0.0.1:1457:3782" in section
+    for base_file in ("docker-compose.yml", "docker-compose.ghcr.yml"):
+        assert (
+            f"-f {base_file} -f compose.codex-oauth.yaml up -d --force-recreate deeptutor"
+        ) in normalized_section
+    assert (
+        "podman compose -f compose.yaml -f compose.codex-oauth.yaml "
+        "up -d --force-recreate deeptutor"
+    ) in normalized_section
 
 
 def test_dockerfile_is_json_driven_without_bundle_sed() -> None:
@@ -118,6 +211,23 @@ def test_supervisord_runs_as_root_with_unprivileged_children() -> None:
         assert "user=deeptutor" in section, (
             f"supervisord program '{name}' must run as deeptutor (user=deeptutor)"
         )
+
+
+def test_entrypoint_fail_fasts_on_unwritable_data_volume_without_root_app() -> None:
+    """Unraid bind mounts owned by a non-1000 host user must not start the app
+    as root, and chown failure must not be swallowed into a later misleading
+    'Knowledge base not initialized' error (#1458).
+    """
+    root = Path(__file__).resolve().parents[2]
+    content = (root / "Dockerfile").read_text(encoding="utf-8")
+
+    assert "chown -R deeptutor:deeptutor /app/data 2>/dev/null || true" not in content
+    assert "check_container_data_volume" in content
+    assert 'PUID="${PUID:-${DEEPTUTOR_PUID:-1000}}"' in content
+    assert "skipping PUID remap" in content
+    assert "PUID/PGID must be non-root" in content
+    assert "gosu deeptutor /usr/bin/supervisord" not in content
+    assert "user=deeptutor" in content
 
 
 def test_frontend_api_is_url_agnostic_passthrough() -> None:

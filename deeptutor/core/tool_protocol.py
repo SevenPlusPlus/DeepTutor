@@ -18,6 +18,7 @@ class ToolParameter:
     """One parameter in a tool's function-calling schema.
 
     Attributes:
+        sensitive: Withhold the value from the trace event (see the field).
         items: Inner JSON Schema for ``type="array"`` parameters. **Required
             by strict providers (Gemini, Anthropic)** even though OpenAI
             silently tolerates its absence — leaving it out causes a 400
@@ -33,6 +34,13 @@ class ToolParameter:
     default: Any = None
     enum: list[str] | None = None
     items: dict[str, Any] | None = None
+    #: Keep this argument's value out of the ``tool_call`` event the trace
+    #: renders. The model still sends it and the tool still receives it — this
+    #: only stops it from being shown back to the person the tool is acting
+    #: for. Set it where the value is something they must not see: the
+    #: ``expected_answer`` of a question they are about to be asked is on
+    #: screen, one disclosure triangle away, for as long as that trace exists.
+    sensitive: bool = False
 
     def to_schema(self) -> dict[str, Any]:
         """Convert to JSON Schema property dict."""
@@ -143,6 +151,9 @@ class ToolResult:
             ``ask_user`` to keep the turn alive across the user's
             answer instead of ending and starting a new turn.
             Shape mirrors ``AskUserPayload.to_dict()``.
+        model_message: Request-local multimodal context attached after this
+            tool result. The loop must never add it to durable messages or
+            user-facing stream metadata.
     """
 
     content: str = ""
@@ -151,6 +162,9 @@ class ToolResult:
     success: bool = True
     terminate_turn: bool = False
     pause_for_user: dict[str, Any] | None = None
+    # Private model-only follow-up (for example verified source image parts).
+    # Never copy this into stream events, citation rows, or persisted metadata.
+    model_message: dict[str, Any] | None = field(default=None, repr=False)
 
     def __str__(self) -> str:
         return self.content
@@ -165,6 +179,42 @@ class ToolEventSink(Protocol):
         message: str = "",
         metadata: dict[str, Any] | None = None,
     ) -> None: ...
+
+
+class ToolLookup(Protocol):
+    """Read-only surface of a tool registry, as its consumers actually use it.
+
+    Extracted so a *view* over the process registry — e.g. one that overlays
+    a single user's external-provider tools on top of the shared ones — is a
+    legal argument everywhere a registry is accepted, instead of something
+    that only happens to duck-type past the annotations.
+
+    Deliberately excludes the mutating half (``register`` / ``unregister`` /
+    ``load_builtins``): only the process-global registry owns tool lifetime,
+    and a view must not be able to pretend otherwise.
+    """
+
+    def get(self, name: str) -> "BaseTool | None": ...
+
+    def get_enabled(self, names: list[str]) -> list["BaseTool"]: ...
+
+    def get_definitions(self, names: list[str] | None = None) -> list[ToolDefinition]: ...
+
+    def deferred_tools(self) -> list["BaseTool"]: ...
+
+    def list_tools(self) -> list[str]: ...
+
+    def build_openai_schemas(self, names: list[str] | None = None) -> list[dict[str, Any]]: ...
+
+    def build_prompt_text(
+        self,
+        names: list[str],
+        format: str = "list",
+        language: str = "en",
+        **opts: Any,
+    ) -> str: ...
+
+    async def execute(self, name: str, /, **kwargs: Any) -> Any: ...
 
 
 class BaseTool(ABC):
@@ -215,3 +265,24 @@ class BaseTool(ABC):
     @property
     def name(self) -> str:
         return self.get_definition().name
+
+
+def provider_identity(tool: Any) -> tuple[str, str]:
+    """``(kind, provider_id)`` for a tool from an external provider.
+
+    Returns ``("", "")`` for a built-in. ``kind`` is ``"mcp"`` or ``"cli"``;
+    ``provider_id`` names the specific server or app.
+
+    Lives in this bottom layer because two very different consumers need the
+    same answer: the deferred-tool manifest groups by it, and the dispatcher
+    puts it on every tool call's trace metadata so the UI can say *which* MCP
+    server or CLI app is running rather than showing a mangled tool name. A
+    frontend that recovered this by parsing ``mcp_<server>_<tool>`` would guess
+    wrong the moment a server's name contains an underscore.
+
+    ``server_name`` is the pre-provider spelling of ``provider_id`` and is still
+    read as a fallback, so an adapter that predates the rename keeps working.
+    """
+    kind = str(getattr(tool, "provider_kind", "") or "")
+    provider_id = str(getattr(tool, "provider_id", "") or getattr(tool, "server_name", "") or "")
+    return kind, provider_id

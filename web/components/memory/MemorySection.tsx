@@ -1,5 +1,8 @@
 "use client";
 
+import Tooltip from "@/shared/ui/Tooltip";
+import { browserStorage } from "@/shared/storage";
+
 import dynamic from "next/dynamic";
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -24,6 +27,8 @@ import {
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { apiFetch, apiUrl } from "@/lib/api";
+import { knowledgeBaseRoute, notebookRoute } from "@/lib/resource-routes";
+import { bookRoute } from "@/lib/learning-routes";
 import SpaceSectionHeader from "@/components/space/SpaceSectionHeader";
 
 const MarkdownRenderer = dynamic(
@@ -220,17 +225,15 @@ function entityDeepLinkUrl(surface: Surface, ent: Entity): string | null {
   const m = ent.metadata || {};
   switch (surface) {
     case "chat":
-      return `/home/${encodeURIComponent(ent.id)}`;
+      return `/chat/${encodeURIComponent(ent.id)}`;
     case "cowriter":
       return `/co-writer/${encodeURIComponent(ent.id)}`;
     case "notebook": {
       const nbId = asString(m.notebook_id);
-      return nbId
-        ? `/space/notebooks?notebook=${encodeURIComponent(nbId)}`
-        : "/space/notebooks";
+      return notebookRoute(nbId);
     }
     case "book":
-      return `/book?book=${encodeURIComponent(ent.id)}`;
+      return bookRoute(ent.id);
     case "partner": {
       // Partner entity.id is `partnerId:sessionKey`. Deep-link to the partner.
       const partnerId = asString(m.partner_id) || ent.id.split(":")[0];
@@ -242,11 +245,11 @@ function entityDeepLinkUrl(surface: Surface, ent: Entity): string | null {
       // Quiz entity.id is `session:question`. Deep-link to the session.
       const sessionId = asString(m.session_id) || ent.id.split(":")[0];
       return sessionId
-        ? `/?session=${encodeURIComponent(sessionId)}`
-        : "/space/questions";
+        ? `/chat/${encodeURIComponent(sessionId)}`
+        : "/learning/practice";
     }
     case "kb":
-      return `/knowledge?kb=${encodeURIComponent(ent.id)}`;
+      return knowledgeBaseRoute(ent.id);
   }
   return null;
 }
@@ -283,7 +286,7 @@ export default function MemorySection({
   useEffect(() => {
     if (typeof window === "undefined") return;
     setDismissedBackup(
-      window.localStorage.getItem("dt:memory:banner-dismissed") || null,
+      browserStorage.readRaw("local", "dt:memory:banner-dismissed") || null,
     );
   }, []);
 
@@ -293,7 +296,11 @@ export default function MemorySection({
   const dismissArchivedBanner = useCallback(() => {
     if (!latestBackup) return;
     if (typeof window !== "undefined") {
-      window.localStorage.setItem("dt:memory:banner-dismissed", latestBackup);
+      browserStorage.writeRaw(
+        "local",
+        "dt:memory:banner-dismissed",
+        latestBackup,
+      );
     }
     setDismissedBackup(latestBackup);
   }, [latestBackup]);
@@ -301,7 +308,7 @@ export default function MemorySection({
   const loadOverview = useCallback(async () => {
     setLoading(true);
     try {
-      const res = await apiFetch(apiUrl("/api/v1/memory/overview"));
+      const res = await apiFetch(apiUrl("/api/memory/overview"));
       const data = (await res.json()) as OverviewResponse;
       setOverview(data);
     } catch (e) {
@@ -326,7 +333,7 @@ export default function MemorySection({
     setEditing(false);
     setStream([]);
     try {
-      const res = await apiFetch(apiUrl(`/api/v1/memory/doc/${layer}/${key}`));
+      const res = await apiFetch(apiUrl(`/api/memory/doc/${layer}/${key}`));
       const data = await res.json();
       const md = String(data?.content || "");
       setContent(md);
@@ -341,7 +348,7 @@ export default function MemorySection({
     setBusy(true);
     try {
       await apiFetch(
-        apiUrl(`/api/v1/memory/doc/${selected.layer}/${selected.key}`),
+        apiUrl(`/api/memory/doc/${selected.layer}/${selected.key}`),
         {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
@@ -371,7 +378,7 @@ export default function MemorySection({
     setStream([]);
     try {
       const res = await apiFetch(
-        apiUrl(`/api/v1/memory/doc/${selected.layer}/${selected.key}/update`),
+        apiUrl(`/api/memory/doc/${selected.layer}/${selected.key}/update`),
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -604,29 +611,30 @@ function TabStrip({ tab, onChange, l2Count, l3Count, t }: TabStripProps) {
         {tabs.map(({ key, label, count, hint }) => {
           const active = tab === key;
           return (
-            <button
-              key={key}
-              onClick={() => onChange(key)}
-              title={hint}
-              className={`relative px-4 py-2 text-[13px] font-medium transition-colors ${
-                active
-                  ? "text-[var(--foreground)]"
-                  : "text-[var(--muted-foreground)] hover:text-[var(--foreground)]"
-              }`}
-            >
-              {label}
-              {typeof count === "number" && (
-                <span className="ml-2 rounded-full bg-[var(--muted)] px-1.5 py-0.5 text-[10px] font-normal text-[var(--muted-foreground)]">
-                  {count}
-                </span>
-              )}
-              {active && (
-                <span
-                  aria-hidden
-                  className="absolute -bottom-px left-0 right-0 h-[2px] bg-[var(--foreground)]"
-                />
-              )}
-            </button>
+            <Tooltip key={key} label={hint} side="top">
+              <button
+                onClick={() => onChange(key)}
+                aria-label={label}
+                className={`relative px-4 py-2 text-[13px] font-medium transition-colors ${
+                  active
+                    ? "text-[var(--foreground)]"
+                    : "text-[var(--muted-foreground)] hover:text-[var(--foreground)]"
+                }`}
+              >
+                {label}
+                {typeof count === "number" && (
+                  <span className="ml-2 rounded-full bg-[var(--muted)] px-1.5 py-0.5 text-[10px] font-normal text-[var(--muted-foreground)]">
+                    {count}
+                  </span>
+                )}
+                {active && (
+                  <span
+                    aria-hidden
+                    className="absolute -bottom-px left-0 right-0 h-[2px] bg-[var(--foreground)]"
+                  />
+                )}
+              </button>
+            </Tooltip>
           );
         })}
       </div>
@@ -681,7 +689,7 @@ export function L1View({
   const loadSnapshot = useCallback(async () => {
     setLoadingSnapshot(true);
     try {
-      const res = await apiFetch(apiUrl(`/api/v1/memory/snapshot/${surface}`));
+      const res = await apiFetch(apiUrl(`/api/memory/snapshot/${surface}`));
       const data = (await res.json()) as SnapshotResponse;
       setSnapshot(data);
     } catch (e) {
@@ -695,7 +703,7 @@ export function L1View({
     setLoadingChanges(true);
     try {
       const res = await apiFetch(
-        apiUrl(`/api/v1/memory/snapshot/${surface}/changes`),
+        apiUrl(`/api/memory/snapshot/${surface}/changes`),
       );
       const data = (await res.json()) as ChangesResponse;
       setChanges(data.changes);
@@ -710,7 +718,7 @@ export function L1View({
     if (surface !== "kb") return;
     setLoadingQueries(true);
     try {
-      const res = await apiFetch(apiUrl("/api/v1/memory/trace/kb?limit=200"));
+      const res = await apiFetch(apiUrl("/api/memory/trace/kb?limit=200"));
       const data = (await res.json()) as KbQueriesResponse;
       setKbQueries(data.events);
     } catch (e) {
@@ -770,7 +778,7 @@ export function L1View({
     setRefreshing(true);
     try {
       const res = await apiFetch(
-        apiUrl(`/api/v1/memory/snapshot/${surface}/refresh`),
+        apiUrl(`/api/memory/snapshot/${surface}/refresh`),
         { method: "POST" },
       );
       const data = await res.json();
@@ -807,28 +815,35 @@ export function L1View({
           })}
           <div className="ml-auto flex items-center gap-2">
             {pendingCount > 0 && (
-              <span
-                className="inline-flex items-center gap-1 rounded-full border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 text-[11px] font-medium text-amber-700 dark:text-amber-300"
-                title={t(
+              <Tooltip
+                label={t(
                   "Workspace changed since last refresh. Click Refresh to commit these to the changes log.",
                 )}
+                side="top"
               >
-                {t("{{n}} pending", { n: pendingCount })}
-              </span>
+                <span
+                  role="note"
+                  tabIndex={0}
+                  className="inline-flex items-center gap-1 rounded-full border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 text-[11px] font-medium text-amber-700 dark:text-amber-300"
+                >
+                  {t("{{n}} pending", { n: pendingCount })}
+                </span>
+              </Tooltip>
             )}
-            <button
-              onClick={() => void onRefresh()}
-              disabled={refreshing}
-              className="inline-flex items-center gap-1.5 rounded-md border border-[var(--border)] bg-[var(--card)] px-2.5 py-1 text-[12px] text-[var(--muted-foreground)] hover:text-[var(--foreground)] disabled:opacity-50"
-              title={t("Re-scan workspace and record any changes")}
-            >
-              {refreshing ? (
-                <Loader2 className="h-3 w-3 animate-spin" />
-              ) : (
-                <RefreshCw className="h-3 w-3" />
-              )}
-              {t("Refresh")}
-            </button>
+            <Tooltip label={t("Re-scan workspace and record any changes")} side="top">
+              <button
+                onClick={() => void onRefresh()}
+                disabled={refreshing}
+                className="inline-flex items-center gap-1.5 rounded-md border border-[var(--border)] bg-[var(--card)] px-2.5 py-1 text-[12px] text-[var(--muted-foreground)] hover:text-[var(--foreground)] disabled:opacity-50"
+              >
+                {refreshing ? (
+                  <Loader2 className="h-3 w-3 animate-spin" />
+                ) : (
+                  <RefreshCw className="h-3 w-3" />
+                )}
+                {t("Refresh")}
+              </button>
+            </Tooltip>
           </div>
         </div>
       )}
@@ -838,28 +853,35 @@ export function L1View({
         {compact && (
           <div className="flex items-center gap-2">
             {pendingCount > 0 && (
-              <span
-                className="inline-flex items-center gap-1 rounded-full border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 text-[11px] font-medium text-amber-700 dark:text-amber-300"
-                title={t(
+              <Tooltip
+                label={t(
                   "Workspace changed since last refresh. Click Refresh to commit these to the changes log.",
                 )}
+                side="top"
               >
-                {t("{{n}} pending", { n: pendingCount })}
-              </span>
+                <span
+                  role="note"
+                  tabIndex={0}
+                  className="inline-flex items-center gap-1 rounded-full border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 text-[11px] font-medium text-amber-700 dark:text-amber-300"
+                >
+                  {t("{{n}} pending", { n: pendingCount })}
+                </span>
+              </Tooltip>
             )}
-            <button
-              onClick={() => void onRefresh()}
-              disabled={refreshing}
-              className="inline-flex items-center gap-1.5 rounded-md border border-[var(--border)] bg-[var(--card)] px-2.5 py-1 text-[12px] text-[var(--muted-foreground)] hover:text-[var(--foreground)] disabled:opacity-50"
-              title={t("Re-scan workspace and record any changes")}
-            >
-              {refreshing ? (
-                <Loader2 className="h-3 w-3 animate-spin" />
-              ) : (
-                <RefreshCw className="h-3 w-3" />
-              )}
-              {t("Refresh")}
-            </button>
+            <Tooltip label={t("Re-scan workspace and record any changes")} side="top">
+              <button
+                onClick={() => void onRefresh()}
+                disabled={refreshing}
+                className="inline-flex items-center gap-1.5 rounded-md border border-[var(--border)] bg-[var(--card)] px-2.5 py-1 text-[12px] text-[var(--muted-foreground)] hover:text-[var(--foreground)] disabled:opacity-50"
+              >
+                {refreshing ? (
+                  <Loader2 className="h-3 w-3 animate-spin" />
+                ) : (
+                  <RefreshCw className="h-3 w-3" />
+                )}
+                {t("Refresh")}
+              </button>
+            </Tooltip>
           </div>
         )}
       </div>
@@ -1089,12 +1111,13 @@ function EntityRow({ surface, ent, focused, pendingKind, t }: EntityRowProps) {
     <li
       id={entityAnchorId(ref)}
       data-entity-ref={ref}
-      title={t("Open in {{label}}", { label: meta.label })}
     >
       {url ? (
-        <Link href={url} className={rowClass}>
-          {inner}
-        </Link>
+        <Tooltip label={t("Open in {{label}}", { label: meta.label })} as="div" side="top">
+          <Link href={url} className={`${rowClass} border-b-0`}>
+            {inner}
+          </Link>
+        </Tooltip>
       ) : (
         <div className={rowClass}>{inner}</div>
       )}
@@ -1127,12 +1150,15 @@ function PendingBadge({
   } as const;
   const cfg = map[kind];
   return (
-    <span
-      className={`inline-flex items-center rounded-full border px-1.5 py-0 text-[10px] font-medium ${cfg.cls}`}
-      title={t("Pending — not yet committed to changes log")}
-    >
-      {cfg.label}
-    </span>
+    <Tooltip label={t("Pending — not yet committed to changes log")} side="top">
+      <span
+        role="note"
+        tabIndex={0}
+        className={`inline-flex items-center rounded-full border px-1.5 py-0 text-[10px] font-medium ${cfg.cls}`}
+      >
+        {cfg.label}
+      </span>
+    </Tooltip>
   );
 }
 
@@ -1465,7 +1491,7 @@ function StreamPanel({ stages, onDismiss, t }: StreamPanelProps) {
             </span>
             {typeof s.count === "number" && (
               <span className="ml-2 text-[var(--muted-foreground)]">
-                count={s.count}
+                {t("Count: {{count}}", { count: s.count })}
               </span>
             )}
             {s.delta && (
@@ -1480,17 +1506,17 @@ function StreamPanel({ stages, onDismiss, t }: StreamPanelProps) {
             )}
             {s.args && Object.keys(s.args).length > 0 && (
               <div className="mt-1 text-[var(--muted-foreground)]">
-                args: {JSON.stringify(s.args)}
+                {t("Arguments")}: {JSON.stringify(s.args)}
               </div>
             )}
             {s.ops && (
               <div className="mt-1 text-[var(--muted-foreground)]">
-                ops: {s.ops.length}
+                {t("Operations: {{count}}", { count: s.ops.length })}
               </div>
             )}
             {typeof s.ops_emitted === "number" && (
               <div className="mt-1 text-[var(--muted-foreground)]">
-                ops_emitted={s.ops_emitted} · turns={s.turns_used ?? "?"}
+                {t("Emitted operations: {{count}} · Turns: {{turns}}", { count: s.ops_emitted, turns: s.turns_used ?? "?" })}
                 {s.tools_used
                   ? ` · ${Object.entries(s.tools_used)
                       .map(([k, v]) => `${k}=${v}`)
@@ -1500,7 +1526,7 @@ function StreamPanel({ stages, onDismiss, t }: StreamPanelProps) {
             )}
             {s.report && (
               <div className="mt-1 text-[var(--muted-foreground)]">
-                accepted={String(s.report.accepted)}
+                {t("Accepted")}: {s.report.accepted ? t("Yes") : t("No")}
                 {s.report.reason ? ` · ${s.report.reason}` : ""}
               </div>
             )}

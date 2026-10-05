@@ -6,6 +6,10 @@ from collections.abc import Mapping
 import json
 from typing import Any
 
+from deeptutor.services.session.provider_response_state import (
+    normalize_provider_response_state,
+)
+
 _CHAT_TOKEN_LIMIT_ALIASES = ("max_completion_tokens", "max_tokens")
 
 
@@ -27,6 +31,18 @@ def convert_messages(messages: list[dict[str, Any]]) -> tuple[str, list[dict[str
             continue
 
         if role == "assistant":
+            state = normalize_provider_response_state(msg.get("_provider_response_state"))
+            state_items = state.get("responses_output_items") if state is not None else None
+            if not isinstance(state_items, list):
+                legacy_state = normalize_provider_response_state(
+                    {"responses_output_items": msg.get("_responses_output_items")}
+                )
+                state_items = (
+                    legacy_state.get("responses_output_items") if legacy_state is not None else None
+                )
+            if isinstance(state_items, list) and state_items:
+                input_items.extend(dict(item) for item in state_items if isinstance(item, dict))
+                continue
             if isinstance(content, str) and content:
                 input_items.append(
                     {
@@ -83,13 +99,28 @@ def convert_user_message(content: Any) -> dict[str, Any]:
     return {"role": "user", "content": [{"type": "input_text", "text": ""}]}
 
 
-def convert_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Convert OpenAI function calling schemas to Responses API tools."""
+def convert_tools(
+    tools: list[dict[str, Any]],
+    *,
+    native_web_search: bool = False,
+) -> list[dict[str, Any]]:
+    """Convert OpenAI function calling schemas to Responses API tools.
+
+    With ``native_web_search=True`` (providers whose Responses API performs
+    web searches server-side, e.g. DeepSeek), DeepTutor's ``web_search``
+    function tool is declared as the provider's native ``{"type":
+    "web_search"}`` tool instead of a function schema: the server runs the
+    search mid-generation and the response carries ``web_search_call`` items
+    with ``url_citation`` annotations rather than a function call.
+    """
     converted: list[dict[str, Any]] = []
     for tool in tools:
         fn = (tool.get("function") or {}) if tool.get("type") == "function" else tool
         name = fn.get("name")
         if not name:
+            continue
+        if native_web_search and name == "web_search":
+            converted.append({"type": "web_search"})
             continue
         params = fn.get("parameters") or {}
         converted.append(
@@ -101,6 +132,32 @@ def convert_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
             }
         )
     return converted
+
+
+def convert_tool_choice(tool_choice: Any) -> Any:
+    """Convert an OpenAI function-calling ``tool_choice`` for the Responses API.
+
+    The two endpoints name a forced tool differently. Chat Completions nests
+    it — ``{"type": "function", "function": {"name": "ask_user"}}`` — while the
+    Responses API puts the name at the top level. Sending the nested shape to a
+    Responses endpoint is rejected outright ("tool_choice: missing field
+    `name`"), which killed every Ask Questions turn on a Responses-wire
+    provider: that mode forces ``ask_user`` on its first round, so the whole
+    capability failed before the model was ever called.
+
+    Mode strings (``"auto"``, ``"none"``, ``"required"``) and shapes that
+    already name the tool at the top level pass through unchanged, as does
+    anything else — a hosted-tool choice is the provider's to validate, not
+    ours to guess at.
+    """
+    if not isinstance(tool_choice, dict):
+        return tool_choice
+    if tool_choice.get("type") != "function":
+        return tool_choice
+    if tool_choice.get("name"):
+        return tool_choice
+    name = (tool_choice.get("function") or {}).get("name")
+    return {"type": "function", "name": name} if name else tool_choice
 
 
 def split_tool_call_id(tool_call_id: Any) -> tuple[str, str | None]:

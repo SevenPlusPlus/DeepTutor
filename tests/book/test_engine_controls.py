@@ -1,7 +1,15 @@
 from __future__ import annotations
 
 from deeptutor.book.engine import BookEngine
-from deeptutor.book.models import Block, BlockStatus, BlockType, Page, PageStatus
+from deeptutor.book.models import (
+    Block,
+    BlockStatus,
+    BlockType,
+    Book,
+    BookStatus,
+    Page,
+    PageStatus,
+)
 
 
 def test_force_compile_reset_preserves_user_notes() -> None:
@@ -93,3 +101,111 @@ def test_mark_page_error_survives_save_failure() -> None:
     engine._mark_page_error(page, RuntimeError("boom"), prefix="x")
 
     assert page.status == PageStatus.ERROR
+
+
+class _GenerationStorage:
+    def __init__(self, book: Book, pages: list[Page]) -> None:
+        self.book = book
+        self.pages = pages
+
+    def load_book(self, book_id: str) -> Book | None:
+        return self.book
+
+    def list_pages(self, book_id: str) -> list[Page]:
+        return self.pages
+
+
+class _LiveRuntime:
+    """Stands in for ``_BookRuntime`` with a worker that has not finished."""
+
+    class _Pending:
+        @staticmethod
+        def done() -> bool:
+            return False
+
+    worker = _Pending()
+    in_flight: dict[str, object] = {}
+
+
+def test_generation_summary_classifies_retryable_failures() -> None:
+    book = Book(id="bk", status=BookStatus.PAUSED, metadata={"pause_reason": "quota"})
+    pages = [
+        Page(id="ready", status=PageStatus.READY),
+        Page(id="pending", status=PageStatus.PENDING),
+        Page(
+            id="failed",
+            status=PageStatus.ERROR,
+            error="429 rate limit",
+            blocks=[
+                Block(
+                    type=BlockType.TEXT,
+                    status=BlockStatus.ERROR,
+                    error="provider timeout",
+                )
+            ],
+        ),
+    ]
+    engine = BookEngine.__new__(BookEngine)
+    engine.storage = _GenerationStorage(book, pages)
+
+    summary = engine.generation_summary("bk")
+
+    assert summary["pages"]["ready"] == 1
+    assert summary["pages"]["pending"] == 1
+    assert summary["pages"]["error"] == 1
+    assert summary["retryable_pages"] == 2
+    assert summary["failed_blocks"] == 1
+    assert summary["can_resume"] is True
+    assert summary["failure_categories"] == {"rate_limit": 1, "provider": 1}
+
+
+def test_generation_summary_does_not_flag_a_queue_as_retryable() -> None:
+    """A book being compiled right now owes chapters; it has not failed any.
+
+    Counting the queue as "retryable" is what made a healthy book raise a
+    failure warning ("3 chapters can be retried") the moment generation
+    started, on zero errors.
+    """
+
+    book = Book(id="bk", status=BookStatus.COMPILING)
+    pages = [
+        Page(id="ready", status=PageStatus.READY),
+        Page(id="queued", status=PageStatus.PENDING),
+        Page(id="working", status=PageStatus.GENERATING),
+    ]
+    engine = BookEngine.__new__(BookEngine)
+    engine.storage = _GenerationStorage(book, pages)
+    engine._runtimes = {"bk": _LiveRuntime()}
+
+    summary = engine.generation_summary("bk")
+
+    assert summary["working"] is True
+    assert summary["interrupted"] is False
+    assert summary["queued_pages"] == 2
+    assert summary["failed_pages"] == 0
+    assert summary["retryable_pages"] == 0
+    assert summary["can_resume"] is False
+
+
+def test_generation_summary_surfaces_an_abandoned_compile() -> None:
+    """``status == compiling`` outlives the process that set it.
+
+    With no worker behind it the queue is not going to move on its own, so the
+    owed chapters become the reader's problem and need the manual way out.
+    """
+
+    book = Book(id="bk", status=BookStatus.COMPILING)
+    pages = [
+        Page(id="ready", status=PageStatus.READY),
+        Page(id="queued", status=PageStatus.PENDING),
+    ]
+    engine = BookEngine.__new__(BookEngine)
+    engine.storage = _GenerationStorage(book, pages)
+    engine._runtimes = {}
+
+    summary = engine.generation_summary("bk")
+
+    assert summary["working"] is False
+    assert summary["interrupted"] is True
+    assert summary["retryable_pages"] == 1
+    assert summary["can_resume"] is True

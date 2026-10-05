@@ -1,19 +1,29 @@
 "use client";
 
+import Tooltip from "@/shared/ui/Tooltip";
 import { Fragment, useEffect, useState, useCallback } from "react";
 import { useRouter } from "next/navigation";
+import { useTranslation } from "react-i18next";
 import { fetchAuthStatus } from "@/lib/auth";
 import {
+  deleteUsers,
   listUsers,
   deleteUser,
   setUserRole,
   createUser,
+  importUsers,
   type UserRecord,
+  type AccountPreset,
+  type UserImportResult,
 } from "@/lib/admin-api";
 import { GrantEditor } from "@/features/multi-user/components/GrantEditor";
+import { BookPermissionEditor } from "@/features/multi-user/components/BookPermissionEditor";
+import { LearnerProfileEditor } from "@/features/multi-user/components/LearnerProfileEditor";
+import { GuardianRelationshipsEditor } from "@/features/multi-user/components/GuardianRelationshipsEditor";
 import { UserAvatar } from "@/components/UserAvatar";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { filterUsersByQuery } from "@/lib/admin-users";
+import { accountRoleLabelKey } from "@/lib/account-role";
 import {
   Search,
   Shield,
@@ -23,20 +33,21 @@ import {
   RefreshCw,
   ArrowLeft,
   SlidersHorizontal,
+  Upload,
   UserPlus,
   Users,
   X,
 } from "lucide-react";
 import Link from "next/link";
+import { formatDate as formatLocaleDate, type Language } from "@/lib/datetime";
 
-function formatDate(iso: string): string {
+// Delegates to the shared locale mapping so a new UI language only has to be
+// taught to lib/datetime; the guard here is for the empty or unparseable
+// created_at that Intl would throw on.
+function formatDate(iso: string, lang: Language): string {
   if (!iso) return "—";
   try {
-    return new Date(iso).toLocaleDateString(undefined, {
-      year: "numeric",
-      month: "short",
-      day: "numeric",
-    });
+    return formatLocaleDate(new Date(iso), lang);
   } catch {
     return "—";
   }
@@ -44,6 +55,8 @@ function formatDate(iso: string): string {
 
 export default function AdminUsersPage() {
   const router = useRouter();
+  const { t, i18n } = useTranslation();
+  const lang: Language = i18n.language?.startsWith("zh") ? "zh" : "en";
   const [currentUser, setCurrentUser] = useState<string | null>(null);
   const [users, setUsers] = useState<UserRecord[]>([]);
   const [loading, setLoading] = useState(true);
@@ -51,7 +64,11 @@ export default function AdminUsersPage() {
   const [actionError, setActionError] = useState("");
   const [expandedUserId, setExpandedUserId] = useState<string | null>(null);
   const [showCreateDialog, setShowCreateDialog] = useState(false);
+  const [showImportDialog, setShowImportDialog] = useState(false);
   const [query, setQuery] = useState("");
+  const [selectedUsernames, setSelectedUsernames] = useState<string[]>([]);
+  const [showBatchDeleteConfirm, setShowBatchDeleteConfirm] = useState(false);
+  const [batchDeleteBusy, setBatchDeleteBusy] = useState(false);
   const [confirmTarget, setConfirmTarget] = useState<{
     kind: "delete" | "promote" | "demote";
     user: UserRecord;
@@ -59,8 +76,13 @@ export default function AdminUsersPage() {
   const [confirmBusy, setConfirmBusy] = useState(false);
   const [createUsername, setCreateUsername] = useState("");
   const [createPassword, setCreatePassword] = useState("");
+  const [createPreset, setCreatePreset] = useState<AccountPreset>("standard");
   const [createSubmitting, setCreateSubmitting] = useState(false);
   const [createError, setCreateError] = useState("");
+  const [importFile, setImportFile] = useState<File | null>(null);
+  const [importSubmitting, setImportSubmitting] = useState(false);
+  const [importError, setImportError] = useState("");
+  const [importResult, setImportResult] = useState<UserImportResult | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -69,11 +91,11 @@ export default function AdminUsersPage() {
       const data = await listUsers();
       setUsers(data);
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Failed to load users");
+      setError(e instanceof Error ? e.message : t("Failed to load users"));
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [t]);
 
   useEffect(() => {
     fetchAuthStatus().then((status) => {
@@ -93,8 +115,22 @@ export default function AdminUsersPage() {
   function openCreateDialog() {
     setCreateUsername("");
     setCreatePassword("");
+    setCreatePreset("standard");
     setCreateError("");
     setShowCreateDialog(true);
+  }
+
+  function openImportDialog() {
+    setImportFile(null);
+    setImportError("");
+    setImportResult(null);
+    setImportSubmitting(false);
+    setShowImportDialog(true);
+  }
+
+  function closeImportDialog() {
+    if (importSubmitting) return;
+    setShowImportDialog(false);
   }
 
   function closeCreateDialog() {
@@ -108,20 +144,22 @@ export default function AdminUsersPage() {
     setCreateError("");
     const username = createUsername.trim();
     if (!username) {
-      setCreateError("Username is required.");
+      setCreateError(t("Username is required."));
       return;
     }
     if (createPassword.length < 8) {
-      setCreateError("Password must be at least 8 characters.");
+      setCreateError(t("Password must be at least 8 characters."));
       return;
     }
     setCreateSubmitting(true);
     try {
-      await createUser(username, createPassword);
+      await createUser(username, createPassword, createPreset);
       setShowCreateDialog(false);
       await load();
     } catch (e) {
-      setCreateError(e instanceof Error ? e.message : "Failed to create user");
+      setCreateError(
+        e instanceof Error ? e.message : t("Failed to create user"),
+      );
     } finally {
       setCreateSubmitting(false);
     }
@@ -157,11 +195,75 @@ export default function AdminUsersPage() {
         e instanceof Error
           ? e.message
           : confirmTarget.kind === "delete"
-            ? "Failed to delete user"
-            : "Failed to update role",
+            ? t("Failed to delete user")
+            : t("Failed to update role"),
       );
     } finally {
       setConfirmBusy(false);
+    }
+  }
+
+  async function handleImportSubmit(event: React.FormEvent) {
+    event.preventDefault();
+    if (importSubmitting) return;
+    if (!importFile) {
+      setImportError(t("Select a CSV file."));
+      return;
+    }
+    setImportSubmitting(true);
+    setImportError("");
+    try {
+      const result = await importUsers(importFile);
+      setImportResult(result);
+      await load();
+    } catch (e) {
+      setImportError(
+        e instanceof Error ? e.message : t("Failed to import users"),
+      );
+    } finally {
+      setImportSubmitting(false);
+    }
+  }
+
+  function toggleSelectedUsername(username: string) {
+    setSelectedUsernames((current) =>
+      current.includes(username)
+        ? current.filter((item) => item !== username)
+        : [...current, username],
+    );
+  }
+
+  async function handleBatchDeleteConfirm() {
+    if (batchDeleteBusy || selectedUsernames.length === 0) return;
+    setBatchDeleteBusy(true);
+    setActionError("");
+    try {
+      const result = await deleteUsers(selectedUsernames);
+      const failed = new Set(
+        result.results
+          .filter((item) => !item.ok)
+          .map((item) => item.username),
+      );
+      setSelectedUsernames((current) =>
+        current.filter((username) => failed.has(username)),
+      );
+      setShowBatchDeleteConfirm(false);
+      await load();
+      if (failed.size > 0) {
+        setActionError(
+          t("{{count}} users could not be deleted: {{users}}", {
+            count: failed.size,
+            users: [...failed].join(", "),
+          }),
+        );
+      }
+    } catch (e) {
+      setShowBatchDeleteConfirm(false);
+      setActionError(
+        e instanceof Error ? e.message : t("Failed to delete users"),
+      );
+    } finally {
+      setBatchDeleteBusy(false);
     }
   }
 
@@ -173,8 +275,26 @@ export default function AdminUsersPage() {
     }
   }, [expandedUserId, users]);
 
+  useEffect(() => {
+    if (selectedUsernames.length === 0) return;
+    const usernames = new Set(users.map((user) => user.username));
+    setSelectedUsernames((current) => {
+      const retained = current.filter((username) => usernames.has(username));
+      return retained.length === current.length ? current : retained;
+    });
+  }, [users, selectedUsernames]);
+
   const normalizedQuery = query.trim().toLowerCase();
   const filteredUsers = filterUsersByQuery(users, query);
+  const selectableFilteredUsers = filteredUsers.filter(
+    (user) => user.username !== currentUser,
+  );
+  const selectedUsernameSet = new Set(selectedUsernames);
+  const allFilteredSelected =
+    selectableFilteredUsers.length > 0 &&
+    selectableFilteredUsers.every((user) =>
+      selectedUsernameSet.has(user.username),
+    );
 
   return (
     <div className="h-screen overflow-y-auto bg-[var(--background)] px-4 py-10 [scrollbar-gutter:stable]">
@@ -186,15 +306,15 @@ export default function AdminUsersPage() {
             className="mb-4 inline-flex items-center gap-1.5 text-sm text-[var(--muted-foreground)] hover:text-[var(--foreground)] transition-colors"
           >
             <ArrowLeft size={16} />
-            Back
+            {t("Back")}
           </Link>
           <div className="flex items-start justify-between gap-4">
             <div>
               <h1 className="font-serif text-xl font-semibold text-[var(--foreground)]">
-                User Management
+                {t("User Management")}
               </h1>
               <p className="mt-0.5 text-sm text-[var(--muted-foreground)]">
-                Manage registered accounts
+                {t("Manage registered accounts")}
               </p>
             </div>
             <div className="flex shrink-0 items-center gap-2">
@@ -205,7 +325,16 @@ export default function AdminUsersPage() {
                            hover:bg-[var(--card)] transition-colors"
               >
                 <UserPlus size={14} />
-                Add user
+                {t("Add user")}
+              </button>
+              <button
+                onClick={openImportDialog}
+                className="flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-sm
+                           border border-[var(--border)] text-[var(--foreground)]
+                           hover:bg-[var(--card)] transition-colors"
+              >
+                <Upload size={14} />
+                {t("Import users")}
               </button>
               <button
                 onClick={load}
@@ -219,7 +348,7 @@ export default function AdminUsersPage() {
                   size={14}
                   className={loading ? "animate-spin" : ""}
                 />
-                Refresh
+                {t("Refresh")}
               </button>
             </div>
           </div>
@@ -242,8 +371,8 @@ export default function AdminUsersPage() {
                 type="search"
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
-                placeholder="Search users…"
-                aria-label="Search users"
+                placeholder={t("Search users…")}
+                aria-label={t("Search users")}
                 className="w-full rounded-lg border border-[var(--border)] bg-[var(--card)] py-2 pl-9 pr-3 text-sm
                            text-[var(--foreground)] placeholder:text-[var(--muted-foreground)]/70
                            outline-none focus:border-[var(--ring)] transition-colors"
@@ -251,9 +380,37 @@ export default function AdminUsersPage() {
             </div>
             <span className="shrink-0 text-xs text-[var(--muted-foreground)]">
               {normalizedQuery
-                ? `${filteredUsers.length} of ${users.length}`
-                : `${users.length} ${users.length === 1 ? "user" : "users"}`}
+                ? t("{{filtered}} of {{total}}", {
+                    filtered: filteredUsers.length,
+                    total: users.length,
+                  })
+                : t(users.length === 1 ? "{{count}} user" : "{{count}} users", {
+                    count: users.length,
+                  })}
             </span>
+          </div>
+        )}
+
+        {!loading && !error && selectedUsernames.length > 0 && (
+          <div className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-[var(--border)] bg-[var(--card)] px-4 py-3">
+            <span className="text-sm text-[var(--muted-foreground)]">
+              {t("{{count}} users selected", { count: selectedUsernames.length })}
+            </span>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => setSelectedUsernames([])}
+                className="rounded-lg px-3 py-1.5 text-sm text-[var(--muted-foreground)] hover:text-[var(--foreground)] transition-colors"
+              >
+                {t("Clear selection")}
+              </button>
+              <button
+                onClick={() => setShowBatchDeleteConfirm(true)}
+                className="flex items-center gap-1.5 rounded-lg border border-red-500/40 px-3 py-1.5 text-sm text-red-600 hover:bg-red-500/10 transition-colors dark:text-red-400"
+              >
+                <Trash2 size={14} />
+                {t("Delete selected")}
+              </button>
+            </div>
           </div>
         )}
 
@@ -286,10 +443,10 @@ export default function AdminUsersPage() {
                 className="text-[var(--muted-foreground)]/50"
               />
               <p className="mt-3 text-sm font-medium text-[var(--foreground)]">
-                No users yet
+                {t("No users yet")}
               </p>
               <p className="mt-1 text-sm text-[var(--muted-foreground)]">
-                Accounts you create will appear here.
+                {t("Accounts you create will appear here.")}
               </p>
               <button
                 onClick={openCreateDialog}
@@ -298,7 +455,7 @@ export default function AdminUsersPage() {
                            hover:bg-[var(--background)]/60 transition-colors"
               >
                 <UserPlus size={14} />
-                Add user
+                {t("Add user")}
               </button>
             </div>
           ) : filteredUsers.length === 0 ? (
@@ -309,7 +466,7 @@ export default function AdminUsersPage() {
                 className="text-[var(--muted-foreground)]/50"
               />
               <p className="mt-3 text-sm font-medium text-[var(--foreground)]">
-                No users match &ldquo;{query.trim()}&rdquo;
+                {t("No users match “{{query}}”", { query: query.trim() })}
               </p>
               <button
                 onClick={() => setQuery("")}
@@ -317,17 +474,43 @@ export default function AdminUsersPage() {
                            text-[var(--muted-foreground)] hover:text-[var(--foreground)]
                            hover:bg-[var(--background)]/60 transition-colors"
               >
-                Clear search
+                {t("Clear search")}
               </button>
             </div>
           ) : (
             <table className="w-full text-sm">
               <thead>
                 <tr className="border-b border-[var(--border)] text-left text-xs text-[var(--muted-foreground)] uppercase tracking-wider">
-                  <th className="px-5 py-3 font-medium">Username</th>
-                  <th className="px-5 py-3 font-medium">Role</th>
-                  <th className="px-5 py-3 font-medium">Joined</th>
-                  <th className="px-5 py-3 font-medium text-right">Actions</th>
+                  <th className="w-12 px-5 py-3">
+                    <input
+                      type="checkbox"
+                      checked={allFilteredSelected}
+                      disabled={selectableFilteredUsers.length === 0}
+                      onChange={() => {
+                        const displayed = new Set(
+                          selectableFilteredUsers.map((user) => user.username),
+                        );
+                        setSelectedUsernames((current) =>
+                          allFilteredSelected
+                            ? current.filter((username) => !displayed.has(username))
+                            : [
+                                ...current,
+                                ...selectableFilteredUsers
+                                  .map((user) => user.username)
+                                  .filter((username) => !current.includes(username)),
+                              ],
+                        );
+                      }}
+                      aria-label={t("Select displayed users")}
+                      className="h-4 w-4 rounded border-[var(--border)] accent-[var(--foreground)]"
+                    />
+                  </th>
+                  <th className="px-5 py-3 font-medium">{t("Username")}</th>
+                  <th className="px-5 py-3 font-medium">{t("Role")}</th>
+                  <th className="px-5 py-3 font-medium">{t("Joined")}</th>
+                  <th className="px-5 py-3 font-medium text-right">
+                    {t("Actions")}
+                  </th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-[var(--border)]">
@@ -338,6 +521,18 @@ export default function AdminUsersPage() {
                   return (
                     <Fragment key={user.username}>
                       <tr className="group hover:bg-[var(--background)]/50 transition-colors">
+                        <td className="px-5 py-3.5">
+                          <input
+                            type="checkbox"
+                            checked={selectedUsernameSet.has(user.username)}
+                            disabled={isSelf}
+                            onChange={() => toggleSelectedUsername(user.username)}
+                            aria-label={t("Select {{username}}", {
+                              username: user.username,
+                            })}
+                            className="h-4 w-4 rounded border-[var(--border)] accent-[var(--foreground)] disabled:opacity-30"
+                          />
+                        </td>
                         <td className="px-5 py-3">
                           <div className="flex items-center gap-3">
                             <UserAvatar
@@ -351,7 +546,7 @@ export default function AdminUsersPage() {
                               {user.username}
                               {isSelf && (
                                 <span className="ml-2 text-xs font-normal text-[var(--muted-foreground)]">
-                                  (you)
+                                  {t("(you)")}
                                 </span>
                               )}
                             </span>
@@ -369,77 +564,127 @@ export default function AdminUsersPage() {
                             {isAdmin && (
                               <ShieldCheck size={11} strokeWidth={2} />
                             )}
-                            {isAdmin ? "Admin" : "User"}
+                            {t(accountRoleLabelKey(user.role))}
                           </span>
+                          {!isAdmin && user.preset && (
+                            <span className="mt-1 block text-[11px] text-[var(--muted-foreground)]">
+                              {t("Preset: {{preset}}", {
+                                preset: t(
+                                  user.preset === "learner"
+                                    ? "Learner"
+                                    : user.preset === "custom"
+                                      ? "Custom"
+                                      : "Standard",
+                                ),
+                              })}
+                            </span>
+                          )}
                         </td>
                         <td className="px-5 py-3.5 text-[var(--muted-foreground)]">
-                          {formatDate(user.created_at)}
+                          {formatDate(user.created_at, lang)}
                         </td>
                         <td className="px-5 py-3.5">
                           <div className="flex items-center justify-end gap-1.5">
                             {canManageAssignments && (
+                              <Tooltip label={t("Manage assignments")} side="top">
+                                <button
+                                  onClick={() =>
+                                    setExpandedUserId((current) =>
+                                      current === user.id ? null : user.id,
+                                    )
+                                  }
+                                  aria-label={t("Manage assignments")}
+                                  className="rounded-lg p-1.5 text-[var(--muted-foreground)]
+                                           hover:bg-[var(--background)] hover:text-[var(--foreground)]
+                                           transition-colors"
+                                >
+                                  <SlidersHorizontal size={15} />
+                                </button>
+                              </Tooltip>
+                            )}
+                            <Tooltip label={
+                                isSelf
+                                  ? t("Cannot change your own role")
+                                  : user.role === "admin"
+                                    ? t("Demote to user")
+                                    : t("Promote to admin")
+                              } side="top">
                               <button
                                 onClick={() =>
-                                  setExpandedUserId((current) =>
-                                    current === user.id ? null : user.id,
-                                  )
+                                  setConfirmTarget({
+                                    kind: isAdmin ? "demote" : "promote",
+                                    user,
+                                  })
                                 }
-                                title="Manage assignments"
+                                disabled={isSelf}
+                                aria-label={
+                                  isSelf
+                                    ? t("Cannot change your own role")
+                                    : user.role === "admin"
+                                      ? t("Demote to user")
+                                      : t("Promote to admin")
+                                }
                                 className="rounded-lg p-1.5 text-[var(--muted-foreground)]
                                          hover:bg-[var(--background)] hover:text-[var(--foreground)]
-                                         transition-colors"
+                                         disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
                               >
-                                <SlidersHorizontal size={15} />
+                                {user.role === "admin" ? (
+                                  <ShieldOff size={15} />
+                                ) : (
+                                  <Shield size={15} />
+                                )}
                               </button>
-                            )}
-                            <button
-                              onClick={() =>
-                                setConfirmTarget({
-                                  kind: isAdmin ? "demote" : "promote",
-                                  user,
-                                })
-                              }
-                              disabled={isSelf}
-                              title={
+                            </Tooltip>
+                            <Tooltip label={
                                 isSelf
-                                  ? "Cannot change your own role"
-                                  : user.role === "admin"
-                                    ? "Demote to user"
-                                    : "Promote to admin"
-                              }
-                              className="rounded-lg p-1.5 text-[var(--muted-foreground)]
-                                       hover:bg-[var(--background)] hover:text-[var(--foreground)]
-                                       disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
-                            >
-                              {user.role === "admin" ? (
-                                <ShieldOff size={15} />
-                              ) : (
-                                <Shield size={15} />
-                              )}
-                            </button>
-                            <button
-                              onClick={() =>
-                                setConfirmTarget({ kind: "delete", user })
-                              }
-                              disabled={isSelf}
-                              title={
-                                isSelf
-                                  ? "Cannot delete your own account"
-                                  : `Delete ${user.username}`
-                              }
-                              className="rounded-lg p-1.5 text-[var(--muted-foreground)]
-                                       hover:bg-red-500/10 hover:text-red-500
-                                       disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
-                            >
-                              <Trash2 size={15} />
-                            </button>
+                                  ? t("Cannot delete your own account")
+                                  : t("Delete {{username}}", {
+                                      username: user.username,
+                                    })
+                              } side="top">
+                              <button
+                                onClick={() =>
+                                  setConfirmTarget({ kind: "delete", user })
+                                }
+                                disabled={isSelf}
+                                aria-label={
+                                  isSelf
+                                    ? t("Cannot delete your own account")
+                                    : t("Delete {{username}}", {
+                                        username: user.username,
+                                      })
+                                }
+                                className="rounded-lg p-1.5 text-[var(--muted-foreground)]
+                                         hover:bg-red-500/10 hover:text-red-500
+                                         disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+                              >
+                                <Trash2 size={15} />
+                              </button>
+                            </Tooltip>
                           </div>
                         </td>
                       </tr>
                       {canManageAssignments && expandedUserId === user.id && (
                         <tr>
-                          <td colSpan={4} className="p-0">
-                            <GrantEditor key={user.id} userId={user.id} />
+                          <td colSpan={5} className="p-0">
+                            <GrantEditor
+                              key={user.id}
+                              userId={user.id}
+                              lockLearningPolicy={user.preset === "learner"}
+                            />
+                            <BookPermissionEditor userId={user.id} />
+                            {user.preset === "learner" && (
+                              <>
+                                <GuardianRelationshipsEditor
+                                  learnerId={user.id}
+                                  learnerUsername={user.username}
+                                  users={users}
+                                />
+                                <LearnerProfileEditor
+                                  username={user.username}
+                                />
+                              </>
+                            )}
                           </td>
                         </tr>
                       )}
@@ -452,7 +697,7 @@ export default function AdminUsersPage() {
         </div>
 
         <p className="mt-8 text-center text-xs text-[var(--muted-foreground)]">
-          DeepTutor Admin · User Management
+          {t("DeepTutor Admin · User Management")}
         </p>
       </div>
 
@@ -460,25 +705,25 @@ export default function AdminUsersPage() {
         open={confirmTarget !== null}
         title={
           confirmTarget?.kind === "delete"
-            ? "Delete user"
+            ? t("Delete user")
             : confirmTarget?.kind === "promote"
-              ? "Promote to admin"
-              : "Demote to user"
+              ? t("Promote to admin")
+              : t("Demote to user")
         }
         tone={confirmTarget?.kind === "delete" ? "danger" : "default"}
         confirmLabel={
           confirmTarget?.kind === "delete"
-            ? "Delete user"
+            ? t("Delete user")
             : confirmTarget?.kind === "promote"
-              ? "Promote"
-              : "Demote"
+              ? t("Promote")
+              : t("Demote")
         }
         busyLabel={
           confirmTarget?.kind === "delete"
-            ? "Deleting…"
+            ? t("Deleting…")
             : confirmTarget?.kind === "promote"
-              ? "Promoting…"
-              : "Demoting…"
+              ? t("Promoting…")
+              : t("Demoting…")
         }
         busy={confirmBusy}
         onConfirm={handleConfirmAction}
@@ -499,20 +744,53 @@ export default function AdminUsersPage() {
                   {confirmTarget.user.username}
                 </p>
                 <p className="text-xs text-[var(--muted-foreground)]">
-                  {confirmTarget.user.role === "admin" ? "Admin" : "User"} ·
-                  joined {formatDate(confirmTarget.user.created_at)}
+                  {t("{{role}} · joined {{date}}", {
+                    role: t(accountRoleLabelKey(confirmTarget.user.role)),
+                    date: formatDate(confirmTarget.user.created_at, lang),
+                  })}
                 </p>
               </div>
             </div>
             <p className="mt-3">
               {confirmTarget.kind === "delete"
-                ? "This permanently removes the account and its assignments. This cannot be undone."
+                ? t(
+                    "This permanently removes the account and its assignments. This cannot be undone.",
+                  )
                 : confirmTarget.kind === "promote"
-                  ? "Admins can manage users and assignments, and work in the shared main workspace."
-                  : "They will lose access to the admin area and switch to their own assigned workspace."}
+                  ? t(
+                      "Admins can manage users and assignments, and work in the shared main workspace.",
+                    )
+                  : t(
+                      "They will lose access to the admin area and switch to their own assigned workspace.",
+                    )}
             </p>
           </>
         )}
+      </ConfirmDialog>
+
+      <ConfirmDialog
+        open={showBatchDeleteConfirm}
+        title={t("Delete users")}
+        tone="danger"
+        confirmLabel={t("Delete users")}
+        busyLabel={t("Deleting…")}
+        busy={batchDeleteBusy}
+        onConfirm={handleBatchDeleteConfirm}
+        onCancel={() => setShowBatchDeleteConfirm(false)}
+      >
+        <p>
+          {t(
+            "This permanently removes {{count}} accounts and their assignments. This cannot be undone.",
+            { count: selectedUsernames.length },
+          )}
+        </p>
+        <ul className="mt-3 max-h-40 space-y-1 overflow-y-auto text-sm text-[var(--muted-foreground)]">
+          {selectedUsernames.map((username) => (
+            <li key={username} className="truncate">
+              {username}
+            </li>
+          ))}
+        </ul>
       </ConfirmDialog>
 
       {showCreateDialog && (
@@ -529,21 +807,21 @@ export default function AdminUsersPage() {
           >
             <div className="mb-4 flex items-center justify-between">
               <h2 className="text-base font-semibold text-[var(--foreground)]">
-                Add user
+                {t("Add user")}
               </h2>
               <button
                 type="button"
                 onClick={closeCreateDialog}
                 disabled={createSubmitting}
                 className="rounded-md p-1 text-[var(--muted-foreground)] hover:bg-[var(--background)] hover:text-[var(--foreground)] disabled:opacity-40"
-                aria-label="Close"
+                aria-label={t("Close")}
               >
                 <X size={16} />
               </button>
             </div>
 
             <label className="mb-3 block text-xs text-[var(--muted-foreground)]">
-              Username (or email)
+              {t("Username (or email)")}
               <input
                 type="text"
                 value={createUsername}
@@ -556,7 +834,7 @@ export default function AdminUsersPage() {
             </label>
 
             <label className="mb-4 block text-xs text-[var(--muted-foreground)]">
-              Password (≥ 8 chars)
+              {t("Password (≥ 8 chars)")}
               <input
                 type="password"
                 value={createPassword}
@@ -566,6 +844,53 @@ export default function AdminUsersPage() {
                 className="mt-1 w-full rounded-lg border border-[var(--border)] bg-transparent px-3 py-2 text-sm text-[var(--foreground)] outline-none focus:border-[var(--ring)]"
               />
             </label>
+
+            <fieldset className="mb-4">
+              <legend className="mb-1.5 block text-xs text-[var(--muted-foreground)]">
+                {t("Account preset")}
+              </legend>
+              <div
+                className="grid grid-cols-3 gap-1 rounded-lg bg-[var(--muted)]/50 p-1"
+                role="group"
+                aria-label={t("Account preset")}
+              >
+                {(["standard", "learner", "custom"] as const).map((preset) => (
+                  <button
+                    key={preset}
+                    type="button"
+                    disabled={createSubmitting}
+                    aria-pressed={createPreset === preset}
+                    onClick={() => setCreatePreset(preset)}
+                    className={`rounded-md px-2 py-1.5 text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-45 ${
+                      createPreset === preset
+                        ? "bg-[var(--card)] text-[var(--foreground)] shadow-sm"
+                        : "text-[var(--muted-foreground)] hover:text-[var(--foreground)]"
+                    }`}
+                  >
+                    {t(
+                      preset === "learner"
+                        ? "Learner"
+                        : preset === "custom"
+                          ? "Custom"
+                          : "Standard",
+                    )}
+                  </button>
+                ))}
+              </div>
+              <p className="mt-1.5 text-[11px] leading-relaxed text-[var(--muted-foreground)]">
+                {createPreset === "learner"
+                  ? t(
+                      "Chat and Immersive Reading only, with uploads and tools disabled until assigned.",
+                    )
+                  : createPreset === "custom"
+                    ? t(
+                        "Create an ordinary account, then customize its assignments.",
+                      )
+                    : t(
+                        "Create an ordinary account with the default workspace behavior.",
+                      )}
+              </p>
+            </fieldset>
 
             {createError && (
               <p className="mb-3 text-xs text-red-500">{createError}</p>
@@ -578,14 +903,119 @@ export default function AdminUsersPage() {
                 disabled={createSubmitting}
                 className="rounded-lg px-3 py-1.5 text-sm text-[var(--muted-foreground)] hover:text-[var(--foreground)] disabled:opacity-40"
               >
-                Cancel
+                {t("Cancel")}
               </button>
               <button
                 type="submit"
                 disabled={createSubmitting}
                 className="rounded-lg bg-[var(--foreground)] px-3 py-1.5 text-sm font-medium text-[var(--background)] hover:opacity-90 disabled:opacity-40"
               >
-                {createSubmitting ? "Creating…" : "Create"}
+                {createSubmitting ? t("Creating…") : t("Create")}
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+
+      {showImportDialog && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-[var(--overlay)] px-4"
+          role="dialog"
+          aria-modal="true"
+          onClick={closeImportDialog}
+        >
+          <form
+            onClick={(e) => e.stopPropagation()}
+            onSubmit={handleImportSubmit}
+            className="max-h-[85vh] w-full max-w-md overflow-y-auto rounded-2xl border border-[var(--border)] bg-[var(--card)] p-5 shadow-xl"
+          >
+            <div className="mb-4 flex items-center justify-between">
+              <h2 className="text-base font-semibold text-[var(--foreground)]">
+                {t("Import users")}
+              </h2>
+              <button
+                type="button"
+                onClick={closeImportDialog}
+                disabled={importSubmitting}
+                className="rounded-md p-1 text-[var(--muted-foreground)] hover:bg-[var(--background)] hover:text-[var(--foreground)] disabled:opacity-40"
+                aria-label={t("Close")}
+              >
+                <X size={16} />
+              </button>
+            </div>
+
+            <label className="mb-3 block text-xs text-[var(--muted-foreground)]">
+              {t("CSV file")}
+              <input
+                type="file"
+                accept=".csv,text/csv"
+                onChange={(e) => {
+                  setImportFile(e.target.files?.[0] ?? null);
+                  setImportResult(null);
+                  setImportError("");
+                }}
+                disabled={importSubmitting}
+                autoFocus
+                className="mt-1 w-full rounded-lg border border-[var(--border)] bg-transparent px-3 py-2 text-sm text-[var(--foreground)] outline-none focus:border-[var(--ring)]"
+              />
+            </label>
+
+            <p className="mb-3 text-[11px] leading-relaxed text-[var(--muted-foreground)]">
+              {t("Header: username,password,preset. Only ordinary user accounts can be imported.")}
+            </p>
+
+            {importError && (
+              <p className="mb-3 text-xs text-red-500">{importError}</p>
+            )}
+
+            {importResult && (
+              <div className="mb-4">
+                <p className="text-sm font-medium text-[var(--foreground)]">
+                  {t("{{created}} created, {{failed}} failed", {
+                    created: importResult.created_count,
+                    failed: importResult.failed_count,
+                  })}
+                </p>
+                <ul className="mt-2 max-h-44 space-y-1 overflow-y-auto text-xs text-[var(--muted-foreground)]">
+                  {importResult.results.map((result) => (
+                    <li
+                      key={`${result.row}-${result.username}`}
+                      className="flex items-start justify-between gap-3"
+                    >
+                      <span className="min-w-0 truncate">
+                        {t("Row {{row}}", { row: result.row })} · {result.username}
+                      </span>
+                      <span
+                        className={
+                          result.ok
+                            ? "shrink-0 text-emerald-600 dark:text-emerald-400"
+                            : "shrink-0 text-red-500"
+                        }
+                      >
+                        {result.ok ? t("Created") : result.error}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+
+            <div className="flex items-center justify-end gap-2">
+              <button
+                type="button"
+                onClick={closeImportDialog}
+                disabled={importSubmitting}
+                className="rounded-lg px-3 py-1.5 text-sm text-[var(--muted-foreground)] hover:text-[var(--foreground)] disabled:opacity-40"
+              >
+                {t("Close")}
+              </button>
+              <button
+                type="submit"
+                disabled={importSubmitting || !importFile}
+                className="flex items-center gap-1.5 rounded-lg bg-[var(--foreground)] px-3 py-1.5 text-sm font-medium text-[var(--background)] hover:opacity-90 disabled:opacity-40"
+              >
+                <Upload size={14} />
+                {importSubmitting ? t("Importing…") : t("Import")}
               </button>
             </div>
           </form>

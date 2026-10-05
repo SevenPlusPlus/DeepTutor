@@ -2,46 +2,50 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from functools import wraps
 import importlib.util
+import inspect
 import json
 from typing import Any, AsyncIterator
 
-from deeptutor.runtime.registry.capability_registry import get_capability_registry
 from deeptutor.services.notebook import get_notebook_manager
-from deeptutor.services.session import get_session_store, get_turn_runtime_manager
+
+from .container import get_application_container
+from .contracts import TurnRequest
 
 
-@dataclass(slots=True)
-class TurnRequest:
-    """Stable turn payload used by adapters such as the CLI package."""
+def _in_app_workspace(method):
+    from deeptutor.services.workspace.activity import data_activity
+    from deeptutor.services.workspace.models import WorkspaceError
 
-    content: str
-    capability: str = "chat"
-    session_id: str | None = None
-    tools: list[str] = field(default_factory=list)
-    knowledge_bases: list[str] = field(default_factory=list)
-    language: str = "en"
-    config: dict[str, Any] = field(default_factory=dict)
-    notebook_references: list[dict[str, Any]] = field(default_factory=list)
-    history_references: list[str] = field(default_factory=list)
-    attachments: list[dict[str, Any]] = field(default_factory=list)
-    skills: list[str] = field(default_factory=list)
+    def validate(scope):
+        if scope.archived and method.__name__ in {
+            "rename_session",
+            "delete_session",
+            "create_notebook",
+            "add_record",
+            "update_record",
+            "remove_record",
+        }:
+            raise WorkspaceError("Restore this workspace before changing its data.")
 
-    def to_payload(self) -> dict[str, Any]:
-        return {
-            "content": self.content,
-            "capability": self.capability,
-            "session_id": self.session_id,
-            "tools": list(self.tools),
-            "knowledge_bases": list(self.knowledge_bases),
-            "language": self.language,
-            "config": dict(self.config),
-            "notebook_references": list(self.notebook_references),
-            "history_references": list(self.history_references),
-            "attachments": list(self.attachments),
-            "skills": list(self.skills),
-        }
+    if inspect.iscoroutinefunction(method):
+
+        @wraps(method)
+        async def call(self, *args, **kwargs):
+            with self._workspace_context() as scope, data_activity():
+                validate(scope)
+                return await method(self, *args, **kwargs)
+    else:
+
+        @wraps(method)
+        def call(self, *args, **kwargs):
+            with self._workspace_context() as scope, data_activity():
+                validate(scope)
+                return method(self, *args, **kwargs)
+
+    return call
 
 
 @dataclass(slots=True)
@@ -56,11 +60,24 @@ class CapabilityAvailability:
 class DeepTutorApp:
     """Facade around runtime, session, notebook, and capability contracts."""
 
-    def __init__(self) -> None:
-        self.runtime = get_turn_runtime_manager()
-        self.store = get_session_store()
-        self.notebooks = get_notebook_manager()
-        self.capabilities = get_capability_registry()
+    def __init__(self, *, workspace_id: str | None = None) -> None:
+        self.workspace_id = workspace_id
+        self._turn_workspaces: dict[str, str] = {}
+        self.container = get_application_container()
+        self.turns = self.container.turns
+        self.capabilities = self.container.capability_registry
+
+    def _workspace_context(self):
+        from deeptutor.services.workspace.context import current_workspace_id, workspace_context
+
+        return workspace_context(
+            self.workspace_id if self.workspace_id is not None else current_workspace_id()
+        )
+
+    @property
+    def notebooks(self):
+        with self._workspace_context():
+            return get_notebook_manager()
 
     def resolve_capability(self, value: str | None) -> str:
         requested = str(value or "chat").strip() or "chat"
@@ -116,29 +133,52 @@ class DeepTutorApp:
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         if isinstance(request, dict):
             request = TurnRequest(**request)
+        await self.container.start()
         resolved_capability = self.resolve_capability(request.capability)
-        session, turn = await self.runtime.start_turn(
-            {
-                **request.to_payload(),
-                "capability": resolved_capability,
-            }
+        from deeptutor.services.workspace.context import current_workspace_id, workspace_context
+
+        workspace_id = (
+            request.workspace_id
+            if "workspace_id" in request.model_fields_set
+            else self.workspace_id
         )
-        await self.store.update_session_preferences(
-            session["id"],
-            {
-                "language": request.language,
-                "notebook_references": request.notebook_references,
-                "history_references": request.history_references,
-            },
-        )
-        return session, turn
+        if workspace_id is None:
+            workspace_id = current_workspace_id()
+        with workspace_context(workspace_id):
+            result = await self.turns.start_turn(
+                {
+                    **request.to_payload(),
+                    "capability": resolved_capability,
+                    "workspace_id": workspace_id,
+                }
+            )
+        self._turn_workspaces[result[1]["id"]] = workspace_id
+        return result
 
     async def stream_turn(self, turn_id: str, after_seq: int = 0) -> AsyncIterator[dict[str, Any]]:
-        async for item in self.runtime.subscribe_turn(turn_id, after_seq=after_seq):
-            yield item
+        await self.container.start()
+        from deeptutor.services.workspace.context import current_workspace_id, workspace_context
+
+        with workspace_context(
+            self._turn_workspaces.get(
+                turn_id,
+                self.workspace_id if self.workspace_id is not None else current_workspace_id(),
+            )
+        ):
+            async for item in self.turns.subscribe_turn(turn_id, after_seq=after_seq):
+                yield item
 
     async def cancel_turn(self, turn_id: str) -> bool:
-        return await self.runtime.cancel_turn(turn_id)
+        await self.container.start()
+        from deeptutor.services.workspace.context import current_workspace_id, workspace_context
+
+        with workspace_context(
+            self._turn_workspaces.get(
+                turn_id,
+                self.workspace_id if self.workspace_id is not None else current_workspace_id(),
+            )
+        ):
+            return await self.turns.cancel_turn(turn_id)
 
     async def submit_user_reply(
         self,
@@ -148,33 +188,55 @@ class DeepTutorApp:
         answers: list[dict[str, Any]] | None = None,
     ) -> bool:
         """Deliver the user's reply to a turn paused on ``ask_user``."""
-        return await self.runtime.submit_user_reply(turn_id, text=text, answers=answers)
+        await self.container.start()
+        from deeptutor.services.workspace.context import workspace_context
 
+        with (
+            workspace_context(self._turn_workspaces[turn_id])
+            if turn_id in self._turn_workspaces
+            else self._workspace_context()
+        ):
+            return await self.turns.submit_user_reply(turn_id, text=text, answers=answers)
+
+    @_in_app_workspace
     async def regenerate_last_turn(
         self,
         session_id: str,
         overrides: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        return await self.runtime.regenerate_last_turn(session_id, overrides=overrides)
+        await self.container.start()
+        return await self.turns.regenerate_last_turn(session_id, overrides=overrides)
 
+    @_in_app_workspace
     async def list_sessions(self, limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
-        return await self.store.list_sessions(limit=limit, offset=offset)
+        await self.container.start()
+        return await self.turns.list_sessions(limit=limit, offset=offset)
 
+    @_in_app_workspace
     async def get_session(self, session_id: str) -> dict[str, Any] | None:
-        return await self.store.get_session_with_messages(session_id)
+        await self.container.start()
+        return await self.turns.get_session(session_id)
 
+    @_in_app_workspace
     async def rename_session(self, session_id: str, title: str) -> bool:
-        return await self.store.update_session_title(session_id, title)
+        await self.container.start()
+        return await self.turns.rename_session(session_id, title)
 
+    @_in_app_workspace
     async def delete_session(self, session_id: str) -> bool:
-        return await self.store.delete_session(session_id)
+        await self.container.start()
+        return await self.turns.delete_session(session_id)
 
+    @_in_app_workspace
     async def get_active_turn(self, session_id: str) -> dict[str, Any] | None:
-        return await self.store.get_active_turn(session_id)
+        await self.container.start()
+        return await self.turns.check_active_turn(session_id)
 
+    @_in_app_workspace
     def list_notebooks(self) -> list[dict[str, Any]]:
         return self.notebooks.list_notebooks()
 
+    @_in_app_workspace
     def create_notebook(
         self,
         name: str,
@@ -190,20 +252,25 @@ class DeepTutorApp:
             icon=icon,
         )
 
+    @_in_app_workspace
     def get_notebook(self, notebook_id: str) -> dict[str, Any] | None:
         return self.notebooks.get_notebook(notebook_id)
 
+    @_in_app_workspace
     def add_record(self, **kwargs: Any) -> dict[str, Any]:
         return self.notebooks.add_record(**kwargs)
 
+    @_in_app_workspace
     def update_record(
         self, notebook_id: str, record_id: str, **kwargs: Any
     ) -> dict[str, Any] | None:
         return self.notebooks.update_record(notebook_id, record_id, **kwargs)
 
+    @_in_app_workspace
     def remove_record(self, notebook_id: str, record_id: str) -> bool:
         return self.notebooks.remove_record(notebook_id, record_id)
 
+    @_in_app_workspace
     def get_records_by_references(
         self, notebook_references: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:

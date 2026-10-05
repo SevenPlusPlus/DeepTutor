@@ -38,7 +38,6 @@ from pydantic import Field
 from deeptutor.partners.bus.events import OutboundMessage
 from deeptutor.partners.bus.queue import MessageBus
 from deeptutor.partners.channels.base import BaseChannel
-from deeptutor.partners.config.paths import get_runtime_subdir
 from deeptutor.partners.config.schema import DeliveryOverrides
 
 MSTEAMS_AVAILABLE = (
@@ -133,7 +132,7 @@ class MSTeamsChannel(BaseChannel):
         self._botframework_openid_config_expires_at: float = 0.0
         self._botframework_jwks: dict[str, Any] | None = None
         self._botframework_jwks_expires_at: float = 0.0
-        state_dir = get_runtime_subdir("msteams")
+        state_dir = self.state_dir()
         self._refs_path = state_dir / MSTEAMS_REF_FILENAME
         self._refs_meta_path = state_dir / MSTEAMS_REF_META_FILENAME
         self._refs_lock_path = state_dir / MSTEAMS_REF_LOCK_FILENAME
@@ -147,10 +146,21 @@ class MSTeamsChannel(BaseChannel):
         """Start the Teams webhook listener."""
         if not MSTEAMS_AVAILABLE:
             logger.error("MSTeams channel disabled: {}", MSTEAMS_DEPS_HINT)
+            self.set_setup_state(
+                "unavailable",
+                message="Required channel dependency is not installed on this server.",
+            )
             return
 
         if not self.config.app_id or not self.config.app_password:
             logger.error("MSTeams app_id/app_password not configured")
+            self.set_setup_state(
+                "action_required",
+                message=(
+                    "Required fields are missing. Complete the channel configuration "
+                    "and save again."
+                ),
+            )
             return
 
         if not self.config.validate_inbound_auth:
@@ -229,6 +239,7 @@ class MSTeamsChannel(BaseChannel):
             self.config.port,
             self.config.path,
         )
+        self.set_setup_state("connected")
 
         while self._running:
             await asyncio.sleep(1)

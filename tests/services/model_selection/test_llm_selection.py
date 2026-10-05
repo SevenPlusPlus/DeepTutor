@@ -27,6 +27,8 @@ def _catalog():
                                 "name": "Gemini Flash",
                                 "model": "google/gemini-3-flash-preview",
                                 "context_window": "1000000",
+                                "reasoning_effort": "high",
+                                "codex_supported_reasoning_levels": ["low", "high"],
                             },
                             {
                                 "id": "m2",
@@ -59,6 +61,8 @@ def test_list_llm_options_is_redacted_and_marks_active_default():
     assert [o["model_id"] for o in payload["options"]] == ["m1", "m2", "m3"]
     assert payload["options"][0]["is_active_default"] is True
     assert payload["options"][0]["context_window"] == 1000000
+    assert payload["options"][0]["reasoning_effort"] == "high"
+    assert payload["options"][0]["supported_reasoning_efforts"] == ["low", "high"]
     assert "api_key" not in payload["options"][0]
     assert "base_url" not in payload["options"][0]
     assert "extra_headers" not in payload["options"][0]
@@ -86,3 +90,39 @@ def test_apply_llm_selection_rejects_model_not_in_profile():
         assert "Invalid LLM selection" in str(exc)
     else:
         raise AssertionError("expected invalid selection to fail")
+
+
+def test_llm_selection_from_payload_accepts_valid_reasoning_effort():
+    selection = LLMSelection.from_payload(
+        {"profile_id": "p1", "model_id": "m1", "reasoning_effort": "High"}
+    )
+    assert selection.reasoning_effort == "high"
+
+
+def test_llm_selection_from_payload_rejects_unsupported_reasoning_effort():
+    try:
+        LLMSelection.from_payload(
+            {"profile_id": "p1", "model_id": "m1", "reasoning_effort": "ultra"}
+        )
+    except ValueError as exc:
+        assert "reasoning_effort" in str(exc)
+    else:
+        raise AssertionError("expected invalid reasoning_effort to fail")
+
+
+def test_llm_selection_from_payload_without_reasoning_effort_defaults_to_none():
+    selection = LLMSelection.from_payload({"profile_id": "p1", "model_id": "m1"})
+    assert selection.reasoning_effort is None
+
+
+def test_llm_selection_to_dict_round_trips_reasoning_effort():
+    selection = LLMSelection(profile_id="p1", model_id="m1", reasoning_effort="xhigh")
+    payload = selection.to_dict()
+    assert payload["reasoning_effort"] == "xhigh"
+    restored = LLMSelection.from_payload(payload)
+    assert restored == selection
+
+
+def test_llm_selection_to_dict_omits_reasoning_effort_when_unset():
+    selection = LLMSelection(profile_id="p1", model_id="m1")
+    assert "reasoning_effort" not in selection.to_dict()

@@ -9,6 +9,7 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowUp, Info, Paperclip, Square, X } from "lucide-react";
 import { useTranslation } from "react-i18next";
+import Tooltip from "@/shared/ui/Tooltip";
 import { shouldSubmitOnEnter } from "@/lib/composer-keyboard";
 import {
   getPartnerCommands,
@@ -44,18 +45,36 @@ export const PartnerComposer = memo(function PartnerComposer({
   disabled,
   streaming,
   placeholder,
+  restoreDraft,
 }: {
-  onSend: (content: string, attachments: PartnerPendingAttachment[]) => void;
+  /** True starts a turn, "handled" consumes a client command, false keeps the draft. */
+  onSend: (content: string, attachments: PartnerPendingAttachment[]) => boolean | "handled";
   onStop?: () => void;
   disabled?: boolean;
   streaming?: boolean;
   placeholder?: string;
+  /** A rejected cross-browser send restores the cleared text and attachments. */
+  restoreDraft?: {
+    id: number;
+    content: string;
+    attachments: PartnerPendingAttachment[];
+  };
 }) {
   const { t } = useTranslation();
   const [input, setInput] = useState("");
   const [attachments, setAttachments] = useState<PartnerPendingAttachment[]>(
     [],
   );
+  useEffect(() => {
+    if (!restoreDraft) return;
+    let cancelled = false;
+    queueMicrotask(() => {
+      if (cancelled) return;
+      setInput(restoreDraft.content);
+      setAttachments(restoreDraft.attachments);
+    });
+    return () => { cancelled = true; };
+  }, [restoreDraft]);
   const attachmentLimits = useAttachmentLimits();
   const [dragging, setDragging] = useState(false);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
@@ -65,12 +84,53 @@ export const PartnerComposer = memo(function PartnerComposer({
   const [showHelp, setShowHelp] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const restoreFocusOnReturnRef = useRef(false);
+  const restoreFocusAfterSendRef = useRef(false);
   const dragCounterRef = useRef(0);
   const errorTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const { isComposingRef, onCompositionStart, onCompositionEnd } =
     useImeComposing();
 
   useAutoSizedTextarea(textareaRef, input, { min: 24, max: 180 });
+
+  const focusTextarea = useCallback(() => {
+    requestAnimationFrame(() => {
+      if (!disabled && !streaming) textareaRef.current?.focus();
+    });
+  }, [disabled, streaming]);
+
+  useEffect(() => {
+    const rememberFocus = () => {
+      restoreFocusOnReturnRef.current =
+        document.activeElement === textareaRef.current;
+    };
+    const restoreFocus = () => {
+      if (
+        restoreFocusOnReturnRef.current &&
+        document.visibilityState === "visible"
+      ) {
+        focusTextarea();
+      }
+    };
+
+    window.addEventListener("blur", rememberFocus);
+    window.addEventListener("focus", restoreFocus);
+    document.addEventListener("visibilitychange", restoreFocus);
+    return () => {
+      window.removeEventListener("blur", rememberFocus);
+      window.removeEventListener("focus", restoreFocus);
+      document.removeEventListener("visibilitychange", restoreFocus);
+    };
+  }, [focusTextarea]);
+
+  useEffect(() => {
+    if (disabled || streaming) return;
+    if (!restoreFocusAfterSendRef.current && !restoreFocusOnReturnRef.current) {
+      return;
+    }
+    restoreFocusAfterSendRef.current = false;
+    focusTextarea();
+  }, [disabled, focusTextarea, streaming]);
 
   // Slash commands (same 5 the IM channels expose) — fetched once; the palette
   // is partner-independent so no id is needed.
@@ -102,13 +162,16 @@ export const PartnerComposer = memo(function PartnerComposer({
   const slashOpen = !slashClosed && slashMatches.length > 0;
   const boundedSlashIndex = Math.min(slashIndex, slashMatches.length - 1);
 
-  const acceptCommand = useCallback((command: PartnerCommandInfo) => {
-    // Arg-taking commands keep the menu out of the way with a trailing space;
-    // zero-arg ones are left ready to send.
-    setInput(command.arg_hint ? `${command.command} ` : command.command);
-    setSlashClosed(true);
-    requestAnimationFrame(() => textareaRef.current?.focus());
-  }, []);
+  const acceptCommand = useCallback(
+    (command: PartnerCommandInfo) => {
+      // Arg-taking commands keep the menu out of the way with a trailing
+      // space; zero-arg ones are left ready to send.
+      setInput(command.arg_hint ? `${command.command} ` : command.command);
+      setSlashClosed(true);
+      focusTextarea();
+    },
+    [focusTextarea],
+  );
 
   const showAttachmentError = useCallback((message: string) => {
     setAttachmentError(message);
@@ -196,11 +259,19 @@ export const PartnerComposer = memo(function PartnerComposer({
   const submit = useCallback(() => {
     const content = input.trim();
     if ((!content && attachments.length === 0) || disabled) return;
-    onSend(content, attachments);
+    const result = onSend(content, attachments);
+    if (result === false) {
+      focusTextarea();
+      return;
+    }
     setInput("");
     setAttachments([]);
-    requestAnimationFrame(() => textareaRef.current?.focus());
-  }, [attachments, disabled, input, onSend]);
+    if (result === true) {
+      restoreFocusAfterSendRef.current = true;
+    } else {
+      focusTextarea();
+    }
+  }, [attachments, disabled, focusTextarea, input, onSend]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -484,16 +555,17 @@ export const PartnerComposer = memo(function PartnerComposer({
 
       <div className="flex items-center justify-between px-2 pb-2">
         <div className="flex items-center gap-0.5">
-          <button
-            type="button"
-            onClick={() => fileInputRef.current?.click()}
-            disabled={disabled || streaming}
-            aria-label={t("Attach files")}
-            title={t("Attach files")}
-            className="flex h-7 w-7 items-center justify-center rounded-full text-[var(--muted-foreground)] transition-colors hover:bg-[var(--muted)] hover:text-[var(--foreground)] disabled:opacity-30"
-          >
-            <Paperclip className="h-4 w-4" strokeWidth={1.9} />
-          </button>
+          <Tooltip label={t("Attach files")}>
+            <button
+              type="button"
+              onClick={() => fileInputRef.current?.click()}
+              disabled={disabled || streaming}
+              aria-label={t("Attach files")}
+              className="flex h-7 w-7 items-center justify-center rounded-full text-[var(--muted-foreground)] transition-colors hover:bg-[var(--muted)] hover:text-[var(--foreground)] disabled:opacity-30"
+            >
+              <Paperclip className="h-4 w-4" strokeWidth={1.9} />
+            </button>
+          </Tooltip>
           <div
             className="relative flex items-center"
             onMouseEnter={() => setShowHelp(true)}
@@ -526,15 +598,16 @@ export const PartnerComposer = memo(function PartnerComposer({
           </div>
         </div>
         {streaming ? (
-          <button
-            type="button"
-            onClick={onStop}
-            aria-label={t("Stop")}
-            title={t("Stop")}
-            className="flex h-7 w-7 items-center justify-center rounded-full bg-[var(--foreground)] text-[var(--background)] transition-opacity hover:opacity-90"
-          >
-            <Square className="h-3 w-3" strokeWidth={2.2} fill="currentColor" />
-          </button>
+          <Tooltip label={t("Stop")}>
+            <button
+              type="button"
+              onClick={onStop}
+              aria-label={t("Stop")}
+              className="flex h-7 w-7 items-center justify-center rounded-full bg-[var(--foreground)] text-[var(--background)] transition-opacity hover:opacity-90"
+            >
+              <Square className="h-3 w-3" strokeWidth={2.2} fill="currentColor" />
+            </button>
+          </Tooltip>
         ) : (
           <button
             type="button"

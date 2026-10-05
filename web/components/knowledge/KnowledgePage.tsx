@@ -1,23 +1,63 @@
 "use client";
 
+import { knowledgeBaseRef } from "@/lib/knowledge-helpers";
+import { moveKnowledgeBase, resourceUsage } from "@/lib/workspaces-api";
+import { apiFetch, apiUrl } from "@/lib/api";
+import type { EmbeddingModelSelection } from "@/features/knowledge/model/types";
+
+import dynamic from "next/dynamic";
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { useRouter, useSearchParams } from "next/navigation";
+import { useParams, useRouter, useSearchParams } from "next/navigation";
 import { useTranslation } from "react-i18next";
 import { Loader2 } from "lucide-react";
 import { useKnowledgeBases } from "@/hooks/useKnowledgeBases";
-import { updateRagProviderMode } from "@/lib/knowledge-api";
-import KnowledgeBaseDetail from "./KnowledgeBaseDetail";
-import KnowledgeHome from "./KnowledgeHome";
-import EngineDetail from "./EngineDetail";
-import CreateKbModal from "./CreateKbModal";
-import PageIndexSettingsModal from "./PageIndexSettingsModal";
+import { updateRagProviderMode } from "@/features/knowledge/api/engines";
+import KnowledgeHome, { type KnowledgeHomeSection } from "./KnowledgeHome";
+import {
+  decodeResourceSegment,
+  knowledgeBaseRoute,
+} from "@/lib/resource-routes";
+import type {
+  IndexingLLMSelection,
+  LinkedFolderInfo,
+  SyncFolderResponse,
+} from "@/features/knowledge/model/types";
+
+const panelLoading = () => (
+  <div
+    className="flex min-h-0 flex-1 items-center justify-center"
+    aria-busy="true"
+  >
+    <Loader2 className="h-5 w-5 animate-spin text-[var(--muted-foreground)]" />
+  </div>
+);
+
+// These panels are not part of the Knowledge overview's first interaction.
+// Keep their large forms and engine controls out of the overview bundle, while
+// still server-rendering the relevant panel for direct detail links.
+const KnowledgeBaseDetail = dynamic(() => import("./KnowledgeBaseDetail"), {
+  loading: panelLoading,
+});
+const EngineDetail = dynamic(
+  () => import("@/features/knowledge/components/engines/EngineDetail"),
+  {
+    loading: panelLoading,
+  },
+);
+const CreateKbModal = dynamic(() => import("./CreateKbModal"));
+const ConnectKiwixModal = dynamic(() => import("./ConnectKiwixModal"));
 
 export default function KnowledgePage() {
   const { t } = useTranslation();
   const router = useRouter();
+  const routeParams = useParams<{ kbName?: string }>();
   const searchParams = useSearchParams();
-  const initialKb = searchParams.get("kb");
+  const initialKb = decodeResourceSegment(routeParams.kbName);
   const initialEngine = searchParams.get("engine");
+  const initialHomeSection: KnowledgeHomeSection =
+    initialEngine || searchParams.get("section") === "engines"
+      ? "knowledge-engines"
+      : "knowledge-bases";
 
   const {
     kbs: allKbs,
@@ -38,7 +78,14 @@ export default function KnowledgePage() {
     deleteKb,
     connectObsidian,
     connectLinkedFolder,
+    linkFolder,
+    unlinkFolder,
+    syncLinkedFolder,
     connectLightRagServer,
+    connectWeKnora,
+    connectMarginNote4,
+    connectIma,
+    connectKiwix,
   } = useKnowledgeBases();
 
   // Connected subagents are stored as ``type: subagent`` KBs so the chat
@@ -55,21 +102,25 @@ export default function KnowledgePage() {
   const [selectedEngineId, setSelectedEngineId] = useState<string | null>(
     initialEngine,
   );
+  const [homeSection, setHomeSection] =
+    useState<KnowledgeHomeSection>(initialHomeSection);
   const [createOpen, setCreateOpen] = useState(false);
+  const [kiwixOpen, setKiwixOpen] = useState(false);
   const [createPreset, setCreatePreset] = useState<{
     mode: "new" | "link";
     source?: string;
   } | null>(null);
-  const [pipelineOpen, setPipelineOpen] = useState(false);
 
   const openCreate = useCallback(() => {
     setCreatePreset(null);
     setCreateOpen(true);
   }, []);
-  // Obsidian lives in the engines grid for discoverability but routes through
-  // the unified create flow, pre-set to "link existing → Obsidian".
-  const openObsidian = useCallback(() => {
-    setCreatePreset({ mode: "link", source: "obsidian" });
+  const openSource = useCallback((source: "obsidian" | "marginnote4" | "kiwix") => {
+    if (source === "kiwix") {
+      setKiwixOpen(true);
+      return;
+    }
+    setCreatePreset({ mode: "link", source });
     setCreateOpen(true);
   }, []);
   // Lands on the Overview console unless deep-linked to a KB or an engine.
@@ -77,12 +128,29 @@ export default function KnowledgePage() {
     initialEngine ? "engine" : initialKb ? "kb" : "home",
   );
 
+  // Dynamic segment changes do not necessarily remount this client page.
+  // Follow the route on browser history navigation instead of restoring a
+  // stale in-memory selection over it.
+  useEffect(() => {
+    if (initialKb) {
+      setExplicitSelection(initialKb);
+      setView("kb");
+    } else if (view === "kb") {
+      setExplicitSelection(null);
+      setView("home");
+    }
+    // Only a route transition should drive this synchronization.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initialKb]);
+
   const openKb = useCallback((name: string) => {
+    setHomeSection("knowledge-bases");
     setExplicitSelection(name);
     setView("kb");
   }, []);
 
   const openEngine = useCallback((id: string) => {
+    setHomeSection("knowledge-engines");
     setSelectedEngineId(id);
     setView("engine");
   }, []);
@@ -91,17 +159,45 @@ export default function KnowledgePage() {
   // exists, otherwise fall back to the default KB (or the first one). No
   // useEffect chains — keeps state out of effects.
   const selectedKbName = useMemo<string | null>(() => {
-    if (explicitSelection && kbs.some((kb) => kb.name === explicitSelection)) {
-      return explicitSelection;
-    }
+    // Do not erase a direct `/knowledge-bases/<name>` visit while the catalog
+    // request is still in flight. Once loading finishes, the normal existence
+    // check below may repair an actually stale name to the default KB.
+    if (loading && explicitSelection) return explicitSelection;
+    const exact = kbs.find((kb) => knowledgeBaseRef(kb) === explicitSelection);
+    if (exact) return knowledgeBaseRef(exact);
+    const legacy = kbs.filter((kb) => kb.name === explicitSelection);
+    if (legacy.length === 1) return knowledgeBaseRef(legacy[0]);
+    if (explicitSelection) return explicitSelection;
     if (!kbs.length) return null;
-    return kbs.find((kb) => kb.is_default)?.name ?? kbs[0].name;
-  }, [explicitSelection, kbs]);
+    return knowledgeBaseRef(kbs.find((kb) => kb.is_default) ?? kbs[0]);
+  }, [explicitSelection, kbs, loading]);
 
   const selectedKb = useMemo(
-    () => kbs.find((kb) => kb.name === selectedKbName) ?? null,
+    () => kbs.find((kb) => knowledgeBaseRef(kb) === selectedKbName) ?? null,
     [kbs, selectedKbName],
   );
+
+  // Saved links may still contain the original qualified ID after a move.
+  // The detail endpoint resolves that ID through the server's move alias.
+  useEffect(() => {
+    if (
+      loading ||
+      !explicitSelection ||
+      kbs.some((kb) => knowledgeBaseRef(kb) === explicitSelection || kb.name === explicitSelection)
+    ) return;
+    let cancelled = false;
+    void apiFetch(
+      apiUrl(`/api/knowledge-bases/${encodeURIComponent(explicitSelection)}?resource_library=true`),
+    )
+      .then((response) => response.ok ? response.json() : null)
+      .then((detail: { id?: string } | null) => {
+        if (!cancelled && detail?.id && kbs.some((kb) => knowledgeBaseRef(kb) === detail.id)) {
+          setExplicitSelection(detail.id);
+        }
+      })
+      .catch(() => undefined);
+    return () => { cancelled = true; };
+  }, [explicitSelection, kbs, loading]);
 
   // The effective engine selection: respect the pick if it still exists.
   const selectedProvider = useMemo(
@@ -109,38 +205,66 @@ export default function KnowledgePage() {
     [providers, selectedEngineId],
   );
 
-  // Keep ?kb / ?engine in sync with the effective selection so deep links work.
-  // The Overview view carries neither, so reloading the console stays on it.
+  // Keep the KB identity in the path. Engine selection and overview section
+  // remain query state because they are views/filters, not KB resources.
   const urlKb = view === "kb" ? (selectedKbName ?? null) : null;
   const urlEngine = view === "engine" ? (selectedProvider?.id ?? null) : null;
+  const urlSection =
+    view === "home" && homeSection === "knowledge-engines" ? "engines" : null;
   useEffect(() => {
     if (typeof window === "undefined") return;
     if (
-      searchParams.get("kb") === urlKb &&
-      searchParams.get("engine") === urlEngine
+      initialKb === urlKb &&
+      searchParams.get("engine") === urlEngine &&
+      searchParams.get("section") === urlSection
     ) {
       return;
     }
     const params = new URLSearchParams(Array.from(searchParams.entries()));
-    if (urlKb) params.set("kb", urlKb);
-    else params.delete("kb");
+    params.delete("kb");
     if (urlEngine) params.set("engine", urlEngine);
     else params.delete("engine");
+    if (urlSection) params.set("section", urlSection);
+    else params.delete("section");
     const search = params.toString();
-    router.replace(search ? `?${search}` : "?", { scroll: false });
-  }, [router, searchParams, urlKb, urlEngine]);
+    const pathname = knowledgeBaseRoute(urlKb);
+    router.replace(search ? `${pathname}?${search}` : pathname, {
+      scroll: false,
+    });
+  }, [initialKb, router, searchParams, urlKb, urlEngine, urlSection]);
 
   const handleCreate = useCallback(
-    async (params: { name: string; provider: string; files: File[] }) => {
+    async (params: {
+      name: string;
+      provider: string;
+      files: File[];
+      storageWorkspaceId?: string;
+      pageindexMode?: "flash" | "standard";
+      searchMode?: string;
+    }) => {
       try {
-        await createKb(params);
-        openKb(params.name);
+        const result = await createKb(params);
+        openKb(result.id || `account:kb:${params.name}`);
       } catch (err) {
         setError(err instanceof Error ? err.message : String(err));
         throw err;
       }
     },
     [createKb, openKb, setError],
+  );
+
+  const handleMove = useCallback(
+    async (sourceId: string, targetWorkspaceId: string) => {
+      try {
+        const result = await moveKnowledgeBase(sourceId, targetWorkspaceId);
+        await refresh({ force: true });
+        openKb(result.target_id);
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err));
+        throw err;
+      }
+    },
+    [openKb, refresh, setError],
   );
 
   const handleSetDefault = useCallback(
@@ -156,10 +280,18 @@ export default function KnowledgePage() {
 
   const handleDelete = useCallback(
     async (name: string) => {
-      if (!window.confirm(t('Delete knowledge base "{{name}}"?', { name }))) {
-        return;
-      }
       try {
+        const workspaces = await resourceUsage("knowledge_bases", name);
+        const impact = workspaces.length
+          ? "\n\n" +
+            t("Used by workspaces: {{names}}", { names: workspaces.join(", ") })
+          : "";
+        if (
+          !window.confirm(
+            t('Delete knowledge base "{{name}}"?', { name }) + impact,
+          )
+        )
+          return;
         await deleteKb(name);
         if (explicitSelection === name) {
           setExplicitSelection(null);
@@ -173,9 +305,9 @@ export default function KnowledgePage() {
   );
 
   const handleUpload = useCallback(
-    async (kbName: string, files: File[]) => {
+    async (kbName: string, files: File[], destSubdir?: string) => {
       try {
-        await uploadFiles(kbName, files);
+        await uploadFiles(kbName, files, undefined, destSubdir);
       } catch (err) {
         setError(err instanceof Error ? err.message : String(err));
         throw err;
@@ -184,12 +316,53 @@ export default function KnowledgePage() {
     [setError, uploadFiles],
   );
 
-  const handleReindex = useCallback(
-    async (kbName: string) => {
+  const handleLinkFolder = useCallback(
+    async (kbName: string, folderPath: string): Promise<LinkedFolderInfo> => {
       try {
-        await reindex(kbName);
+        return await linkFolder(kbName, folderPath);
       } catch (err) {
         setError(err instanceof Error ? err.message : String(err));
+        throw err;
+      }
+    },
+    [linkFolder, setError],
+  );
+
+  const handleUnlinkFolder = useCallback(
+    async (kbName: string, folderId: string): Promise<void> => {
+      try {
+        await unlinkFolder(kbName, folderId);
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err));
+        throw err;
+      }
+    },
+    [setError, unlinkFolder],
+  );
+
+  const handleSyncFolder = useCallback(
+    async (kbName: string, folderId: string): Promise<SyncFolderResponse> => {
+      try {
+        return await syncLinkedFolder(kbName, folderId);
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err));
+        throw err;
+      }
+    },
+    [setError, syncLinkedFolder],
+  );
+
+  const handleReindex = useCallback(
+    async (
+      kbName: string,
+      configFingerprint?: string,
+      embeddingModel?: EmbeddingModelSelection,
+    ) => {
+      try {
+        await reindex(kbName, configFingerprint, embeddingModel);
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err));
+        throw err;
       }
     },
     [reindex, setError],
@@ -254,14 +427,19 @@ export default function KnowledgePage() {
               providers={providers}
               onOpenKb={openKb}
               onOpenEngine={openEngine}
+              onOpenSource={openSource}
               onCreate={openCreate}
-              onConnectObsidian={openObsidian}
+              activeSection={homeSection}
+              onSectionChange={setHomeSection}
             />
           ) : view === "engine" && selectedProvider ? (
             <EngineDetail
               provider={selectedProvider}
               kbs={kbs}
-              onBack={() => setView("home")}
+              onBack={() => {
+                setHomeSection("knowledge-engines");
+                setView("home");
+              }}
               onOpenKb={openKb}
               onSelectMode={handleSelectMode}
               onChanged={() => void refresh({ force: true })}
@@ -274,50 +452,73 @@ export default function KnowledgePage() {
               providers={providers}
               onOpenKb={openKb}
               onOpenEngine={openEngine}
+              onOpenSource={openSource}
               onCreate={openCreate}
-              onConnectObsidian={openObsidian}
+              activeSection={homeSection}
+              onSectionChange={setHomeSection}
             />
           ) : (
             <KnowledgeBaseDetail
               kb={selectedKb}
               uploadPolicy={uploadPolicy}
-              task={selectedKb ? tasksByKb[selectedKb.name] : undefined}
-              history={selectedKb ? (historyByKb[selectedKb.name] ?? []) : []}
+              task={
+                selectedKb ? tasksByKb[knowledgeBaseRef(selectedKb)] : undefined
+              }
+              history={
+                selectedKb
+                  ? (historyByKb[knowledgeBaseRef(selectedKb)] ?? [])
+                  : []
+              }
               onCreate={openCreate}
               onUpload={handleUpload}
+              onLinkFolder={handleLinkFolder}
+              onUnlinkFolder={handleUnlinkFolder}
+              onSyncFolder={handleSyncFolder}
               onReindex={handleReindex}
               onRetry={handleRetry}
               onSetDefault={handleSetDefault}
               onDelete={handleDelete}
+              onMove={handleMove}
               onClearHistory={clearHistory}
-              onBack={() => setView("home")}
+              onBack={() => {
+                setHomeSection("knowledge-bases");
+                setView("home");
+              }}
             />
           )}
         </div>
       )}
 
-      <CreateKbModal
-        isOpen={createOpen}
-        onClose={() => setCreateOpen(false)}
-        providers={providers}
-        uploadPolicy={uploadPolicy}
-        onCreate={handleCreate}
-        onConnectLinkedFolder={connectLinkedFolder}
-        onConnectObsidian={connectObsidian}
-        onConnectLightRagServer={connectLightRagServer}
-        initialMode={createPreset?.mode}
-        initialSource={createPreset?.source}
-        onConfigureProvider={() => {
-          setCreateOpen(false);
-          setPipelineOpen(true);
-        }}
-      />
-
-      <PageIndexSettingsModal
-        isOpen={pipelineOpen}
-        onClose={() => setPipelineOpen(false)}
-        onSaved={() => void refresh({ force: true })}
-      />
+      {createOpen ? (
+        <CreateKbModal
+          isOpen
+          onClose={() => setCreateOpen(false)}
+          providers={providers}
+          uploadPolicy={uploadPolicy}
+          onCreate={handleCreate}
+          onConnectLinkedFolder={connectLinkedFolder}
+          onConnectObsidian={connectObsidian}
+          onConnectLightRagServer={connectLightRagServer}
+          onConnectWeKnora={connectWeKnora}
+          onConnectMarginNote4={connectMarginNote4}
+          onConnectIma={connectIma}
+          initialMode={createPreset?.mode}
+          initialSource={createPreset?.source}
+          onConfigureProvider={(providerId) => {
+            setCreateOpen(false);
+            openEngine(providerId);
+          }}
+        />
+      ) : null}
+      {kiwixOpen ? (
+        <ConnectKiwixModal
+          onClose={() => setKiwixOpen(false)}
+          onConnect={async (params) => {
+            await connectKiwix(params);
+            openKb(`account:kb:${params.name}`);
+          }}
+        />
+      ) : null}
     </div>
   );
 }

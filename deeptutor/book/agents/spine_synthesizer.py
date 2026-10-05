@@ -35,7 +35,8 @@ import logging
 from typing import Any
 
 from deeptutor.agents.base_agent import BaseAgent
-from deeptutor.utils.json_parser import parse_json_response
+from deeptutor.services.llm.structured_retry import json_with_reasoning_retry
+from deeptutor.services.llm.types import StreamOutcome
 
 from ..models import (
     BookProposal,
@@ -88,7 +89,11 @@ class SpineSynthesizer(BaseAgent):
         base_url: str | None = None,
         api_version: str | None = None,
         language: str = "en",
-        binding: str = "openai",
+        # None, not "openai": BaseAgent falls back to the configured
+        # provider only when this is falsy. Hard-coding it forced every
+        # user onto the OpenAI wire format. Matches the pattern in
+        # deeptutor/agents/research/pipeline.py:403.
+        binding: str | None = None,
         *,
         max_rounds: int = 2,
     ) -> None:
@@ -197,6 +202,7 @@ class SpineSynthesizer(BaseAgent):
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             stage="spine_draft",
+            expected_key="chapters",
         )
 
     async def _critique(
@@ -244,6 +250,7 @@ class SpineSynthesizer(BaseAgent):
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             stage="spine_revise",
+            expected_key="chapters",
         )
 
     async def _call_json(
@@ -252,25 +259,44 @@ class SpineSynthesizer(BaseAgent):
         system_prompt: str,
         user_prompt: str,
         stage: str,
+        expected_key: str | None = None,
     ) -> dict[str, Any]:
         from ..blocks._language import language_directive
 
         system_prompt = system_prompt.rstrip() + language_directive(self.language)
-        try:
-            buf: list[str] = []
-            async for piece in self.stream_llm(
+
+        async def _run(reasoning_effort: str | None) -> str:
+            # Collect the whole stream before parsing. Its terminal reason
+            # distinguishes a capped, repairable fragment from a finished JSON
+            # object; accepting that fragment can silently lose chapters.
+            outcome = StreamOutcome()
+            chunks: list[str] = []
+            async for chunk in self.stream_llm(
                 user_prompt=user_prompt,
                 system_prompt=system_prompt,
                 response_format={"type": "json_object"},
                 stage=stage,
+                reasoning_effort=reasoning_effort,
+                outcome=outcome,
             ):
-                buf.append(piece)
-            raw = "".join(buf)
+                chunks.append(chunk)
+            if outcome.truncated:
+                return ""
+            return "".join(chunks)
+
+        try:
+            # A reasoning model can spend the whole budget thinking and return
+            # nothing to parse; the retry asks the same question with thinking
+            # turned down rather than letting the spine silently degrade to a
+            # single "Overview" chapter (#1316).
+            return await json_with_reasoning_retry(
+                _run,
+                expected_key=expected_key,
+                logger_instance=self.logger,
+            )
         except Exception as exc:
             logger.warning(f"SpineSynthesizer LLM call ({stage}) failed: {exc}")
             return {}
-        payload = parse_json_response(raw, logger_instance=self.logger, fallback={})
-        return payload if isinstance(payload, dict) else {}
 
     # ------------------------------------------------------------------ #
     # Materialise: payload → Spine + ConceptGraph (with validation)
@@ -421,6 +447,7 @@ class SpineSynthesizer(BaseAgent):
                     anchors.append(
                         SourceAnchor(
                             kind=_clip(str(anchor_item.get("kind") or "manual"), 32),
+                            kb_name=_clip(str(anchor_item.get("kb_name") or ""), 120),
                             ref=_clip(str(anchor_item.get("ref") or ""), 200),
                             snippet=_clip(str(anchor_item.get("snippet") or ""), 300),
                         )

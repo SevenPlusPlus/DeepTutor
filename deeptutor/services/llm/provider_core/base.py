@@ -6,6 +6,7 @@ from abc import ABC, abstractmethod
 import asyncio
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
+import inspect
 import json
 from typing import Any
 
@@ -51,6 +52,7 @@ class LLMResponse:
     usage: dict[str, int] = field(default_factory=dict)
     reasoning_content: str | None = None
     thinking_blocks: list[dict[str, Any]] | None = None
+    provider_specific_fields: dict[str, Any] = field(default_factory=dict)
 
     @property
     def has_tool_calls(self) -> bool:
@@ -81,6 +83,10 @@ class LLMProvider(ABC):
         "overloaded",
         "timeout",
         "timed out",
+        # An idle stream that never delivered its final message: the wording
+        # ``chat_stream`` uses for its own stall guard, which is as retryable
+        # as the timeouts above and was being classified as permanent.
+        "stalled",
         "connection",
         "server error",
         "temporarily unavailable",
@@ -117,6 +123,23 @@ class LLMProvider(ABC):
         self.api_key = api_key
         self.api_base = api_base
         self.generation: GenerationSettings = GenerationSettings()
+
+    async def aclose(self) -> None:
+        """Release an SDK/HTTP client owned by this provider.
+
+        Provider implementations intentionally expose a common lifecycle even
+        though the underlying SDKs use either ``close`` or ``aclose``.  Most
+        providers own no client and therefore make this a cheap no-op.
+        """
+        client = getattr(self, "_client", None)
+        if client is None:
+            return
+        close = getattr(client, "aclose", None) or getattr(client, "close", None)
+        if not callable(close):
+            return
+        result = close()
+        if inspect.isawaitable(result):
+            await result
 
     @staticmethod
     def _sanitize_empty_content(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -267,11 +290,22 @@ class LLMProvider(ABC):
         allow_image_fallback: bool = True,
         **kwargs: Any,
     ) -> LLMResponse:
+        from deeptutor.services.llm.metrics import measure_provider_call
         from deeptutor.services.llm.multimodal import (
             has_image_parts,
             strip_image_parts,
             strip_image_parts_inplace,
         )
+
+        raw_call = call
+
+        async def measured_call(**call_kwargs: Any) -> LLMResponse:
+            call_kwargs["model"] = call_kwargs.get("model") or self.get_default_model()
+            return await measure_provider_call(
+                raw_call,
+                provider=getattr(self, "provider_name", self.__class__.__name__),
+                **call_kwargs,
+            )
 
         delays = self._normalize_retry_delays(retry_delays)
         attempt = 0
@@ -279,7 +313,7 @@ class LLMProvider(ABC):
         while True:
             attempt += 1
             try:
-                response = await call(
+                response = await measured_call(
                     messages=messages,
                     tools=tools,
                     model=model,
@@ -310,7 +344,7 @@ class LLMProvider(ABC):
                         "Non-transient LLM error with image content; model is not"
                         " known vision-capable, retrying once without images"
                     )
-                    retry_response = await call(
+                    retry_response = await measured_call(
                         messages=strip_image_parts(messages),
                         tools=tools,
                         model=model,

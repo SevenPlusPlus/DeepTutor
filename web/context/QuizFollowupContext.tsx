@@ -33,9 +33,10 @@ import {
   type ChatMessage,
   type LLMSelection,
   type StreamEvent,
-  UnifiedWSClient,
-} from "@/lib/unified-ws";
+} from "@/features/chat/model/protocol";
+import { UnifiedTurnClient } from "@/features/chat/transport/UnifiedTurnClient";
 import type { QuizQuestion } from "@/lib/quiz-types";
+import type { SelectionTutorContext } from "@/lib/selection-tutor";
 
 export interface FollowupMessage {
   role: "user" | "assistant" | "system";
@@ -107,6 +108,8 @@ export interface QuizFollowupTabContext {
   language: string;
   /** Short label for the tab strip, e.g. "Q1 follow-up". */
   tabLabel: string;
+  /** Present when this thread tutors a selected chat passage, not a quiz. */
+  tutorSelection?: SelectionTutorContext;
 }
 
 export interface SendMessageInput {
@@ -124,7 +127,7 @@ export interface SendMessageInput {
   language?: string;
   /** Selected knowledge bases (names) for this turn. */
   knowledgeBases?: string[];
-  /** Notebook/book/history/question references — same shape the
+  /** Notebook/books/history/question references — same shape the
    *  main ChatPage builds for ``sendMessage``. */
   notebookReferences?: { notebook_id: string; record_ids: string[] }[];
   historyReferences?: string[];
@@ -177,7 +180,7 @@ export interface QuizFollowupController {
           text?: string;
           answers?: Array<{ questionId: string; text: string }>;
         },
-  ): void;
+  ): Promise<boolean>;
   /** Tab open helper — forwards to whoever registered an open handler. */
   openFollowupTab(context: QuizFollowupTabContext): void;
   /**
@@ -218,7 +221,7 @@ export function QuizFollowupProvider({ children }: ProviderProps) {
   );
   const threadsRef = useRef<Record<string, FollowupThreadState>>({});
   const runnersRef = useRef<
-    Map<string, { questionKey: string; client: UnifiedWSClient }>
+    Map<string, { questionKey: string; client: UnifiedTurnClient }>
   >(new Map());
   // Notebook entry ids per question — captured from sendMessage so the
   // ``session`` event handler can persist ``followup_session_id`` on the
@@ -353,7 +356,7 @@ export function QuizFollowupProvider({ children }: ProviderProps) {
       }
       const record = {
         questionKey: key,
-        client: new UnifiedWSClient(
+        client: new UnifiedTurnClient(
           (event) => handleThreadEvent(key, event),
           () => {
             const current = threadsRef.current[key];
@@ -379,7 +382,12 @@ export function QuizFollowupProvider({ children }: ProviderProps) {
   );
 
   const sendThroughRunner = useCallback(
-    function send(key: string, message: ChatMessage, attempt = 0) {
+    function send(
+      key: string,
+      message: ChatMessage,
+      options: { awaitAck?: boolean; attempt?: number } = {},
+    ): Promise<boolean> {
+      const attempt = options.attempt ?? 0;
       const runner = ensureRunner(key);
       if (!runner.client.connected) {
         if (attempt >= 10) {
@@ -389,12 +397,20 @@ export function QuizFollowupProvider({ children }: ProviderProps) {
             currentStage: "",
             error: "Follow-up chat failed to connect.",
           }));
-          return;
+          return Promise.resolve(false);
         }
-        window.setTimeout(() => send(key, message, attempt + 1), 200);
-        return;
+        return new Promise<boolean>((resolve) => {
+          window.setTimeout(
+            () => resolve(send(key, message, { ...options, attempt: attempt + 1 })),
+            200,
+          );
+        });
+      }
+      if (options.awaitAck) {
+        return runner.client.sendAwaitingAck(message);
       }
       runner.client.send(message);
+      return Promise.resolve(true);
     },
     [ensureRunner, updateThread],
   );
@@ -416,6 +432,15 @@ export function QuizFollowupProvider({ children }: ProviderProps) {
         messages: [...prev.messages, { role: "user", content }],
       }));
 
+      const {
+        followup_question_context: followupQuestionContext,
+        selection_tutor_context: selectionTutorContext,
+        subagent_consult_budget: subagentConsultBudget,
+        consult_partner_id: consultPartnerId,
+        partner_discussion_group_id: partnerDiscussionGroupId,
+        auto_route: autoRoute,
+        ...capabilityConfig
+      } = input.config ?? {};
       sendThroughRunner(input.questionKey, {
         type: "start_turn",
         content,
@@ -425,7 +450,32 @@ export function QuizFollowupProvider({ children }: ProviderProps) {
         session_id: current.sessionId,
         attachments: input.attachments,
         language: input.language,
-        config: input.config,
+        ...(Object.keys(capabilityConfig).length
+          ? { config: capabilityConfig }
+          : {}),
+        ...(followupQuestionContext &&
+        typeof followupQuestionContext === "object"
+          ? {
+              followup_question_context: followupQuestionContext as Record<
+                string,
+                unknown
+              >,
+            }
+          : {}),
+        ...(selectionTutorContext && typeof selectionTutorContext === "object"
+          ? {
+              selection_tutor_context: selectionTutorContext as Record<
+                string,
+                unknown
+              >,
+            }
+          : {}),
+        ...(typeof consultPartnerId === "string" && consultPartnerId ? { consult_partner_id: consultPartnerId } : {}),
+        ...(typeof partnerDiscussionGroupId === "string" && partnerDiscussionGroupId ? { partner_discussion_group_id: partnerDiscussionGroupId } : {}),
+        ...(typeof subagentConsultBudget === "number"
+          ? { subagent_consult_budget: subagentConsultBudget }
+          : {}),
+        ...(typeof autoRoute === "boolean" ? { auto_route: autoRoute } : {}),
         notebook_references: input.notebookReferences,
         history_references: input.historyReferences,
         book_references: input.bookReferences,
@@ -443,7 +493,7 @@ export function QuizFollowupProvider({ children }: ProviderProps) {
   );
 
   const submitAskUserReply = useCallback(
-    (
+    async (
       key: string,
       reply:
         | string
@@ -451,22 +501,23 @@ export function QuizFollowupProvider({ children }: ProviderProps) {
             text?: string;
             answers?: Array<{ questionId: string; text: string }>;
           },
-    ) => {
+    ): Promise<boolean> => {
       const current = threadsRef.current[key];
       const turnId = current?.activeTurnId;
-      if (!current || !turnId) return;
+      if (!current || !turnId) return false;
       // Allow submission either while the turn is still streaming OR while
       // it's paused on an unresolved ask_user card (matches the main chat's
       // ``submitUserReply`` guard).
       const pendingAskUser = current.messages.some((m) =>
         hasPendingAskUser(m.events, turnId),
       );
-      if (!current.isStreaming && !pendingAskUser) return;
+      if (!current.isStreaming && !pendingAskUser) return false;
 
-      const message: import("@/lib/unified-ws").SubmitUserReplyMessage = {
-        type: "submit_user_reply",
-        turn_id: turnId,
-      };
+      const message: import("@/features/chat/model/protocol").SubmitUserReplyMessage =
+        {
+          type: "submit_user_reply",
+          turn_id: turnId,
+        };
       if (typeof reply === "string") {
         message.text = reply;
       } else {
@@ -482,7 +533,14 @@ export function QuizFollowupProvider({ children }: ProviderProps) {
         isStreaming: true,
         error: null,
       }));
-      sendThroughRunner(key, message);
+      const accepted = await sendThroughRunner(key, message, {
+        awaitAck: true,
+      });
+      if (!accepted) {
+        // The turn is gone; stop showing a spinner for work nobody is doing.
+        updateThread(key, (prev) => ({ ...prev, isStreaming: false }));
+      }
+      return accepted;
     },
     [sendThroughRunner, updateThread],
   );

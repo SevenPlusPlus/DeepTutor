@@ -21,8 +21,8 @@ import pytest
 from deeptutor.agents.chat.agentic_pipeline import AgenticChatPipeline
 from deeptutor.core.context import UnifiedContext
 from deeptutor.core.stream import StreamEvent, StreamEventType
-from deeptutor.core.stream_bus import StreamBus
 from deeptutor.core.tool_protocol import ToolResult
+from deeptutor.runtime.stream_bus import StreamBus
 
 
 async def _collect_bus_events(bus: StreamBus) -> tuple[list[StreamEvent], asyncio.Task[Any]]:
@@ -84,6 +84,10 @@ class _SeedRegistry:
         self._metadata = metadata if metadata is not None else {"content": _PASSAGE}
         self._raise = raise_exc
 
+    def deferred_tools(self) -> list[Any]:
+        """No provider tools: keeps the turn on this registry (see view.py)."""
+        return []
+
     def build_prompt_text(self, *_args, **_kwargs):
         return "- rag: retrieve from a knowledge base"
 
@@ -125,7 +129,7 @@ def _make_pipeline(
     client: _ScriptedChatClient,
 ) -> AgenticChatPipeline:
     monkeypatch.setattr(
-        "deeptutor.agents.chat.agentic_pipeline.get_llm_config",
+        "deeptutor.agents.loop.pipeline.get_llm_config",
         lambda: SimpleNamespace(
             binding="openai", model="gpt-test", api_key="k", base_url="u", api_version=None
         ),

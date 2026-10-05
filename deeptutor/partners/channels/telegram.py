@@ -19,7 +19,6 @@ from telegram.request import HTTPXRequest
 from deeptutor.partners.bus.events import OutboundMessage
 from deeptutor.partners.bus.queue import MessageBus
 from deeptutor.partners.channels.base import BaseChannel
-from deeptutor.partners.config.paths import get_media_dir
 from deeptutor.partners.config.schema import DeliveryOverrides, StreamingSupport
 from deeptutor.partners.helpers import (
     is_markdown_table_separator_row,
@@ -272,6 +271,13 @@ class TelegramChannel(BaseChannel):
         """Start the Telegram bot with long polling."""
         if not self.config.token:
             logger.error("Telegram bot token not configured")
+            self.set_setup_state(
+                "action_required",
+                message=(
+                    "Required fields are missing. Complete the channel configuration "
+                    "and save again."
+                ),
+            )
             return
 
         self._running = True
@@ -334,6 +340,7 @@ class TelegramChannel(BaseChannel):
         self._bot_user_id = getattr(bot_info, "id", None)
         self._bot_username = getattr(bot_info, "username", None)
         logger.info("Telegram bot @{} connected", bot_info.username)
+        self.set_setup_state("connected")
 
         try:
             await self._app.bot.set_my_commands(self.BOT_COMMANDS)
@@ -801,7 +808,7 @@ class TelegramChannel(BaseChannel):
                 getattr(media_file, "mime_type", None),
                 getattr(media_file, "file_name", None),
             )
-            media_dir = get_media_dir("telegram")
+            media_dir = self.media_dir()
             unique_id = getattr(media_file, "file_unique_id", media_file.file_id)
             file_path = media_dir / f"{unique_id}{ext}"
             await file.download_to_drive(str(file_path))

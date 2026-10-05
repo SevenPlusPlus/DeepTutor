@@ -47,7 +47,7 @@ def _model() -> CodexModel:
 def test_codex_upstream_contract_is_pinned() -> None:
     assert CODEX_OAUTH_CLIENT_ID == "app_EMoamEEZ73f0CkXaXp7hrann"
     assert CODEX_CALLBACK_PORTS == (1455, 1457)
-    assert CODEX_CLIENT_VERSION == "0.145.0"
+    assert CODEX_CLIENT_VERSION == "0.153.4"
     assert CODEX_MODELS_URL.endswith("/backend-api/codex/models")
     assert CODEX_DEFAULT_MODEL == "gpt-5.6-sol"
 
@@ -154,6 +154,7 @@ def test_catalog_snapshot_round_trip_preserves_tuples() -> None:
         etag='"catalog-v1"',
         generation=7,
         account_hash="account-hash",
+        client_version="1.2.3",
     )
 
     restored = CatalogSnapshot.from_dict(snapshot.to_dict())
@@ -161,3 +162,93 @@ def test_catalog_snapshot_round_trip_preserves_tuples() -> None:
     assert restored == snapshot
     assert isinstance(restored.models, tuple)
     assert isinstance(restored.models[0].supported_reasoning_levels, tuple)
+
+
+@pytest.mark.parametrize("version", [True, 123, "", "1.2.3-beta", "1.2.3\n"])
+def test_catalog_snapshot_rejects_invalid_cached_client_version(version: object) -> None:
+    payload = CatalogSnapshot(
+        models=(),
+        source="live",
+        fetched_at=1_000,
+        etag=None,
+        generation=1,
+        account_hash="account-hash",
+    ).to_dict()
+    payload["client_version"] = version
+    with pytest.raises(CodexAuthError) as error:
+        CatalogSnapshot.from_dict(payload)
+    assert error.value.code == "catalog_corrupt"
+
+
+def test_legacy_catalog_defaults_to_valid_models_without_known_version() -> None:
+    payload = CatalogSnapshot(
+        models=(_model(),),
+        source="live",
+        fetched_at=1_000,
+        etag=None,
+        generation=1,
+        account_hash="account-hash",
+    ).to_dict()
+    del payload["models_valid"]
+    del payload["client_version"]
+    restored = CatalogSnapshot.from_dict(payload)
+    assert restored.models_valid is True
+    assert restored.client_version is None
+
+
+@pytest.mark.parametrize("value", [None, "false", 0, 1])
+def test_cache_validity_marker_must_be_boolean(value: object) -> None:
+    payload = CatalogSnapshot(
+        models=(),
+        source="live",
+        fetched_at=1_000,
+        etag=None,
+        generation=1,
+        account_hash="account-hash",
+    ).to_dict()
+    payload["models_valid"] = value
+    with pytest.raises(CodexAuthError) as error:
+        CatalogSnapshot.from_dict(payload)
+    assert error.value.code == "catalog_corrupt"
+
+
+def test_codex_model_round_trip_preserves_context_windows() -> None:
+    model = CodexModel(
+        slug="gpt-5.6-sol",
+        display_name="GPT-5.6-Sol",
+        priority=10,
+        visibility="list",
+        default_reasoning_level="medium",
+        supported_reasoning_levels=("low", "medium", "high"),
+        supports_reasoning_summary=True,
+        supports_parallel_tool_calls=True,
+        use_responses_lite=False,
+        context_window=272_000,
+        max_context_window=272_000,
+    )
+
+    restored = CodexModel.from_dict(model.to_dict())
+
+    assert restored == model
+
+
+def test_codex_model_accepts_cache_without_context_windows() -> None:
+    payload = _model().to_dict()
+    payload.pop("context_window")
+    payload.pop("max_context_window")
+
+    restored = CodexModel.from_dict(payload)
+
+    assert restored.context_window is None
+    assert restored.max_context_window is None
+
+
+def test_codex_model_normalizes_legacy_luna_reasoning_cache() -> None:
+    payload = _model().to_dict()
+    payload["slug"] = "gpt-5.6-luna"
+    payload["display_name"] = "GPT-5.6-Luna"
+    payload["supported_reasoning_levels"] = ["low", "medium"]
+
+    restored = CodexModel.from_dict(payload)
+
+    assert restored.supported_reasoning_levels == ("none", "low", "medium")

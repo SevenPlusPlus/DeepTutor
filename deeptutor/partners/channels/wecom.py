@@ -12,7 +12,6 @@ from pydantic import Field
 from deeptutor.partners.bus.events import OutboundMessage
 from deeptutor.partners.bus.queue import MessageBus
 from deeptutor.partners.channels.base import BaseChannel
-from deeptutor.partners.config.paths import get_media_dir
 from deeptutor.partners.config.schema import DeliveryOverrides
 
 WECOM_AVAILABLE = importlib.util.find_spec("wecom_aibot_sdk") is not None
@@ -69,10 +68,21 @@ class WecomChannel(BaseChannel):
         """Start the WeCom bot with WebSocket long connection."""
         if not WECOM_AVAILABLE:
             logger.error("WeCom SDK not installed. Run: pip install deeptutor[wecom]")
+            self.set_setup_state(
+                "unavailable",
+                message="Required channel dependency is not installed on this server.",
+            )
             return
 
         if not self.config.bot_id or not self.config.secret:
             logger.error("WeCom bot_id and secret not configured")
+            self.set_setup_state(
+                "action_required",
+                message=(
+                    "Required fields are missing. Complete the channel configuration "
+                    "and save again."
+                ),
+            )
             return
 
         from wecom_aibot_sdk import WSClient, generate_req_id
@@ -121,19 +131,26 @@ class WecomChannel(BaseChannel):
     async def _on_connected(self, frame: Any = None) -> None:
         """Handle WebSocket connected event."""
         logger.info("WeCom WebSocket connected")
+        self.set_setup_state("connecting")
 
     async def _on_authenticated(self, frame: Any = None) -> None:
         """Handle authentication success event."""
         logger.info("WeCom authenticated successfully")
+        self.set_setup_state("connected")
 
     async def _on_disconnected(self, frame: Any) -> None:
         """Handle WebSocket disconnected event."""
         reason = frame.body if hasattr(frame, "body") else str(frame)
         logger.warning("WeCom WebSocket disconnected: {}", reason)
+        self.set_setup_state("connecting")
 
     async def _on_error(self, frame: Any) -> None:
         """Handle error event."""
         logger.error("WeCom error: {}", frame)
+        self.set_setup_state(
+            "error",
+            message="Channel connection failed; the listener will retry.",
+        )
 
     async def _on_text_message(self, frame: Any) -> None:
         """Handle text message."""
@@ -331,7 +348,7 @@ class WecomChannel(BaseChannel):
                 logger.warning("Failed to download media from WeCom")
                 return None
 
-            media_dir = get_media_dir("wecom")
+            media_dir = self.media_dir()
             if not filename:
                 filename = fname or f"{media_type}_{hash(file_url) % 100000}"
             filename = os.path.basename(filename)

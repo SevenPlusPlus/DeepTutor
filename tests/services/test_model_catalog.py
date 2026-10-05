@@ -2,7 +2,7 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
 
-from deeptutor.services.config.model_catalog import ModelCatalogService
+from deeptutor.services.config.model_catalog import SERVICE_NAMES, ModelCatalogService
 
 
 def test_load_creates_empty_catalog_without_dotenv_hydration(tmp_path: Path):
@@ -105,18 +105,247 @@ def test_load_recovers_invalid_catalog_with_defaults(tmp_path: Path):
 
     catalog = ModelCatalogService(path=catalog_path).load()
 
-    expected_services = {
-        "llm",
-        "embedding",
-        "search",
-        "tts",
-        "stt",
-        "imagegen",
-        "videogen",
-    }
+    # Derived rather than re-listed: a new service should not need this test
+    # edited to keep passing, only the one that describes it.
+    expected_services = set(SERVICE_NAMES)
     assert set(catalog["services"]) == expected_services
     saved = json.loads(catalog_path.read_text(encoding="utf-8"))
     assert set(saved["services"]) == expected_services
+
+
+def test_load_migrates_only_legacy_dashscope_stt_model(tmp_path: Path):
+    catalog_path = tmp_path / "model_catalog.json"
+    catalog_path.write_text(
+        json.dumps(
+            {
+                "services": {
+                    "stt": {
+                        "active_profile_id": "dashscope-profile",
+                        "active_model_id": "dashscope-model",
+                        "profiles": [
+                            {
+                                "id": "dashscope-profile",
+                                "binding": "bailian",
+                                "models": [
+                                    {
+                                        "id": "dashscope-model",
+                                        "name": "paraformer-v2",
+                                        "model": "paraformer-v2",
+                                    },
+                                    {
+                                        "id": "custom-name",
+                                        "name": "My speech model",
+                                        "model": "paraformer-v2",
+                                    },
+                                ],
+                            },
+                            {
+                                "id": "other-profile",
+                                "binding": "openai",
+                                "models": [
+                                    {
+                                        "id": "other-model",
+                                        "name": "paraformer-v2",
+                                        "model": "paraformer-v2",
+                                    }
+                                ],
+                            },
+                        ],
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = ModelCatalogService(path=catalog_path).load()
+    models = loaded["services"]["stt"]["profiles"]
+    assert models[0]["models"][0]["model"] == "paraformer-realtime-v2"
+    assert models[0]["models"][0]["name"] == "paraformer-realtime-v2"
+    assert models[0]["models"][1]["model"] == "paraformer-realtime-v2"
+    assert models[0]["models"][1]["name"] == "My speech model"
+    assert models[1]["models"][0]["model"] == "paraformer-v2"
+    assert json.loads(catalog_path.read_text(encoding="utf-8")) == loaded
+
+
+def test_load_migrates_legacy_stt_for_effective_provider_refs(tmp_path: Path):
+    catalog_path = tmp_path / "model_catalog.json"
+    catalog_path.write_text(
+        json.dumps(
+            {
+                "connections": [
+                    {"id": "dashscope", "provider": "dashscope"},
+                    {"id": "openai", "provider": "openai"},
+                ],
+                "services": {
+                    "stt": {
+                        "profiles": [
+                            {
+                                "id": "source",
+                                "binding": "dashscope",
+                                "models": [
+                                    {"id": "source-model", "model": "paraformer-realtime-v2"}
+                                ],
+                            },
+                            {
+                                "id": "profile-ref",
+                                "binding": "custom",
+                                "provider_ref": {"connection_id": "dashscope"},
+                                "models": [{"id": "profile-model", "model": "paraformer-v2"}],
+                            },
+                            {
+                                "id": "model-ref",
+                                "binding": "openai",
+                                "models": [
+                                    {
+                                        "id": "model-ref-model",
+                                        "model": "paraformer-v2",
+                                        "provider_ref": {"service": "stt", "profile_id": "source"},
+                                    }
+                                ],
+                            },
+                            {
+                                "id": "model-override",
+                                "binding": "dashscope",
+                                "provider_ref": {"connection_id": "dashscope"},
+                                "models": [
+                                    {
+                                        "id": "other-model",
+                                        "model": "paraformer-v2",
+                                        "provider_ref": {"connection_id": "openai"},
+                                    }
+                                ],
+                            },
+                            {
+                                "id": "profile-override",
+                                "binding": "dashscope",
+                                "provider_ref": {"connection_id": "openai"},
+                                "models": [{"id": "other-profile-model", "model": "paraformer-v2"}],
+                            },
+                        ]
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = ModelCatalogService(path=catalog_path).load()
+    models = {
+        profile["id"]: profile["models"][0]["model"]
+        for profile in loaded["services"]["stt"]["profiles"]
+    }
+    assert models == {
+        "source": "paraformer-realtime-v2",
+        "profile-ref": "paraformer-realtime-v2",
+        "model-ref": "paraformer-realtime-v2",
+        "model-override": "paraformer-v2",
+        "profile-override": "paraformer-v2",
+    }
+    assert json.loads(catalog_path.read_text(encoding="utf-8")) == loaded
+
+
+def test_load_normalizes_wire_api_to_supported_profile_backends(tmp_path: Path):
+    catalog_path = tmp_path / "model_catalog.json"
+    catalog_path.write_text(
+        json.dumps(
+            {
+                "services": {
+                    "llm": {
+                        "active_profile_id": "azure-profile",
+                        "active_model_id": "azure-model",
+                        "profiles": [
+                            {
+                                "id": "azure-profile",
+                                "name": "Azure",
+                                "binding": "azure_openai",
+                                "wire_api": "responses",
+                                "models": [
+                                    {
+                                        "id": "azure-model",
+                                        "name": "Deployment",
+                                        "model": "deployment-name",
+                                    }
+                                ],
+                            },
+                            {
+                                "id": "custom-profile",
+                                "name": "Custom",
+                                "binding": "custom",
+                                "wire_api": "unknown-protocol",
+                                "models": [],
+                            },
+                        ],
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = ModelCatalogService(path=catalog_path).load()
+    profiles = loaded["services"]["llm"]["profiles"]
+
+    assert profiles[0]["wire_api"] == "auto"
+    assert profiles[1]["wire_api"] == "auto"
+
+
+def _gemini_embedding_catalog(path: Path, model: str) -> Path:
+    path.write_text(
+        json.dumps(
+            {
+                "services": {
+                    "embedding": {
+                        "active_profile_id": "gemini-profile",
+                        "active_model_id": "gemini-model",
+                        "profiles": [
+                            {
+                                "id": "gemini-profile",
+                                "name": "Gemini",
+                                "binding": "gemini",
+                                "base_url": "",
+                                "api_key": "test-key",
+                                "models": [
+                                    {
+                                        "id": "gemini-model",
+                                        "name": model,
+                                        "model": model,
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_load_sets_gemini_native_endpoint_from_active_embedding_model(tmp_path: Path):
+    catalog_path = _gemini_embedding_catalog(tmp_path / "model_catalog.json", "gemini-embedding-2")
+
+    catalog = ModelCatalogService(path=catalog_path).load()
+
+    profile = catalog["services"]["embedding"]["profiles"][0]
+    assert profile["base_url"].endswith("/models/gemini-embedding-2:batchEmbedContents")
+
+
+def test_load_keeps_older_gemini_embedding_models_on_the_openai_path(tmp_path: Path):
+    """The native route sends a taskType and L2-normalizes, so moving an
+    existing gemini-embedding-001 profile there would change its document
+    vectors and invalidate the index built from them."""
+    catalog_path = _gemini_embedding_catalog(
+        tmp_path / "model_catalog.json", "gemini-embedding-001"
+    )
+
+    catalog = ModelCatalogService(path=catalog_path).load()
+
+    profile = catalog["services"]["embedding"]["profiles"][0]
+    assert profile["base_url"] == (
+        "https://generativelanguage.googleapis.com/v1beta/openai/embeddings"
+    )
 
 
 def test_load_persists_normalized_active_ids(tmp_path: Path):

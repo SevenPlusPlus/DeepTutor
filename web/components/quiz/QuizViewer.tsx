@@ -15,13 +15,12 @@ import {
   ChevronLeft,
   ChevronRight,
   Eye,
-  FolderPlus,
   ImagePlus,
   Loader2,
   MessageSquarePlus,
-  Plus,
   RotateCcw,
   Sparkles,
+  Square,
   X,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
@@ -43,6 +42,7 @@ import {
   type QuizJudgeHandle,
 } from "@/lib/quiz-judge";
 import { type QuizQuestion } from "@/lib/quiz-types";
+import CategoryMenu from "@/components/space/question-bank/CategoryMenu";
 import {
   addEntryToCategory,
   createCategory,
@@ -54,6 +54,9 @@ import {
 } from "@/lib/notebook-api";
 import { recordQuizResults } from "@/lib/session-api";
 import { apiUrl } from "@/lib/api";
+import Tooltip from "@/shared/ui/Tooltip";
+
+import { randomUuid } from "@/lib/random-uuid";
 
 /** Resolve a possibly-relative AttachmentStore URL to an absolute one so
  *  ``<img src>`` works regardless of the API/frontend port pairing. */
@@ -111,10 +114,7 @@ const EMPTY_ANSWER: AnswerState = {
 };
 
 function makeAnswerImageId(): string {
-  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
-    return crypto.randomUUID().replaceAll("-", "").slice(0, 12);
-  }
-  return Math.random().toString(36).slice(2, 14);
+  return randomUuid().replaceAll("-", "").slice(0, 12);
 }
 
 type JudgmentState = {
@@ -212,11 +212,6 @@ export default function QuizViewer({
     Record<string, string>
   >({});
   const [categories, setCategories] = useState<NotebookCategory[]>([]);
-  const [categoryDropdownKey, setCategoryDropdownKey] = useState<string | null>(
-    null,
-  );
-  const [newCategoryName, setNewCategoryName] = useState("");
-  const [categoryBusy, setCategoryBusy] = useState(false);
 
   const [judgments, setJudgments] = useState<Record<number, JudgmentState>>({});
   const [answerViews, setAnswerViews] = useState<Record<number, AnswerView>>(
@@ -364,62 +359,63 @@ export default function QuizViewer({
     }
   }, []);
 
-  const handleOpenCategoryDropdown = useCallback(() => {
-    if (!q) return;
-    const key = getQuestionKey(q, idx);
-    if (categoryDropdownKey === key) {
-      setCategoryDropdownKey(null);
-      return;
-    }
-    setCategoryDropdownKey(key);
-    void loadCategories();
-  }, [categoryDropdownKey, idx, loadCategories, q]);
+  // Load the category list once, so the file-into menu opens already
+  // populated. Guarded against a late response landing after unmount.
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const next = await listCategories();
+        if (!cancelled) setCategories(next);
+      } catch {
+        /* ignore */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const handleAddToCategory = useCallback(
     async (catId: number) => {
       if (!q) return;
-      const key = getQuestionKey(q, idx);
-      const eId = entryIds[key];
+      const eId = entryIds[getQuestionKey(q, idx)];
       if (!eId) return;
-      setCategoryBusy(true);
-      try {
-        await addEntryToCategory(eId, catId);
-        setCategoryDropdownKey(null);
-      } catch {
-        /* ignore */
-      }
-      setCategoryBusy(false);
+      await addEntryToCategory(eId, catId);
+      await loadCategories();
     },
-    [entryIds, idx, q],
+    [entryIds, idx, loadCategories, q],
   );
 
-  const handleCreateAndAdd = useCallback(async () => {
-    if (!q || !newCategoryName.trim()) return;
-    const key = getQuestionKey(q, idx);
-    const eId = entryIds[key];
-    if (!eId) return;
-    setCategoryBusy(true);
-    try {
-      const cat = await createCategory(newCategoryName.trim());
+  const handleCreateAndAdd = useCallback(
+    async (name: string) => {
+      if (!q) return;
+      const eId = entryIds[getQuestionKey(q, idx)];
+      if (!eId) return;
+      const cat = await createCategory(name);
       await addEntryToCategory(eId, cat.id);
-      setNewCategoryName("");
-      setCategoryDropdownKey(null);
-    } catch {
-      /* ignore */
-    }
-    setCategoryBusy(false);
-  }, [entryIds, idx, newCategoryName, q]);
+      await loadCategories();
+    },
+    [entryIds, idx, loadCategories, q],
+  );
 
   const isChoice = q ? isMultipleChoice(q) : false;
   const isConcept = q ? isConceptQuizQuestion(q.question_type) : false;
   const isFillBlank = q ? isFillInBlankQuizQuestion(q.question_type) : false;
   const isGradable = q ? isAutoGradable(q) : false;
+  // Fill-in-the-blank questions normally use exact text grading, but formulas
+  // can be much easier to submit as a photo. Keep the existing image path for
+  // open-ended questions and extend it to fill-in-the-blank questions only.
+  const canAttachImage = isFillBlank || !isGradable;
   const currentUserAnswer = q ? getUserAnswer(q, ans) : "";
+  const canShowCorrectness = isGradable && currentUserAnswer.length > 0;
 
   const isCorrect = useMemo(() => {
-    if (!q || !ans.submitted) return null;
+    // An image-only fill-in-the-blank answer needs the multimodal AI judge;
+    // exact string matching would otherwise label it incorrectly as wrong.
+    if (!q || !ans.submitted || !canShowCorrectness) return null;
     return isAnswerCorrect(q, ans);
-  }, [ans, q]);
+  }, [ans, canShowCorrectness, q]);
 
   const submittedResults = useMemo(
     () =>
@@ -644,7 +640,10 @@ export default function QuizViewer({
     }));
     setAnswerViews((prev) => ({ ...prev, [idx]: "judgment" }));
 
-    const judgeLanguage: "zh" | "en" = language === "zh" ? "zh" : "en";
+    // Pass the UI language through; the backend falls back to English for
+    // any language it has no judge prompt for. Collapsing to "en" here
+    // meant a Ukrainian quiz was always graded in English.
+    const judgeLanguage = language;
 
     const handle = startQuizJudge(
       {
@@ -672,14 +671,16 @@ export default function QuizViewer({
             };
           });
         },
-        onDone: () => {
-          let finalText = "";
+        onDone: (finalText) => {
           setJudgments((prev) => {
             const current = prev[idx] ?? EMPTY_JUDGMENT;
-            finalText = current.text;
             return {
               ...prev,
-              [idx]: { ...current, isStreaming: false },
+              [idx]: {
+                ...current,
+                text: finalText || current.text,
+                isStreaming: false,
+              },
             };
           });
           judgeHandlesRef.current.delete(idx);
@@ -708,6 +709,11 @@ export default function QuizViewer({
     );
     judgeHandlesRef.current.set(idx, handle);
   }, [answers, entryIds, idx, language, q]);
+
+  const handleStopAiJudge = useCallback(() => {
+    judgeHandlesRef.current.get(idx)?.cancel();
+    judgeHandlesRef.current.delete(idx);
+  }, [idx]);
 
   const handleToggleAnswerView = useCallback(
     (view: AnswerView) => {
@@ -768,21 +774,24 @@ export default function QuizViewer({
 
   const currentEntryId = entryIds[questionKey];
   const currentBookmarked = bookmarked[questionKey] ?? false;
-  const showCategoryDropdown = categoryDropdownKey === questionKey;
 
   return (
-    <div className="overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--card)]">
+    <div
+      data-chat-grow="quiz"
+      className="overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--card)]"
+    >
       <div className="flex items-center gap-2 border-b border-[var(--border)] px-3 py-2">
-        <button
-          type="button"
-          onClick={() => setIdx((value) => Math.max(0, value - 1))}
-          disabled={idx === 0}
-          title={t("Previous")}
-          aria-label={t("Previous")}
-          className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-[var(--border)] bg-[var(--muted)]/60 text-[var(--foreground)] shadow-sm transition-colors hover:border-[var(--primary)] hover:bg-[var(--primary)]/10 hover:text-[var(--primary)] disabled:cursor-not-allowed disabled:border-[var(--border)] disabled:bg-transparent disabled:text-[var(--muted-foreground)] disabled:opacity-40 disabled:hover:bg-transparent"
-        >
-          <ChevronLeft size={18} strokeWidth={2.5} />
-        </button>
+        <Tooltip label={t("Previous")}>
+          <button
+            type="button"
+            onClick={() => setIdx((value) => Math.max(0, value - 1))}
+            disabled={idx === 0}
+            aria-label={t("Previous")}
+            className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-[var(--border)] bg-[var(--muted)]/60 text-[var(--foreground)] shadow-sm transition-colors hover:border-[var(--primary)] hover:bg-[var(--primary)]/10 hover:text-[var(--primary)] disabled:cursor-not-allowed disabled:border-[var(--border)] disabled:bg-transparent disabled:text-[var(--muted-foreground)] disabled:opacity-40 disabled:hover:bg-transparent"
+          >
+            <ChevronLeft size={18} strokeWidth={2.5} />
+          </button>
+        </Tooltip>
         <span className="text-[11px] font-semibold text-[var(--muted-foreground)]">
           {completedCount}/{total}
         </span>
@@ -807,8 +816,10 @@ export default function QuizViewer({
             // answer red just because it doesn't match the reference
             // string verbatim.
             const autoGradable = isAutoGradable(question);
+            const hasAutoGradableAnswer =
+              !!answer && getUserAnswer(question, answer).length > 0;
             const correctness: "correct" | "incorrect" | null =
-              done && answer && autoGradable
+              done && answer && autoGradable && hasAutoGradableAnswer
                 ? isAnswerCorrect(question, answer)
                   ? "correct"
                   : "incorrect"
@@ -857,16 +868,17 @@ export default function QuizViewer({
             );
           })}
         </div>
-        <button
-          type="button"
-          onClick={() => setIdx((value) => Math.min(total - 1, value + 1))}
-          disabled={idx === total - 1}
-          title={t("Next")}
-          aria-label={t("Next")}
-          className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-[var(--border)] bg-[var(--muted)]/60 text-[var(--foreground)] shadow-sm transition-colors hover:border-[var(--primary)] hover:bg-[var(--primary)]/10 hover:text-[var(--primary)] disabled:cursor-not-allowed disabled:border-[var(--border)] disabled:bg-transparent disabled:text-[var(--muted-foreground)] disabled:opacity-40 disabled:hover:bg-transparent"
-        >
-          <ChevronRight size={18} strokeWidth={2.5} />
-        </button>
+        <Tooltip label={t("Next")}>
+          <button
+            type="button"
+            onClick={() => setIdx((value) => Math.min(total - 1, value + 1))}
+            disabled={idx === total - 1}
+            aria-label={t("Next")}
+            className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-[var(--border)] bg-[var(--muted)]/60 text-[var(--foreground)] shadow-sm transition-colors hover:border-[var(--primary)] hover:bg-[var(--primary)]/10 hover:text-[var(--primary)] disabled:cursor-not-allowed disabled:border-[var(--border)] disabled:bg-transparent disabled:text-[var(--muted-foreground)] disabled:opacity-40 disabled:hover:bg-transparent"
+          >
+            <ChevronRight size={18} strokeWidth={2.5} />
+          </button>
+        </Tooltip>
       </div>
       <div className="h-0.5 bg-[var(--muted)]">
         <div
@@ -901,92 +913,52 @@ export default function QuizViewer({
 
           {ans.submitted && (
             <div className="relative flex items-center gap-1">
-              <button
-                onClick={handleToggleBookmark}
+              <Tooltip label={currentBookmarked ? t("Remove Bookmark") : t("Bookmark")}>
+                <button
+                  type="button"
+                  onClick={handleToggleBookmark}
+                  disabled={!currentEntryId}
+                  aria-label={currentBookmarked ? t("Remove Bookmark") : t("Bookmark")}
+                  className={`rounded-lg p-1.5 transition-all disabled:opacity-30 ${
+                    currentBookmarked
+                      ? "scale-110 text-amber-500 dark:text-amber-400"
+                      : "text-[var(--muted-foreground)] hover:text-amber-500 dark:hover:text-amber-400"
+                  }`}
+                >
+                  <Bookmark
+                    size={18}
+                    strokeWidth={currentBookmarked ? 2.5 : 1.8}
+                    fill={currentBookmarked ? "currentColor" : "none"}
+                  />
+                </button>
+              </Tooltip>
+              <CategoryMenu
+                categories={categories}
                 disabled={!currentEntryId}
-                title={currentBookmarked ? t("Remove Bookmark") : t("Bookmark")}
-                className={`rounded-lg p-1.5 transition-all disabled:opacity-30 ${
-                  currentBookmarked
-                    ? "scale-110 text-amber-500 dark:text-amber-400"
-                    : "text-[var(--muted-foreground)] hover:text-amber-500 dark:hover:text-amber-400"
-                }`}
-              >
-                <Bookmark
-                  size={18}
-                  strokeWidth={currentBookmarked ? 2.5 : 1.8}
-                  fill={currentBookmarked ? "currentColor" : "none"}
-                />
-              </button>
-              <button
-                onClick={handleOpenCategoryDropdown}
-                disabled={!currentEntryId}
-                title={t("Add to Category")}
-                className="rounded-lg p-1.5 text-[var(--muted-foreground)] transition-colors hover:text-[var(--foreground)] disabled:opacity-30"
-              >
-                <FolderPlus size={16} />
-              </button>
-              <button
-                onClick={handleOpenFollowup}
-                title={t("Follow-up Chat")}
-                className="ml-1 inline-flex items-center gap-1 rounded-lg border border-[var(--primary)]/60 bg-[var(--primary)]/10 px-2 py-1 text-[12px] font-medium text-[var(--primary)] transition-colors hover:bg-[var(--primary)]/15"
-              >
-                <MessageSquarePlus size={13} />
-                {t("Follow-up")}
-                {(() => {
-                  const tcount =
-                    followupThreads[questionKey]?.messages.filter(
-                      (m) => m.role !== "system",
-                    ).length ?? 0;
-                  return tcount > 0 ? (
-                    <span className="rounded-full bg-[var(--primary)]/25 px-1.5 py-0 text-[10px]">
-                      {tcount}
-                    </span>
-                  ) : null;
-                })()}
-              </button>
-
-              {showCategoryDropdown && (
-                <div className="absolute right-0 top-8 z-20 w-48 rounded-lg border border-[var(--border)] bg-[var(--card)] py-1 shadow-lg">
-                  {categories.length > 0 && (
-                    <div className="max-h-[160px] overflow-y-auto">
-                      {categories.map((cat) => (
-                        <button
-                          key={cat.id}
-                          disabled={categoryBusy}
-                          onClick={() => void handleAddToCategory(cat.id)}
-                          className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[12px] text-[var(--foreground)] transition-colors hover:bg-[var(--muted)] disabled:opacity-40"
-                        >
-                          {cat.name}
-                        </button>
-                      ))}
-                    </div>
-                  )}
-                  <div className="border-t border-[var(--border)] px-2 py-1.5">
-                    <div className="flex items-center gap-1">
-                      <input
-                        value={newCategoryName}
-                        onChange={(e) => setNewCategoryName(e.target.value)}
-                        onKeyDown={(e) =>
-                          e.key === "Enter" && void handleCreateAndAdd()
-                        }
-                        placeholder={t("New category...")}
-                        className="flex-1 rounded border border-[var(--border)] bg-[var(--background)] px-2 py-1 text-[11px] text-[var(--foreground)] outline-none placeholder:text-[var(--muted-foreground)]"
-                      />
-                      <button
-                        disabled={!newCategoryName.trim() || categoryBusy}
-                        onClick={() => void handleCreateAndAdd()}
-                        className="rounded p-1 text-[var(--primary)] disabled:opacity-30"
-                      >
-                        {categoryBusy ? (
-                          <Loader2 size={12} className="animate-spin" />
-                        ) : (
-                          <Plus size={12} />
-                        )}
-                      </button>
-                    </div>
-                  </div>
-                </div>
-              )}
+                onPick={handleAddToCategory}
+                onCreate={handleCreateAndAdd}
+              />
+              <Tooltip label={t("Follow-up Chat")}>
+                <button
+                  type="button"
+                  onClick={handleOpenFollowup}
+                  className="ml-1 inline-flex items-center gap-1 rounded-lg border border-[var(--primary)]/60 bg-[var(--primary)]/10 px-2 py-1 text-[12px] font-medium text-[var(--primary)] transition-colors hover:bg-[var(--primary)]/15"
+                >
+                  <MessageSquarePlus size={13} />
+                  {t("Follow-up")}
+                  {(() => {
+                    const tcount =
+                      followupThreads[questionKey]?.messages.filter(
+                        (m) => m.role !== "system",
+                      ).length ?? 0;
+                    return tcount > 0 ? (
+                      <span className="rounded-full bg-[var(--primary)]/25 px-1.5 py-0 text-[10px]">
+                        {tcount}
+                      </span>
+                    ) : null;
+                  })()}
+                </button>
+              </Tooltip>
             </div>
           )}
         </div>
@@ -996,6 +968,7 @@ export default function QuizViewer({
             content={q.question}
             variant="prose"
             className="text-[var(--foreground)]"
+            enableMath
           />
         </div>
 
@@ -1150,11 +1123,10 @@ export default function QuizViewer({
           </div>
         )}
 
-        {/* Image-as-answer attachment — only offered for question types
-            without an auto-gradable answer (short_answer / written /
-            coding). These are also the types that benefit most from a
-            multimodal AI judgment over handwritten work. */}
-        {!isGradable && (
+        {/* Image-as-answer attachment — offered for open-ended questions and
+            fill-in-the-blank questions, where formulas may be cumbersome to
+            type. Choice and concept questions keep their direct controls. */}
+        {canAttachImage && (
           <div className="mt-2 space-y-2">
             <input
               ref={fileInputRef}
@@ -1190,14 +1162,18 @@ export default function QuizViewer({
                         {image.filename}
                       </div>
                       {!ans.submitted && (
-                        <button
-                          type="button"
-                          onClick={() => handleRemoveImage(image.id)}
-                          title={t("Remove image")}
-                          className="absolute right-1 top-1 inline-flex h-5 w-5 items-center justify-center rounded-full bg-black/55 text-white opacity-0 transition-opacity group-hover:opacity-100"
-                        >
-                          <X size={11} />
-                        </button>
+                        <span className="absolute right-1 top-1 opacity-0 transition-opacity group-hover:opacity-100">
+                          <Tooltip label={t("Remove image")}>
+                            <button
+                              type="button"
+                              onClick={() => handleRemoveImage(image.id)}
+                              aria-label={t("Remove image")}
+                              className="inline-flex h-5 w-5 items-center justify-center rounded-full bg-black/55 text-white"
+                            >
+                              <X size={11} />
+                            </button>
+                          </Tooltip>
+                        </span>
                       )}
                     </div>
                   );
@@ -1225,10 +1201,10 @@ export default function QuizViewer({
               onClick={handleSubmit}
               disabled={(() => {
                 if (isChoice || isConcept) return !ans.selected;
-                // For free-text / fill-blank, require a typed answer; for
-                // non-auto-gradable types, an image attachment also counts.
+                // For free-text / fill-blank, accept either a typed answer or
+                // an image when this question type supports image answers.
                 if (ans.typed.trim()) return false;
-                if (!isGradable && ans.images.length > 0) return false;
+                if (canAttachImage && ans.images.length > 0) return false;
                 return true;
               })()}
               className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--primary)] px-3 py-1.5 text-[12px] font-medium text-white transition-opacity disabled:opacity-30"
@@ -1261,17 +1237,16 @@ export default function QuizViewer({
                 const hasJudgment = j.text.length > 0 || j.error !== null;
                 return (
                   <button
-                    onClick={handleAiJudge}
-                    disabled={j.isStreaming}
+                    onClick={j.isStreaming ? handleStopAiJudge : handleAiJudge}
                     className="inline-flex items-center gap-1 rounded-lg border border-[var(--primary)]/60 bg-[var(--primary)]/10 px-2.5 py-1.5 text-[12px] font-medium text-[var(--primary)] transition-colors hover:bg-[var(--primary)]/15 disabled:opacity-50"
                   >
                     {j.isStreaming ? (
-                      <Loader2 size={11} className="animate-spin" />
+                      <Square size={10} fill="currentColor" />
                     ) : (
                       <Sparkles size={11} />
                     )}
                     {j.isStreaming
-                      ? t("Judging...")
+                      ? t("Stop judging")
                       : hasJudgment
                         ? t("Re-judge")
                         : t("AI Judge")}
@@ -1335,20 +1310,19 @@ export default function QuizViewer({
                         <Loader2 size={10} className="animate-spin" />
                       )}
                     </button>
-                    <button
-                      type="button"
-                      onClick={toggleCollapsed}
-                      aria-label={collapsed ? t("Expand") : t("Collapse")}
-                      title={collapsed ? t("Expand") : t("Collapse")}
-                      className="ml-auto inline-flex h-5 w-5 items-center justify-center rounded-md text-[var(--muted-foreground)] transition-colors hover:bg-[var(--muted)] hover:text-[var(--foreground)]"
-                    >
-                      <ChevronDown
-                        size={13}
-                        className={`transition-transform ${
-                          collapsed ? "-rotate-90" : ""
-                        }`}
-                      />
-                    </button>
+                    <Tooltip label={collapsed ? t("Expand") : t("Collapse")}>
+                      <button
+                        type="button"
+                        onClick={toggleCollapsed}
+                        aria-label={collapsed ? t("Expand") : t("Collapse")}
+                        className="ml-auto inline-flex h-5 w-5 items-center justify-center rounded-md text-[var(--muted-foreground)] transition-colors hover:bg-[var(--muted)] hover:text-[var(--foreground)]"
+                      >
+                        <ChevronDown
+                          size={13}
+                          className={`transition-transform ${collapsed ? "-rotate-90" : ""}`}
+                        />
+                      </button>
+                    </Tooltip>
                   </div>
                 ) : (
                   <button
@@ -1389,6 +1363,7 @@ export default function QuizViewer({
                         <MarkdownRenderer
                           content={judgment.text}
                           variant="prose"
+                          enableMath
                         />
                       </div>
                     ) : (
@@ -1413,6 +1388,7 @@ export default function QuizViewer({
                                 : q.correct_answer
                             }
                             variant="prose"
+                            enableMath
                           />
                         </div>
                       </div>
@@ -1426,6 +1402,7 @@ export default function QuizViewer({
                           <MarkdownRenderer
                             content={q.explanation}
                             variant="prose"
+                            enableMath
                           />
                         </div>
                       </div>

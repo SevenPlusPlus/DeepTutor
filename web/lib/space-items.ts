@@ -38,14 +38,14 @@ export const SPACE_ITEMS: SpaceItem[] = [
   },
   {
     key: "agents",
-    href: "/space/agents",
+    href: "/agents",
     label: "My Agents",
     description: "Chat with imported Claude Code and Codex agents.",
     icon: Bot,
   },
   {
     key: "notebooks",
-    href: "/space/notebooks",
+    href: "/notebooks",
     label: "Notebooks",
     description:
       "Organize saved outputs from chat, research, Co-Writer, and more.",

@@ -11,7 +11,8 @@ from __future__ import annotations
 from typing import Any
 
 from deeptutor.agents.base_agent import BaseAgent
-from deeptutor.utils.json_parser import parse_json_response
+from deeptutor.services.llm.structured_retry import json_with_reasoning_retry
+from deeptutor.services.llm.types import StreamOutcome
 
 from ..inputs import IdeationContext
 from ..models import BookProposal
@@ -26,7 +27,11 @@ class IdeationAgent(BaseAgent):
         base_url: str | None = None,
         api_version: str | None = None,
         language: str = "en",
-        binding: str = "openai",
+        # None, not "openai": BaseAgent falls back to the configured
+        # provider only when this is falsy. Hard-coding it forced every
+        # user onto the OpenAI wire format. Matches the pattern in
+        # deeptutor/agents/research/pipeline.py:403.
+        binding: str | None = None,
     ) -> None:
         super().__init__(
             module_name="book",
@@ -50,19 +55,29 @@ class IdeationAgent(BaseAgent):
         user_template = self.get_prompt("user_template") or _FALLBACK_USER
         user_prompt = user_template.format(ideation_context=ideation_context.render())
 
-        chunks: list[str] = []
-        async for chunk in self.stream_llm(
-            user_prompt=user_prompt,
-            system_prompt=system_prompt,
-            response_format={"type": "json_object"},
-            stage="ideation",
-        ):
-            chunks.append(chunk)
-        raw = "".join(chunks)
+        async def _run(reasoning_effort: str | None) -> str:
+            chunks: list[str] = []
+            outcome = StreamOutcome()
+            async for chunk in self.stream_llm(
+                user_prompt=user_prompt,
+                system_prompt=system_prompt,
+                response_format={"type": "json_object"},
+                stage="ideation",
+                reasoning_effort=reasoning_effort,
+                outcome=outcome,
+            ):
+                chunks.append(chunk)
+            if outcome.truncated:
+                return ""
+            return "".join(chunks)
 
-        payload = parse_json_response(raw, logger_instance=self.logger, fallback={})
-        if not isinstance(payload, dict):
-            payload = {}
+        # ``title`` is the one field the proposal cannot be rebuilt without, so
+        # it is what tells a thinking-only response apart from a real one.
+        payload = await json_with_reasoning_retry(
+            _run,
+            expected_key="title",
+            logger_instance=self.logger,
+        )
 
         return self._coerce_proposal(payload, ideation_context)
 

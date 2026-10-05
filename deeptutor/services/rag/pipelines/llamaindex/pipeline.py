@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+from contextvars import copy_context
 import json
 import logging
 from pathlib import Path
+import threading
+import time
 import traceback
 from typing import Any, Callable, Dict, List, Optional
 
@@ -19,9 +22,10 @@ from deeptutor.services.rag.index_versioning import (
     write_version_meta,
 )
 from deeptutor.services.rag.kb_paths import resolve_kb_dir
+from deeptutor.services.rag.visual_assets import VisualAssetStore
 
 from . import storage
-from .config import default_top_k
+from .config import default_top_k, should_show_progress
 from .document_loader import LlamaIndexDocumentLoader
 from .embedding_adapter import (
     configure_llamaindex_settings,
@@ -32,7 +36,129 @@ from .errors import search_error_result
 
 DEFAULT_KB_BASE_DIR = str(get_runtime_data_root() / "knowledge_bases")
 
+# How long an indexing step may run without reporting any progress before it
+# is treated as stalled (see _run_with_stall_guard).
+_INDEX_STALL_TIMEOUT_SECONDS = 600.0
+# How often the stall guard checks the progress heartbeat.
+_INDEX_STALL_POLL_SECONDS = 5.0
+_INDEX_WORKERS: dict[str, threading.Event] = {}
+_INDEX_WORKERS_LOCK = threading.Lock()
+
 SignatureProvider = Callable[[], EmbeddingSignature | None]
+
+
+class IndexingStallError(RuntimeError):
+    """Raised when an indexing operation makes no progress for too long."""
+
+
+def _worker_busy_error() -> IndexingStallError:
+    return IndexingStallError(
+        "A previous indexing worker for this knowledge base is still running. "
+        "Wait for it to finish or restart DeepTutor before retrying."
+    )
+
+
+def _ensure_index_worker_available(key: str) -> None:
+    with _INDEX_WORKERS_LOCK:
+        marker = _INDEX_WORKERS.get(key)
+        if marker is not None and not marker.is_set():
+            raise _worker_busy_error()
+
+
+def _claim_index_worker(key: str | None) -> threading.Event | None:
+    if key is None:
+        return None
+    with _INDEX_WORKERS_LOCK:
+        previous = _INDEX_WORKERS.get(key)
+        if previous is not None and not previous.is_set():
+            raise _worker_busy_error()
+        marker = threading.Event()
+        _INDEX_WORKERS[key] = marker
+        return marker
+
+
+def _release_index_worker(key: str | None, marker: threading.Event | None) -> None:
+    if key is None or marker is None:
+        return
+    marker.set()
+    with _INDEX_WORKERS_LOCK:
+        if _INDEX_WORKERS.get(key) is marker:
+            _INDEX_WORKERS.pop(key, None)
+
+
+async def _run_with_stall_guard(
+    fn: Callable[[], Any],
+    *,
+    progress_callback: Optional[Callable[..., Any]] = None,
+    stall_timeout: Optional[float] = None,
+    worker_key: str | None = None,
+) -> Any:
+    """Run a synchronous indexing step in the executor, failing if it stalls.
+
+    Indexing steps (chunking + embedding) run in a worker thread via
+    ``run_in_executor``. A provider that accepts a request but never
+    completes it (e.g. a blackholed keep-alive connection) can block that
+    thread indefinitely: per-request HTTP timeouts only bound a single
+    attempt, and provider retries extend the wait far beyond any reasonable
+    budget. Instead of hanging forever, watch the embedding progress
+    heartbeat and fail with a clear error once no progress has been reported
+    for ``stall_timeout`` seconds.
+
+    The sync function keeps running in its thread after a stall is raised —
+    Python cannot interrupt arbitrary synchronous code. Its callback becomes
+    silent and a same-KB retry is rejected until that thread actually exits.
+    """
+    if stall_timeout is None:
+        stall_timeout = _INDEX_STALL_TIMEOUT_SECONDS
+
+    worker_marker = _claim_index_worker(worker_key)
+    progress_live = threading.Event()
+    progress_live.set()
+    last_progress = {"at": time.monotonic()}
+
+    def _heartbeat(*args: Any, **kwargs: Any) -> None:
+        if not progress_live.is_set():
+            return
+        last_progress["at"] = time.monotonic()
+        if progress_callback is not None:
+            progress_callback(*args, **kwargs)
+
+    def _work() -> Any:
+        try:
+            return fn()
+        finally:
+            _release_index_worker(worker_key, worker_marker)
+
+    set_progress_callback(_heartbeat)
+    try:
+        future = asyncio.get_running_loop().run_in_executor(None, copy_context().run, _work)
+    except BaseException:
+        progress_live.clear()
+        _release_index_worker(worker_key, worker_marker)
+        raise
+
+    def _consume_terminal_exception(fut: "asyncio.Future[Any]") -> None:
+        # The stalled thread may finish after we raise; retrieve its exception
+        # so it is not reported as "exception was never retrieved".
+        if not fut.cancelled():
+            fut.exception()
+
+    try:
+        while True:
+            done, _ = await asyncio.wait({future}, timeout=_INDEX_STALL_POLL_SECONDS)
+            if done:
+                return future.result()
+            stalled_for = time.monotonic() - last_progress["at"]
+            if stalled_for > stall_timeout:
+                raise IndexingStallError(
+                    f"Indexing made no progress for {stalled_for:.0f}s while "
+                    "embedding documents. Check the embedding endpoint; wait "
+                    "for the worker to finish or restart DeepTutor before retrying."
+                )
+    finally:
+        progress_live.clear()
+        if not future.done():
+            future.add_done_callback(_consume_terminal_exception)
 
 
 class LlamaIndexPipeline:
@@ -49,7 +175,6 @@ class LlamaIndexPipeline:
         self.kb_base_dir = kb_base_dir or DEFAULT_KB_BASE_DIR
         self._signature_provider = signature_provider or signature_from_embedding_config
         self.document_loader = document_loader or LlamaIndexDocumentLoader(self.logger)
-        self._configure_settings()
 
     def _configure_settings(self) -> None:
         configure_llamaindex_settings(self.logger)
@@ -74,19 +199,27 @@ class LlamaIndexPipeline:
 
     async def initialize(self, kb_name: str, file_paths: List[str], **kwargs) -> bool:
         progress_callback = kwargs.get("progress_callback")
+        image_progress_callback = kwargs.get("image_progress_callback")
+        kb_dir = resolve_kb_dir(self.kb_base_dir, kb_name)
+        _ensure_index_worker_available(str(kb_dir.resolve()))
         self._configure_settings()
 
         self.logger.info(
             f"Initializing KB '{kb_name}' with {len(file_paths)} files using LlamaIndex"
         )
 
-        kb_dir = resolve_kb_dir(self.kb_base_dir, kb_name)
         signature = self._current_signature()
         storage_dir = resolve_storage_dir_for_rebuild(kb_dir, signature)
 
         try:
             await self._verify_embedding_connectivity()
-            documents = await self.document_loader.load(file_paths)
+            visual_candidates = []
+            documents = await self.document_loader.load(
+                file_paths,
+                image_progress_callback=image_progress_callback,
+                kb_dir=kb_dir,
+                visual_candidates=visual_candidates,
+            )
             if not documents:
                 self.logger.error("No valid documents found")
                 return False
@@ -96,18 +229,29 @@ class LlamaIndexPipeline:
                 f"(chunking + embedding)..."
             )
 
-            if progress_callback:
-                set_progress_callback(progress_callback)
-
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(
-                None,
-                lambda: storage.create_index(documents, storage_dir, show_progress=True),
+            await _run_with_stall_guard(
+                lambda: storage.create_index(
+                    documents, storage_dir, show_progress=should_show_progress()
+                ),
+                progress_callback=progress_callback,
+                worker_key=str(kb_dir.resolve()),
             )
 
             self.logger.info(f"Index persisted to {storage_dir}")
+            VisualAssetStore(kb_dir).publish(visual_candidates, prune_missing=True)
             if signature is not None:
                 write_version_meta(kb_dir, signature, storage_dir=storage_dir)
+
+            indexed_file_callback = kwargs.get("indexed_file_callback")
+            if indexed_file_callback is not None:
+                indexed_paths: set[str] = set()
+                for document in documents:
+                    metadata = getattr(document, "metadata", None)
+                    if isinstance(metadata, dict):
+                        path = metadata.get("file_path")
+                        if isinstance(path, str) and path:
+                            indexed_paths.add(path)
+                indexed_file_callback(sorted(indexed_paths))
 
             self.logger.info(f"KB '{kb_name}' initialized successfully with LlamaIndex")
             return True
@@ -115,7 +259,9 @@ class LlamaIndexPipeline:
         except Exception as exc:
             self.logger.error(f"Failed to initialize KB: {exc}")
             self.logger.error(traceback.format_exc())
-            self._cleanup_failed_version_dir(storage_dir, signature)
+            # A timed-out executor can still be writing to this directory.
+            if not isinstance(exc, IndexingStallError):
+                self._cleanup_failed_version_dir(storage_dir, signature)
             raise
         finally:
             set_progress_callback(None)
@@ -142,7 +288,7 @@ class LlamaIndexPipeline:
             return {
                 "query": query,
                 "answer": (
-                    "This knowledge base has no index for the active embedding "
+                    "This knowledge base has no index for its selected embedding "
                     "model. Re-index it (or switch back to a previously-used "
                     "embedding model) before querying."
                 ),
@@ -158,6 +304,7 @@ class LlamaIndexPipeline:
             top_k = kwargs.get("top_k") or default_top_k()
             nodes = await loop.run_in_executor(
                 None,
+                copy_context().run,
                 lambda: storage.retrieve_nodes(storage_dir, query, top_k=top_k),
             )
 
@@ -210,6 +357,17 @@ class LlamaIndexPipeline:
                     "page": meta.get("page_label", meta.get("page", "")),
                     "chunk_id": node.node.node_id or str(i),
                     "score": round(node.score, 4) if node.score is not None else "",
+                    **(
+                        {
+                            "visual_asset_id": meta["visual_asset_id"],
+                            "source_document_id": meta.get("source_document_id", ""),
+                            "bbox": meta.get("bbox"),
+                            "caption": meta.get("caption", ""),
+                            "source_locator": meta.get("source_locator", ""),
+                        }
+                        if meta.get("visual_asset_id")
+                        else {}
+                    ),
                 }
             )
 
@@ -224,45 +382,55 @@ class LlamaIndexPipeline:
 
     async def add_documents(self, kb_name: str, file_paths: List[str], **kwargs) -> bool:
         progress_callback = kwargs.get("progress_callback")
+        image_progress_callback = kwargs.get("image_progress_callback")
+        kb_dir = resolve_kb_dir(self.kb_base_dir, kb_name)
+        _ensure_index_worker_available(str(kb_dir.resolve()))
         self._configure_settings()
 
         self.logger.info(f"Adding {len(file_paths)} documents to KB '{kb_name}' using LlamaIndex")
 
-        kb_dir = resolve_kb_dir(self.kb_base_dir, kb_name)
         signature = self._current_signature()
         plan = storage.resolve_add_storage_plan(kb_dir, signature)
 
         try:
             await self._verify_embedding_connectivity()
-            if progress_callback:
-                set_progress_callback(progress_callback)
 
-            documents = await self.document_loader.load(file_paths)
+            visual_candidates = []
+            documents = await self.document_loader.load(
+                file_paths,
+                image_progress_callback=image_progress_callback,
+                kb_dir=kb_dir,
+                visual_candidates=visual_candidates,
+            )
             if not documents:
                 self.logger.warning("No valid documents to add")
                 return False
 
-            loop = asyncio.get_running_loop()
-
             if plan.existing_storage is not None:
                 self.logger.info(f"Loading existing index from {plan.existing_storage}...")
-                num_added = await loop.run_in_executor(
-                    None,
+                num_added = await _run_with_stall_guard(
                     lambda: storage.insert_documents(
                         plan.existing_storage, plan.storage_dir, documents
                     ),
+                    progress_callback=progress_callback,
+                    worker_key=str(kb_dir.resolve()),
                 )
                 self.logger.info(f"Added {num_added} documents to existing index")
+                VisualAssetStore(kb_dir).publish(visual_candidates)
                 if signature is not None and plan.storage_dir != plan.existing_storage:
                     write_version_meta(kb_dir, signature, storage_dir=plan.storage_dir)
             else:
                 self.logger.info(f"Creating new index with {len(documents)} documents...")
                 plan.storage_dir.mkdir(parents=True, exist_ok=True)
-                num_added = await loop.run_in_executor(
-                    None,
-                    lambda: storage.create_index(documents, plan.storage_dir, show_progress=True),
+                num_added = await _run_with_stall_guard(
+                    lambda: storage.create_index(
+                        documents, plan.storage_dir, show_progress=should_show_progress()
+                    ),
+                    progress_callback=progress_callback,
+                    worker_key=str(kb_dir.resolve()),
                 )
                 self.logger.info(f"Created new index with {num_added} documents")
+                VisualAssetStore(kb_dir).publish(visual_candidates)
                 if signature is not None:
                     write_version_meta(kb_dir, signature, storage_dir=plan.storage_dir)
 
@@ -272,7 +440,9 @@ class LlamaIndexPipeline:
         except Exception as exc:
             self.logger.error(f"Failed to add documents: {exc}")
             self.logger.error(traceback.format_exc())
-            if plan.existing_storage is None or plan.storage_dir != plan.existing_storage:
+            if not isinstance(exc, IndexingStallError) and (
+                plan.existing_storage is None or plan.storage_dir != plan.existing_storage
+            ):
                 self._cleanup_failed_version_dir(plan.storage_dir, signature)
             raise
         finally:

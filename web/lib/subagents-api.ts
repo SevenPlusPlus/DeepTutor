@@ -1,4 +1,7 @@
 import { apiFetch, apiUrl } from "@/lib/api";
+import { invalidateClientCache, withClientCache } from "@/lib/client-cache";
+
+const SUBAGENT_SETTINGS_CACHE_KEY = "subagents:settings";
 
 /** One agent CLI backend's installability on this machine. */
 export interface SubagentBackendInfo {
@@ -14,40 +17,13 @@ export interface SubagentConnection {
   name: string;
   agent_kind: string;
   cwd: string;
-  /** Set for a partner connection (`agent_kind === "partner"`): the bound partner. */
-  partner_id?: string;
   description?: string;
   created_at?: string;
   updated_at?: string | null;
 }
 
-/**
- * A partner the current user may connect & consult. Admins get every partner;
- * non-admins get only the partners an admin has assigned to them. Identity-only
- * (no channel wiring / model selection) — that's what the connect flow needs.
- */
-export interface ConnectablePartner {
-  partner_id: string;
-  name: string;
-  description?: string;
-  emoji?: string;
-  color?: string;
-  avatar?: string;
-  language?: string;
-  running?: boolean;
-}
-
-export async function listConnectablePartners(): Promise<ConnectablePartner[]> {
-  const res = await apiFetch(apiUrl("/api/v1/subagents/partners"), {
-    cache: "no-store",
-  });
-  if (!res.ok) throw new Error(`Request failed: ${res.status}`);
-  const data = (await res.json()) as { partners: ConnectablePartner[] };
-  return data.partners ?? [];
-}
-
 export async function detectSubagents(): Promise<SubagentBackendInfo[]> {
-  const res = await apiFetch(apiUrl("/api/v1/subagents/detect"), {
+  const res = await apiFetch(apiUrl("/api/subagents/detect"), {
     cache: "no-store",
   });
   if (!res.ok) throw new Error(`Detect failed: ${res.status}`);
@@ -56,7 +32,7 @@ export async function detectSubagents(): Promise<SubagentBackendInfo[]> {
 }
 
 export async function listSubagentConnections(): Promise<SubagentConnection[]> {
-  const res = await apiFetch(apiUrl("/api/v1/subagents/connections"), {
+  const res = await apiFetch(apiUrl("/api/subagents/connections"), {
     cache: "no-store",
   });
   if (!res.ok) throw new Error(`Request failed: ${res.status}`);
@@ -68,10 +44,8 @@ export async function connectSubagent(payload: {
   name: string;
   agent_kind: string;
   cwd?: string;
-  /** Required when `agent_kind === "partner"`: which partner to consult. */
-  partner_id?: string;
 }): Promise<SubagentConnection> {
-  const res = await apiFetch(apiUrl("/api/v1/subagents/connections"), {
+  const res = await apiFetch(apiUrl("/api/subagents/connections"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
@@ -88,7 +62,7 @@ export async function connectSubagent(payload: {
 
 export async function disconnectSubagent(name: string): Promise<void> {
   const res = await apiFetch(
-    apiUrl(`/api/v1/subagents/connections/${encodeURIComponent(name)}`),
+    apiUrl(`/api/subagents/connections/${encodeURIComponent(name)}`),
     { method: "DELETE" },
   );
   if (!res.ok) throw new Error(`Disconnect failed: ${res.status}`);
@@ -115,7 +89,7 @@ export interface SubagentBackendOptions {
 }
 
 export async function getBackendOptions(): Promise<SubagentBackendOptions[]> {
-  const res = await apiFetch(apiUrl("/api/v1/subagents/backends/options"), {
+  const res = await apiFetch(apiUrl("/api/subagents/backends/options"), {
     cache: "no-store",
   });
   if (!res.ok) throw new Error(`Request failed: ${res.status}`);
@@ -132,7 +106,7 @@ export async function syncBackendOptions(
   kind: string,
 ): Promise<SubagentBackendOptions> {
   const res = await apiFetch(
-    apiUrl(`/api/v1/subagents/backends/${encodeURIComponent(kind)}/sync`),
+    apiUrl(`/api/subagents/backends/${encodeURIComponent(kind)}/sync`),
     { method: "POST" },
   );
   if (!res.ok) throw new Error(`Sync failed: ${res.status}`);
@@ -155,6 +129,13 @@ export interface SubagentBackendConfig {
   thinking?: boolean;
   forward_images?: boolean;
   extra_args?: string[];
+  /** Remote Hermes gateway URL; the API key itself is never persisted here. */
+  base_url?: string;
+  /** Environment variable name containing the remote gateway bearer. */
+  api_key_env?: string;
+  /** Informational profile name associated with the gateway deployment. */
+  profile?: string;
+  idle_timeout_seconds?: number;
 }
 
 export interface SubagentSettings {
@@ -183,7 +164,7 @@ export async function* streamSubagentMessage(
   signal?: AbortSignal,
 ): AsyncGenerator<SubagentStreamLine> {
   const res = await apiFetch(
-    apiUrl(`/api/v1/subagents/connections/${encodeURIComponent(name)}/message`),
+    apiUrl(`/api/subagents/connections/${encodeURIComponent(name)}/message`),
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -213,22 +194,37 @@ export async function* streamSubagentMessage(
   if (tail) yield JSON.parse(tail) as SubagentStreamLine;
 }
 
-export async function getSubagentSettings(): Promise<SubagentSettings> {
-  const res = await apiFetch(apiUrl("/api/v1/subagents/settings"), {
-    cache: "no-store",
-  });
-  if (!res.ok) throw new Error(`Request failed: ${res.status}`);
-  return (await res.json()) as SubagentSettings;
+/** Read the subagent settings (backends + consult budget).
+ *
+ *  Cached because the chat page only needs the default consult budget, and
+ *  re-reading it on every session switch is pure overhead. Writes through
+ *  ``updateSubagentSettings`` drop the cache; pass ``force`` for editors that
+ *  must show the stored values. */
+export async function getSubagentSettings(options?: {
+  force?: boolean;
+}): Promise<SubagentSettings> {
+  return withClientCache<SubagentSettings>(
+    SUBAGENT_SETTINGS_CACHE_KEY,
+    async () => {
+      const res = await apiFetch(apiUrl("/api/subagents/settings"), {
+        cache: "no-store",
+      });
+      if (!res.ok) throw new Error(`Request failed: ${res.status}`);
+      return (await res.json()) as SubagentSettings;
+    },
+    { force: options?.force },
+  );
 }
 
 export async function updateSubagentSettings(
   payload: Partial<SubagentSettings>,
 ): Promise<SubagentSettings> {
-  const res = await apiFetch(apiUrl("/api/v1/subagents/settings"), {
+  const res = await apiFetch(apiUrl("/api/subagents/settings"), {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
   if (!res.ok) throw new Error(`Update failed: ${res.status}`);
+  invalidateClientCache(SUBAGENT_SETTINGS_CACHE_KEY);
   return (await res.json()) as SubagentSettings;
 }

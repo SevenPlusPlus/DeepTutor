@@ -166,6 +166,10 @@ class SkillNotFoundError(Exception):
     pass
 
 
+class SkillFileNotFoundError(Exception):
+    """The skill exists but the requested file inside it does not."""
+
+
 class SkillExistsError(Exception):
     pass
 
@@ -465,7 +469,7 @@ class SkillService:
         if not target.is_relative_to(skill_dir.resolve()):
             raise InvalidSkillPathError(f"Illegal skill file path: {rel_path}")
         if not target.is_file():
-            raise SkillNotFoundError(f"{name}/{candidate}")
+            raise SkillFileNotFoundError(f"File not found in skill: {name}/{candidate}")
         text = target.read_text(encoding="utf-8", errors="replace")
         if len(text) > _MAX_READ_CHARS:
             text = text[:_MAX_READ_CHARS] + "\n\n[... truncated ...]"
@@ -1022,8 +1026,24 @@ def render_skills_manifest(entries: list[SkillSummaryEntry]) -> str:
 _instances: dict[str, SkillService] = {}
 
 
+def get_admin_skill_service() -> SkillService:
+    """Resolve the shared admin skill catalog, including storage migrations."""
+    from deeptutor.multi_user.paths import local_admin_user, user_context
+
+    with user_context(local_admin_user()):
+        return get_skill_service()
+
+
 def get_skill_service() -> SkillService:
-    root = (get_path_service().get_workspace_dir() / "skills").resolve()
+    from deeptutor.multi_user.context import get_current_user
+    from deeptutor.services.partners.scope import is_partner_user_id
+    from deeptutor.services.workspace import get_content_workspace_service
+
+    root = (
+        get_path_service().get_workspace_dir() / "skills"
+        if is_partner_user_id(get_current_user().id)
+        else get_content_workspace_service().system_binding().root / "skills"
+    ).resolve()
     key = str(root)
     if key not in _instances:
         _instances[key] = SkillService(root=root)
@@ -1047,5 +1067,6 @@ __all__ = [
     "TagExistsError",
     "TagNotFoundError",
     "get_skill_service",
+    "get_admin_skill_service",
     "render_skills_manifest",
 ]

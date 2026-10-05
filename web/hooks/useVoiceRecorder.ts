@@ -3,12 +3,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { apiFetch, apiUrl } from "@/lib/api";
+import { stripAudioMimeParameters } from "@/lib/voice-mime";
 
 export type RecorderState = "idle" | "recording" | "transcribing";
 
 /**
  * Microphone capture → backend transcription. Records via MediaRecorder, posts
- * the clip to ``/api/v1/voice/stt`` (which uses the admin-configured STT
+ * the clip to ``/api/voice/stt`` (which uses the admin-configured STT
  * provider), and hands the transcript back through ``onTranscript``.
  */
 export function useVoiceRecorder(onTranscript: (text: string) => void) {
@@ -50,7 +51,7 @@ export function useVoiceRecorder(onTranscript: (text: string) => void) {
       if (event.data && event.data.size > 0) chunksRef.current.push(event.data);
     };
     recorder.onstop = async () => {
-      const mimeType = recorder.mimeType || "audio/webm";
+      const mimeType = stripAudioMimeParameters(recorder.mimeType);
       releaseStream();
       const blob = new Blob(chunksRef.current, { type: mimeType });
       chunksRef.current = [];
@@ -67,7 +68,7 @@ export function useVoiceRecorder(onTranscript: (text: string) => void) {
             : "webm";
         const form = new FormData();
         form.append("file", blob, `recording.${ext}`);
-        const resp = await apiFetch(apiUrl("/api/v1/voice/stt"), {
+        const resp = await apiFetch(apiUrl("/api/voice/stt"), {
           method: "POST",
           body: form,
         });

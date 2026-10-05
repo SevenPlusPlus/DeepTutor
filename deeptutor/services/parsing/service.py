@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 from deeptutor.services.config.runtime_settings import (
     _DEFAULT_DOCUMENT_PARSING_ENGINE,
@@ -23,6 +23,52 @@ from .engines.factory import get_parser
 from .types import ParsedDocument, ParserError
 
 logger = logging.getLogger(__name__)
+
+
+def _matches_supported_format(source_path: str | Path, supported: frozenset[str]) -> bool:
+    """Match simple or compound parser suffixes case-insensitively."""
+    name = Path(source_path).name.lower()
+    return any(name.endswith(str(extension).lower()) for extension in supported)
+
+
+def _display_extension(source_path: str | Path, supported: frozenset[str]) -> str:
+    """Return the most specific advertised suffix for an error message."""
+    name = Path(source_path).name.lower()
+    matches = [extension for extension in supported if name.endswith(extension.lower())]
+    if matches:
+        return max(matches, key=len)
+    return Path(source_path).suffix.lower() or "this"
+
+
+# Engines tried, in order, when the *implicitly* selected engine (the global
+# default) does not advertise support for a file's suffix. The global
+# single-select is a default, not a per-file command: a mixed KB (MinerU PDFs
+# plus .txt/.md notes) must not hard-fail the whole ingest batch on the files
+# the chosen engine was never built for (#1502). ``text_only`` leads because
+# it is lossless for text files and needs no model.
+_FALLBACK_ENGINE_PREFERENCE = ("text_only", "markitdown", "tika")
+
+
+def _find_fallback_engine(
+    source_path: str | Path, primary_engine: str
+) -> Optional[tuple[str, Any, Any]]:
+    """First installed engine other than ``primary`` that supports the file.
+
+    Returns ``(engine_name, parser, config)`` or ``None``. Engines that are
+    not installed are skipped — the fallback must never turn a routing
+    decision into an import-time failure.
+    """
+    for name in _FALLBACK_ENGINE_PREFERENCE:
+        if name == primary_engine:
+            continue
+        try:
+            parser = get_parser(name)
+        except Exception:
+            continue
+        supported = parser.supported_formats()
+        if not supported or _matches_supported_format(source_path, supported):
+            return name, parser, parser.resolve_config()
+    return None
 
 
 class ParseService:
@@ -44,6 +90,16 @@ class ParseService:
         return str(
             load_document_parsing_settings().get("engine") or _DEFAULT_DOCUMENT_PARSING_ENGINE
         )
+
+    def supports(self, source_path: str | Path, *, engine: Optional[str] = None) -> bool:
+        """Return whether the selected engine advertises support for this path.
+
+        This is a cheap routing check only: it does not require the file to
+        exist, initialize models, or evaluate engine readiness.
+        """
+        engine_name = (engine or self.active_engine()).strip().lower()
+        supported = get_parser(engine_name).supported_formats()
+        return not supported or _matches_supported_format(source_path, supported)
 
     def parse(
         self,
@@ -67,12 +123,30 @@ class ParseService:
         parser = get_parser(engine_name)
         config = parser.resolve_config()
 
-        suffix = source_path.suffix.lower()
         supported = parser.supported_formats()
-        if supported and suffix not in supported:
-            raise ParserError(
-                f"The '{engine_name}' parsing engine doesn't support {suffix or 'this'} "
-                f"files. Choose a different engine in Settings → Document Parsing."
+        if supported and not _matches_supported_format(source_path, supported):
+            if engine is not None:
+                # The caller pinned this engine by name — keep the loud error.
+                suffix = _display_extension(source_path, supported)
+                raise ParserError(
+                    f"The '{engine_name}' parsing engine doesn't support {suffix} "
+                    f"files. Choose a different engine in Settings → Document Parsing."
+                )
+            fallback = _find_fallback_engine(source_path, engine_name)
+            if fallback is None:
+                suffix = _display_extension(source_path, supported)
+                raise ParserError(
+                    f"The '{engine_name}' parsing engine doesn't support {suffix} "
+                    f"files. Choose a different engine in Settings → Document Parsing."
+                )
+            primary_engine = engine_name
+            engine_name, parser, config = fallback
+            supported = parser.supported_formats()
+            logger.warning(
+                "The '%s' parsing engine doesn't support %s files; using '%s' for this file.",
+                primary_engine,
+                _display_extension(source_path, supported),
+                engine_name,
             )
 
         sig = parser.signature(config).hash()

@@ -23,7 +23,11 @@ from datetime import datetime, timezone
 import json
 import logging
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from deeptutor.services.embedding.config import EmbeddingConfig
+    from deeptutor.services.rag.index_versioning import EmbeddingSignature
 
 from deeptutor.services.file_io import atomic_write_json
 
@@ -31,6 +35,8 @@ logger = logging.getLogger(__name__)
 
 META_FILENAME = "meta.json"
 PROVIDER = "lightrag"
+ADAPTER_SCHEMA = 2
+PUBLISHED_STATE = "published"
 
 # Glob patterns LightRAG writes once it has actually built chunk/vector data.
 # A graphml file alone is not enough: LightRAG creates an empty graph at startup
@@ -46,11 +52,26 @@ def working_dir(root_dir: Path) -> Path:
     return Path(root_dir)
 
 
+def _store_root(root_dir: Path) -> Path:
+    """Resolve native workspace storage while retaining legacy flat reads."""
+    root = Path(root_dir)
+    if (root / _DOC_STATUS_FILENAME).exists() or any(root.glob("vdb_*.json")):
+        return root
+    meta = _read_meta(root)
+    workspace = str((meta or {}).get("workspace") or "").strip()
+    if not workspace:
+        from .engine import workspace_for
+
+        workspace = workspace_for(root)
+    candidate = root / workspace
+    return candidate if candidate.is_dir() else root
+
+
 def has_output(root_dir: Path | None) -> bool:
     """True when LightRAG has at least one successfully indexed document."""
     if root_dir is None:
         return False
-    root = Path(root_dir)
+    root = _store_root(Path(root_dir))
     if not root.is_dir():
         return False
 
@@ -93,7 +114,7 @@ def failure_summary(root_dir: Path | None, *, limit: int = 3) -> str:
     """Return a short human-readable summary of failed LightRAG documents."""
     if root_dir is None:
         return ""
-    payload = _read_doc_status(Path(root_dir))
+    payload = _read_doc_status(_store_root(Path(root_dir)))
     if not payload:
         return ""
 
@@ -116,7 +137,7 @@ def document_error(root_dir: Path | None, doc_id: str) -> str:
     """Return the stored LightRAG error for one document, if present."""
     if root_dir is None or not doc_id:
         return ""
-    payload = _read_doc_status(Path(root_dir))
+    payload = _read_doc_status(_store_root(Path(root_dir)))
     if not payload:
         return ""
     item = payload.get(doc_id)
@@ -142,7 +163,118 @@ def _read_doc_status(root_dir: Path) -> dict[str, Any] | None:
         return None
 
 
-def write_meta(root_dir: Path) -> None:
+def has_any_doc_status(root_dir: Path | None) -> bool:
+    if root_dir is None:
+        return False
+    payload = _read_doc_status(_store_root(Path(root_dir)))
+    return bool(payload)
+
+
+def _read_meta(root_dir: Path) -> dict[str, Any] | None:
+    path = Path(root_dir) / META_FILENAME
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def meta_is_native_published(root_dir: Path | None) -> bool:
+    if root_dir is None:
+        return False
+    meta = _read_meta(Path(root_dir))
+    return bool(
+        meta
+        and meta.get("provider") == PROVIDER
+        and meta.get("signature") == PROVIDER
+        and meta.get("lightrag_adapter_schema") == ADAPTER_SCHEMA
+        and meta.get("parser_bridge_schema") == 1
+        and meta.get("state") == PUBLISHED_STATE
+        and has_output(Path(root_dir))
+    )
+
+
+def _parser_inputs(root_dir: Path) -> list[dict[str, str]]:
+    from .ingress import bundles_root, load_verified_bundle
+
+    records: set[tuple[str, str]] = set()
+    for bundle in sorted(bundles_root(root_dir).glob("*.bundle")):
+        canonical_name = bundle.name.removesuffix(".bundle")
+        manifest, _ = load_verified_bundle(root_dir, canonical_name)
+        parser = manifest.get("parser")
+        if not isinstance(parser, dict):
+            continue
+        records.add(
+            (
+                str(parser.get("engine") or ""),
+                str(parser.get("parser_signature") or ""),
+            )
+        )
+    return [
+        {"engine": engine, "parser_signature": signature} for engine, signature in sorted(records)
+    ]
+
+
+def read_published_policy(root_dir: Path | None) -> dict[str, Any] | None:
+    if root_dir is None or not meta_is_native_published(root_dir):
+        return None
+    meta = _read_meta(Path(root_dir)) or {}
+    policy = meta.get("indexing_policy")
+    if isinstance(policy, dict):
+        return policy
+    return {"policy": "legacy_unpinned"}
+
+
+def latest_published_root(kb_dir: Path) -> Path | None:
+    """Return the newest native published version, ignoring failed candidates."""
+    from deeptutor.services.rag.index_versioning import list_kb_versions
+
+    for entry in list_kb_versions(Path(kb_dir)):
+        root = Path(str(entry.get("storage_path") or ""))
+        if meta_is_native_published(root):
+            return root
+    return None
+
+
+def published_root_for_embedding(kb_dir: Path, signature: str | None) -> Path | None:
+    """Find provenance for the recorded binding, even after catalog identity drift."""
+    if signature is None:
+        return latest_published_root(kb_dir)
+    from deeptutor.services.rag.index_versioning import list_kb_versions
+
+    for entry in list_kb_versions(kb_dir):
+        root = Path(entry["storage_path"])
+        if entry.get("embedding_signature") == signature and meta_is_native_published(root):
+            return root
+    return None
+
+
+def embedding_matches(root_dir: Path, signature: EmbeddingSignature | None) -> bool:
+    """Compare the published vector identity, never just its dimension."""
+    meta = _read_meta(root_dir) or {}
+    return signature is not None and meta.get("embedding_signature") == signature.hash()
+
+
+def require_compatible_embedding(root_dir: Path, config: EmbeddingConfig) -> None:
+    """Reject reads and appends when the published embedding identity differs."""
+    from deeptutor.services.rag.embedding_signature import signature_from_config
+
+    from .indexing_policy import EmbeddingMismatchError
+
+    if not embedding_matches(root_dir, signature_from_config(config)):
+        raise EmbeddingMismatchError(
+            "The current embedding configuration does not match this LightRAG index. "
+            "Restore the original embedding configuration or rebuild with the current embedding "
+            "before querying or adding documents."
+        )
+
+
+def write_meta(
+    root_dir: Path,
+    *,
+    indexing_policy: dict[str, Any] | None = None,
+    embedding_config: EmbeddingConfig | None = None,
+) -> None:
     """Write a flat-layout ``meta.json`` so the version lists as ready.
 
     Mirrors ``index_versioning.write_version_meta`` but carries a synthetic
@@ -151,16 +283,42 @@ def write_meta(root_dir: Path) -> None:
     embedding compatibility at connect time (LightRAG otherwise fails retrieval
     silently on a dimension mismatch).
     """
-    from deeptutor.services.rag.embedding_signature import embedding_meta_fields
+    from deeptutor.services.rag.embedding_signature import (
+        embedding_meta_fields,
+        signature_from_config,
+    )
+
+    from .engine import installed_version, workspace_for
 
     target = Path(root_dir)
+    previous = _read_meta(target) or {}
+    now = datetime.now(timezone.utc).replace(tzinfo=None).isoformat() + "Z"
+    if embedding_config is None:
+        embedding_fields = embedding_meta_fields()
+    else:
+        signature = signature_from_config(embedding_config)
+        embedding_fields = {
+            "embedding_signature": signature.hash(),
+            "embedding_model": signature.model,
+            "embedding_dim": signature.dimension,
+        }
     payload = {
         "version": target.name,
         "signature": PROVIDER,
         "provider": PROVIDER,
+        "state": PUBLISHED_STATE,
+        "lightrag_adapter_schema": ADAPTER_SCHEMA,
+        "lightrag_package_version": installed_version(),
+        "parser_bridge_schema": 1,
+        "parser_inputs": _parser_inputs(target),
+        "workspace": workspace_for(target),
         "layout": "flat",
-        "created_at": datetime.now(timezone.utc).replace(tzinfo=None).isoformat() + "Z",
-        **embedding_meta_fields(),
+        "created_at": str(previous.get("created_at") or now),
+        "updated_at": now,
+        "indexing_policy": indexing_policy
+        or previous.get("indexing_policy")
+        or {"policy": "legacy_unpinned"},
+        **embedding_fields,
     }
     atomic_write_json(target / META_FILENAME, payload)
 
@@ -170,7 +328,11 @@ __all__ = [
     "PROVIDER",
     "document_error",
     "failure_summary",
+    "has_any_doc_status",
     "working_dir",
     "has_output",
+    "meta_is_native_published",
+    "latest_published_root",
+    "read_published_policy",
     "write_meta",
 ]

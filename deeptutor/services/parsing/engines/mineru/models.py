@@ -1,6 +1,6 @@
 """One-click MinerU model download.
 
-Wraps the ``mineru-models-download`` CLI (MinerU 2.x) in a background job the
+Wraps the ``mineru-models-download`` CLI (current MinerU) in a background job the
 settings UI can start, poll, and cancel. The same source/endpoint settings
 also feed the parse subprocess via :func:`model_env_overrides`, so a lazy
 first-parse download honors the configured mirror even when the user never
@@ -20,6 +20,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from typing import Any
@@ -69,6 +70,20 @@ def model_env_overrides(source: str, endpoint: str = "") -> dict[str, str]:
     if cleaned and src == "huggingface":
         overrides["HF_ENDPOINT"] = cleaned
     return overrides
+
+
+def render_env_overrides() -> dict[str, str]:
+    """Env vars that steer how MinerU renders PDF pages to images.
+
+    MinerU renders pages with several worker threads (``MINERU_PDF_RENDER_THREADS``,
+    upstream default 3-4). On Windows that concurrency can abort the parse
+    process with a heap-corruption fault (0xc0000409), so serialize it there.
+    The variable is honored on every platform, hence the explicit guard: Linux
+    and macOS keep the parallel renderer and its throughput.
+    """
+    if sys.platform != "win32":
+        return {}
+    return {"MINERU_PDF_RENDER_THREADS": "1"}
 
 
 class ModelDownloadManager:

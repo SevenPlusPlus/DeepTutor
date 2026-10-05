@@ -4,8 +4,11 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { AlertCircle, Bot, Check, ChevronDown } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { useLingerExpand } from "@/hooks/use-linger-expand";
+import { useOutsideClick } from "@/hooks/use-outside-click";
+import Tooltip from "@/shared/ui/Tooltip";
+import ToolbarLabel from "./ToolbarLabel";
 import ProviderIcon from "@/components/common/ProviderIcon";
-import type { LLMSelection } from "@/lib/unified-ws";
+import type { LLMSelection } from "@/features/chat/model/protocol";
 import {
   llmSelectionKey,
   sameLLMSelection,
@@ -48,7 +51,7 @@ function ModelOptionRow({
   return (
     <button
       type="button"
-      title={`${option.model_name} | ${option.profile_name}`}
+      aria-label={`${option.model_name} | ${option.profile_name}`}
       onClick={onSelect}
       onMouseEnter={() => {
         const el = nameRef.current;
@@ -112,7 +115,9 @@ export default function ModelSelector({
   systemDefaultDetail,
   helperText,
   placement = "top",
+  pinned = false,
   onChange,
+  onRefresh,
 }: {
   options: LLMOption[];
   activeDefault: LLMSelection | null;
@@ -124,12 +129,19 @@ export default function ModelSelector({
   systemDefaultDetail?: string;
   helperText?: string;
   placement?: "top" | "bottom";
+  /** Optional always-visible label for surfaces outside the composer. */
+  pinned?: boolean;
   onChange: (selection: LLMSelection | null) => void;
+  onRefresh?: () => void;
 }) {
   const { t } = useTranslation();
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
-  const { expanded, linger, triggerProps: lingerProps } = useLingerExpand(open);
+  const {
+    expanded,
+    linger,
+    triggerProps: lingerProps,
+  } = useLingerExpand(open, 1200, pinned);
 
   const selectedSelection = allowSystemDefault
     ? value
@@ -142,32 +154,27 @@ export default function ModelSelector({
     [options, selectedSelection],
   );
 
-  useEffect(() => {
-    if (!open) return;
-    const handler = (event: MouseEvent) => {
-      const target = event.target as Node;
-      if (rootRef.current && !rootRef.current.contains(target)) {
-        setOpen(false);
-        linger();
-      }
-    };
-    document.addEventListener("mousedown", handler);
-    return () => document.removeEventListener("mousedown", handler);
-  }, [open, linger]);
+  useOutsideClick(rootRef, open, () => {
+    setOpen(false);
+    linger();
+  });
 
   const defaultLabel = systemDefaultLabel || t("System default");
   const defaultDetail =
     systemDefaultDetail || t("Use the active default model from Settings");
+  const canRefresh = error && Boolean(onRefresh);
   const disabled =
-    loading || error || (options.length === 0 && !allowSystemDefault);
+    loading ||
+    (!canRefresh && (error || (options.length === 0 && !allowSystemDefault)));
   const label = loading
     ? t("Loading models")
     : error
-      ? t("Models unavailable")
+      ? canRefresh
+        ? t("Refresh models")
+        : t("Models unavailable")
       : allowSystemDefault && !selectedSelection
         ? defaultLabel
-        : // Official model ID, consistent with the dropdown rows.
-          selectedOption?.model ||
+        : selectedOption?.model ||
           selectedOption?.model_name ||
           t("Select model");
   const menuPlacementClass =
@@ -175,44 +182,44 @@ export default function ModelSelector({
 
   return (
     <div ref={rootRef} className="relative">
-      {/* Same resting/expanded treatment as PersonaSelector: the brand
-          icon is the whole control at rest; hovering (or opening) slides
-          the model name out with a max-width animation and lingers ~1.2s
-          after leave/selection before collapsing. */}
-      <button
-        type="button"
-        disabled={disabled}
-        onClick={() => setOpen((current) => !current)}
-        aria-label={t("Select model")}
-        aria-expanded={open}
-        {...lingerProps}
-        className={`inline-flex h-8 shrink-0 items-center rounded-lg px-2 text-[14px] font-medium transition-[background-color,color,transform] duration-150 active:scale-[0.97] ${
-          disabled
-            ? "cursor-not-allowed text-[var(--border)]"
-            : open
-              ? "bg-[var(--muted)] text-[var(--foreground)]"
-              : "text-[var(--muted-foreground)] hover:bg-[var(--muted)]/55 hover:text-[var(--foreground)]"
-        }`}
-      >
-        {error ? (
-          <AlertCircle size={16} strokeWidth={1.7} className="shrink-0" />
-        ) : (
-          <ProviderIcon provider={selectedOption?.provider} size={16} />
-        )}
-        <span
-          className={`flex min-w-0 items-center gap-1 overflow-hidden whitespace-nowrap transition-[max-width,opacity,margin-left] duration-300 ease-out ${
-            expanded
-              ? "ml-1.5 max-w-[180px] opacity-100"
-              : "ml-0 max-w-0 opacity-0"
+      {/* The model name shares the composer selectors' spring and hover delay. */}
+      <Tooltip label={canRefresh ? t("Refresh models") : label} suppressed={open} side="top">
+        <button
+          type="button"
+          disabled={disabled}
+          onClick={() => {
+            if (canRefresh) {
+              setOpen(false);
+              onRefresh?.();
+              return;
+            }
+            setOpen((current) => !current);
+          }}
+          aria-label={canRefresh ? t("Refresh models") : t("Select model")}
+          aria-expanded={open}
+          {...lingerProps}
+          className={`inline-flex h-8 shrink-0 items-center rounded-lg px-2 text-[14px] font-medium transition-[background-color,color,transform] duration-150 active:scale-[0.97] ${
+            disabled
+              ? "cursor-not-allowed text-[var(--border)]"
+              : open
+                ? "bg-[var(--muted)] text-[var(--foreground)]"
+                : "text-[var(--muted-foreground)] hover:bg-[var(--muted)]/55 hover:text-[var(--foreground)]"
           }`}
         >
-          <span className="min-w-0 truncate">{label}</span>
-          <ChevronDown
-            size={13}
-            className={`shrink-0 transition-transform ${open ? "rotate-180" : ""}`}
-          />
-        </span>
-      </button>
+          {error ? (
+            <AlertCircle size={16} strokeWidth={1.7} className="shrink-0" />
+          ) : (
+            <ProviderIcon provider={selectedOption?.provider} size={16} />
+          )}
+          <ToolbarLabel expanded={expanded} fullWidth>
+            <span className="min-w-0">{label}</span>
+            <ChevronDown
+              size={13}
+              className={`shrink-0 transition-transform ${open ? "rotate-180" : ""}`}
+            />
+          </ToolbarLabel>
+        </button>
+      </Tooltip>
 
       {open && !disabled && (
         <div
@@ -227,7 +234,7 @@ export default function ModelSelector({
             {allowSystemDefault && (
               <button
                 type="button"
-                title={defaultDetail}
+                aria-label={defaultDetail}
                 onClick={() => {
                   onChange(null);
                   setOpen(false);

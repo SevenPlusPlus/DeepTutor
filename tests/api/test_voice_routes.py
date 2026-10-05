@@ -17,7 +17,7 @@ from deeptutor.services.voice import VoiceProviderError
 @pytest.fixture()
 def client() -> TestClient:
     app = FastAPI()
-    app.include_router(voice_router.router, prefix="/api/v1/voice")
+    app.include_router(voice_router.router, prefix="/api/voice")
     return TestClient(app)
 
 
@@ -31,7 +31,7 @@ def test_tts_returns_audio_bytes(client: TestClient, monkeypatch: pytest.MonkeyP
         return b"audio-bytes", "audio/mpeg"
 
     monkeypatch.setattr(voice_router, "synthesize_speech", fake_synth)
-    resp = client.post("/api/v1/voice/tts", json={"text": "hello", "voice": "nova"})
+    resp = client.post("/api/voice/tts", json={"text": "hello", "voice": "nova"})
     assert resp.status_code == 200
     assert resp.content == b"audio-bytes"
     assert resp.headers["content-type"] == "audio/mpeg"
@@ -48,7 +48,7 @@ def test_tts_wraps_pcm_bytes_as_browser_playable_wav(
         return pcm, "audio/pcm;rate=24000;channels=1"
 
     monkeypatch.setattr(voice_router, "synthesize_speech", fake_synth)
-    resp = client.post("/api/v1/voice/tts", json={"text": "hello"})
+    resp = client.post("/api/voice/tts", json={"text": "hello"})
 
     assert resp.status_code == 200
     assert resp.headers["content-type"] == "audio/wav"
@@ -61,7 +61,7 @@ def test_tts_wraps_pcm_bytes_as_browser_playable_wav(
 
 
 def test_tts_rejects_empty_text(client: TestClient) -> None:
-    resp = client.post("/api/v1/voice/tts", json={"text": ""})
+    resp = client.post("/api/voice/tts", json={"text": ""})
     assert resp.status_code == 422  # pydantic min_length
 
 
@@ -70,7 +70,7 @@ def test_tts_provider_error_is_502(client: TestClient, monkeypatch: pytest.Monke
         raise VoiceProviderError("upstream down")
 
     monkeypatch.setattr(voice_router, "synthesize_speech", boom)
-    resp = client.post("/api/v1/voice/tts", json={"text": "hi"})
+    resp = client.post("/api/voice/tts", json={"text": "hi"})
     assert resp.status_code == 502
     assert "upstream down" in resp.json()["detail"]
 
@@ -80,7 +80,7 @@ def test_tts_missing_config_is_400(client: TestClient, monkeypatch: pytest.Monke
         raise ValueError("No active TTS model is configured.")
 
     monkeypatch.setattr(voice_router, "synthesize_speech", no_config)
-    resp = client.post("/api/v1/voice/tts", json={"text": "hi"})
+    resp = client.post("/api/voice/tts", json={"text": "hi"})
     assert resp.status_code == 400
 
 
@@ -90,22 +90,48 @@ def test_stt_returns_text(client: TestClient, monkeypatch: pytest.MonkeyPatch) -
     async def fake_transcribe(audio: bytes, *, filename: str, content_type: str, language=None):
         captured["bytes"] = len(audio)
         captured["filename"] = filename
+        captured["content_type"] = content_type
         return "hello world"
 
     monkeypatch.setattr(voice_router, "transcribe_audio", fake_transcribe)
     resp = client.post(
-        "/api/v1/voice/stt",
+        "/api/voice/stt",
         files={"file": ("clip.webm", b"audiobytes", "audio/webm")},
     )
     assert resp.status_code == 200
     assert resp.json() == {"text": "hello world"}
     assert captured["filename"] == "clip.webm"
     assert captured["bytes"] == 10
+    assert captured["content_type"] == "audio/webm"
+
+
+def test_stt_forwards_the_browser_reported_mime_verbatim(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The route reports what the client sent; the adapter owns wire shaping.
+
+    Stripping the codec parameter happens once, at the boundary that puts the
+    value on the wire (``OpenAICompatSTTAdapter._post_multipart``), so the route
+    must not normalize it a second time.
+    """
+    captured: dict[str, Any] = {}
+
+    async def fake_transcribe(audio: bytes, *, filename: str, content_type: str, language=None):
+        captured["content_type"] = content_type
+        return "hello"
+
+    monkeypatch.setattr(voice_router, "transcribe_audio", fake_transcribe)
+    resp = client.post(
+        "/api/voice/stt",
+        files={"file": ("recording.webm", b"audiobytes", "audio/webm;codecs=opus")},
+    )
+    assert resp.status_code == 200
+    assert captured["content_type"] == "audio/webm;codecs=opus"
 
 
 def test_stt_rejects_empty_upload(client: TestClient) -> None:
     resp = client.post(
-        "/api/v1/voice/stt",
+        "/api/voice/stt",
         files={"file": ("empty.webm", b"", "audio/webm")},
     )
     assert resp.status_code == 400

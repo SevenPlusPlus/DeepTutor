@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_SUBPATH = ("workspace", "chat", "attachments")
 # Public route prefix served by deeptutor.api.routers.attachments
-_PUBLIC_URL_PREFIX = "/api/attachments"
+_PUBLIC_URL_PREFIX = "/files/attachments"
 
 
 def _coerce_filename(filename: str) -> str:
@@ -81,7 +81,7 @@ class AttachmentStore(Protocol):
         """Persist *data* and return a public URL the frontend can fetch.
 
         The returned URL is relative to the API origin (e.g.
-        ``"/api/attachments/<sid>/<aid>/<name>"``). Raising on failure is
+        ``"/files/attachments/<sid>/<aid>/<name>"``). Raising on failure is
         fine — callers log the error and proceed without ``url``.
         """
 
@@ -163,7 +163,9 @@ class LocalDiskAttachmentStore:
         sid = quote(_coerce_filename(session_id), safe="")
         aid = quote(attachment_id, safe="")
         name = quote(_coerce_filename(filename), safe="")
-        return f"{_PUBLIC_URL_PREFIX}/{sid}/{aid}/{name}"
+        from deeptutor.services.workspace.context import workspace_url
+
+        return workspace_url(f"{_PUBLIC_URL_PREFIX}/{sid}/{aid}/{name}")
 
     @staticmethod
     def _write_sync(target: Path, data: bytes) -> None:
@@ -245,8 +247,10 @@ def get_attachment_store() -> AttachmentStore:
 
 
 def _attachment_root() -> Path:
+    from deeptutor.services.workspace.context import current_workspace_id
+
     override = str(load_system_settings().get("chat_attachment_dir") or "").strip()
-    if override:
+    if override and not current_workspace_id():
         return Path(override).expanduser().resolve()
     return get_path_service().get_user_root().joinpath(*_DEFAULT_SUBPATH).resolve()
 

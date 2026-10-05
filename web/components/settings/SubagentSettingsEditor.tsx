@@ -1,5 +1,7 @@
 "use client";
 
+import { useSettings } from "@/features/settings/store/SettingsStore";
+import { useStagedSettings } from "@/features/settings/store/useStagedSettings";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { CheckCircle2, Loader2, RefreshCw, XCircle } from "lucide-react";
 import { useTranslation } from "react-i18next";
@@ -17,14 +19,13 @@ import {
   getBackendOptions,
   getSubagentSettings,
   syncBackendOptions,
-  updateSubagentSettings,
   type SubagentBackendConfig,
   type SubagentBackendOptions,
 } from "@/lib/subagents-api";
 
 type Lang = { zh: string; en: string };
 
-/** The CLI default sentinel — empty model/effort means "let the CLI decide". */
+/** Empty model/effort means "let the selected runtime decide". */
 const CUSTOM = "__custom__";
 
 // Defaults mirror BackendConfig in deeptutor/services/subagent/config.py so the
@@ -63,8 +64,8 @@ const DEFAULTS: Required<
 /**
  * Which knobs each backend kind actually honors — the editor renders from this
  * table instead of per-kind branches. Mirrors what the Python backend reads:
- * e.g. only Claude Code / Gemini use `permission_mode`, only Codex has its
- * sandbox family, kimi/opencode/mimo take the `auto_approve` reply switch.
+ * e.g. Claude Code / Antigravity / Grok use `permission_mode`, only Codex has its
+ * sandbox family, kimi/hermes/opencode/mimo take the `auto_approve` switch.
  */
 type KindFeatures = {
   effort: boolean;
@@ -95,14 +96,25 @@ const KIND_FEATURES: Record<string, KindFeatures> = {
     thinking: false,
     forwardImages: true,
   },
-  gemini: {
-    effort: false, // no reasoning-effort flag
+  grok: {
+    effort: true,
     systemPrompt: true,
-    permissionMode: true, // canonical values map onto --approval-mode
+    permissionMode: true,
     codexSandbox: false,
     autoApprove: false,
     thinking: false,
-    forwardImages: true, // @path syntax
+    forwardImages: false,
+  },
+  antigravity: {
+    effort: true, // --effort low|medium|high
+    systemPrompt: true,
+    permissionMode: true, // permissive modes map onto --dangerously-skip-permissions
+    codexSandbox: false,
+    autoApprove: false,
+    thinking: false,
+    // Headless `agy` documents no attachment flag; images are named as paths
+    // in the prompt for the agent's own file-reading tools instead.
+    forwardImages: false,
   },
   kimi: {
     effort: false,
@@ -131,6 +143,42 @@ const KIND_FEATURES: Record<string, KindFeatures> = {
     thinking: false,
     forwardImages: true,
   },
+  hermes: {
+    effort: true,
+    systemPrompt: true,
+    permissionMode: false,
+    codexSandbox: false,
+    autoApprove: true, // --yolo
+    thinking: false,
+    forwardImages: true, // --image
+  },
+  hermes_remote: {
+    effort: true,
+    systemPrompt: true,
+    permissionMode: false,
+    codexSandbox: false,
+    autoApprove: true,
+    thinking: false,
+    forwardImages: false,
+  },
+  openclaw: {
+    effort: true, // --thinking
+    systemPrompt: true,
+    permissionMode: false,
+    codexSandbox: false,
+    autoApprove: false,
+    thinking: false,
+    forwardImages: true, // local paths are named in the prompt
+  },
+  deepseek_harness: {
+    effort: true, // SDK reasoning_effort
+    systemPrompt: true,
+    permissionMode: false,
+    codexSandbox: false,
+    autoApprove: false,
+    thinking: false,
+    forwardImages: true, // local paths are named in the prompt
+  },
 };
 
 const FALLBACK_FEATURES: KindFeatures = KIND_FEATURES.claude_code;
@@ -138,22 +186,26 @@ const FALLBACK_FEATURES: KindFeatures = KIND_FEATURES.claude_code;
 const DISPLAY_NAMES: Record<string, string> = {
   claude_code: "Claude Code",
   codex: "Codex",
-  gemini: "Gemini CLI",
+  grok: "Grok CLI",
   kimi: "Kimi CLI",
   opencode: "opencode",
   mimo: "MiMo Code",
+  hermes: "Hermes Agent",
+  hermes_remote: "Hermes Agent (remote)",
+  openclaw: "OpenClaw",
+  deepseek_harness: "DeepSeek Harness",
 };
 
 // Per-kind flavor for the system-prompt section: how the instruction reaches
 // the agent (a real flag, a native prompt field, or a first-message prefix).
 const SYSTEM_PROMPT_HINT: Record<string, Lang> = {
+  grok: {
+    zh: "通过 Grok CLI 的 rules 参数传入额外教学或委派指令。",
+    en: "Additional teaching or delegation instructions are passed through Grok CLI's rules option.",
+  },
   claude_code: {
     zh: "追加到该智能体的系统提示（--append-system-prompt）。",
     en: "Appended to the agent's system prompt (--append-system-prompt).",
-  },
-  gemini: {
-    zh: "Gemini CLI 没有系统提示 flag——该指令会前缀在每个新会话的第一条消息上。",
-    en: "Gemini CLI has no system-prompt flag — the instruction is prefixed to each new session's first message.",
   },
   kimi: {
     zh: "Kimi CLI 没有系统提示 flag——该指令会前缀在每个新会话的第一条消息上。",
@@ -166,6 +218,22 @@ const SYSTEM_PROMPT_HINT: Record<string, Lang> = {
   mimo: {
     zh: "通过服务器 API 的 system 字段注入到每个新会话。",
     en: "Injected into each new session via the server API's system field.",
+  },
+  hermes: {
+    zh: "Hermes 没有系统提示 flag——该指令会前缀在每个新会话的第一条消息上。",
+    en: "Hermes has no system-prompt flag — the instruction is prefixed to each new session's first message.",
+  },
+  hermes_remote: {
+    zh: "新会话（或远端会话已失效）时，通过 Hermes 网关 API 的 instructions 字段注入。",
+    en: "Sent through the Hermes gateway API's instructions field for a fresh or expired session.",
+  },
+  openclaw: {
+    zh: "该指令会前缀在每个新 OpenClaw session key 的第一条消息上。",
+    en: "The instruction is prefixed to the first message for each new OpenClaw session key.",
+  },
+  deepseek_harness: {
+    zh: "该指令会前缀在每个新 DeepSeek Harness 会话的第一条消息上。",
+    en: "The instruction is prefixed to the first message in each new DeepSeek Harness session.",
   },
 };
 
@@ -190,6 +258,42 @@ const PERMISSION_MODES: { value: string; label: Lang }[] = [
     label: { zh: "计划模式 · 只读", en: "Plan mode · read-only" },
   },
 ];
+
+const GROK_PERMISSION_MODES: { value: string; label: Lang }[] = [
+  {
+    value: "dontAsk",
+    label: {
+      zh: "不询问 · 拒绝需审批操作（默认）",
+      en: "Don't ask · deny approval requests (default)",
+    },
+  },
+  {
+    value: "plan",
+    label: { zh: "Plan（兼容模式）", en: "Plan (compatibility mode)" },
+  },
+  {
+    value: "default",
+    label: { zh: "默认权限", en: "Default permissions" },
+  },
+  {
+    value: "acceptEdits",
+    label: { zh: "自动接受编辑", en: "Accept edits automatically" },
+  },
+  {
+    value: "auto",
+    label: { zh: "自动评估权限", en: "Automatically evaluate permissions" },
+  },
+  {
+    value: "bypassPermissions",
+    label: { zh: "绕过权限", en: "Bypass permissions" },
+  },
+];
+
+function defaultsForKind(kind: string): typeof DEFAULTS {
+  return kind === "grok"
+    ? { ...DEFAULTS, permission_mode: "dontAsk" }
+    : DEFAULTS;
+}
 
 const SANDBOXES: { value: string; label: Lang }[] = [
   { value: "read-only", label: { zh: "只读", en: "Read-only" } },
@@ -217,47 +321,20 @@ const APPROVALS: { value: string; label: Lang }[] = [
   },
 ];
 
-// Gemini stores the same canonical permission values (the two CLIs' modes are
-// semantically parallel); the labels name its native --approval-mode spellings.
-const GEMINI_PERMISSION_MODES: { value: string; label: Lang }[] = [
-  {
-    value: "bypassPermissions",
-    label: {
-      zh: "YOLO · 全自主（推荐）",
-      en: "YOLO · autonomous (recommended)",
-    },
-  },
-  {
-    value: "acceptEdits",
-    label: {
-      zh: "自动接受编辑（auto_edit）",
-      en: "Auto-accept edits (auto_edit)",
-    },
-  },
-  {
-    value: "default",
-    label: {
-      zh: "默认 · 无人值守下改动会被拒绝",
-      en: "Default · mutating tools are denied headless",
-    },
-  },
-  {
-    value: "plan",
-    label: { zh: "计划模式 · 只读", en: "Plan mode · read-only" },
-  },
-];
-
 export function SubagentSettingsEditor({ kind }: { kind: string }) {
   const { i18n } = useTranslation();
   const zh = i18n.language?.toLowerCase().startsWith("zh");
   const tr = useCallback((l: Lang) => (zh ? l.zh : l.en), [zh]);
 
   const [options, setOptions] = useState<SubagentBackendOptions | null>(null);
-  const [config, setConfig] = useState<SubagentBackendConfig>({ ...DEFAULTS });
+  const [liveConfig, setLiveConfig] = useState<SubagentBackendConfig>({
+    ...defaultsForKind(kind),
+  });
+  const [config, setConfig] = useStagedSettings(`subagent:${kind}`, liveConfig, setLiveConfig);
   const [customModel, setCustomModel] = useState(false);
   const [loading, setLoading] = useState(true);
   const [syncing, setSyncing] = useState(false);
-  const [busy, setBusy] = useState(false);
+  const { applying: busy, draftRevision } = useSettings();
   const [error, setError] = useState<string | null>(null);
 
   const Glyph = agentGlyph(kind);
@@ -272,11 +349,12 @@ export function SubagentSettingsEditor({ kind }: { kind: string }) {
     try {
       const [opts, settings] = await Promise.all([
         fetchOptions(),
-        getSubagentSettings(),
+        // An editor must show what is stored, never a cached copy.
+        getSubagentSettings({ force: true }),
       ]);
       setOptions(opts);
       const stored = settings.backends?.[kind] ?? {};
-      setConfig({ ...DEFAULTS, ...stored });
+      setLiveConfig({ ...defaultsForKind(kind), ...stored });
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -286,7 +364,7 @@ export function SubagentSettingsEditor({ kind }: { kind: string }) {
 
   useEffect(() => {
     void load();
-  }, [load]);
+  }, [load, draftRevision]);
 
   const sync = useCallback(async () => {
     setSyncing(true);
@@ -301,25 +379,14 @@ export function SubagentSettingsEditor({ kind }: { kind: string }) {
     }
   }, [kind]);
 
-  // Persist a patch for THIS backend only; the API merges per field, so we send
-  // just what changed and never clobber the other backend or unsent fields.
-  const save = useCallback(
-    async (patch: Partial<SubagentBackendConfig>) => {
-      setConfig((prev) => ({ ...prev, ...patch }));
-      setBusy(true);
-      setError(null);
-      try {
-        await updateSubagentSettings({ backends: { [kind]: patch } });
-      } catch (err) {
-        setError(err instanceof Error ? err.message : String(err));
-      } finally {
-        setBusy(false);
-      }
-    },
-    [kind],
-  );
+  const save = useCallback(async (patch: Partial<SubagentBackendConfig>) => {
+    setConfig((prev) => ({ ...prev, ...patch }));
+  }, [setConfig]);
 
   const features = KIND_FEATURES[kind] ?? FALLBACK_FEATURES;
+  const isRemote = kind === "hermes_remote";
+  const isGrok = kind === "grok";
+  const permissionModes = isGrok ? GROK_PERMISSION_MODES : PERMISSION_MODES;
   const knownSlugs = useMemo(
     () => new Set((options?.models ?? []).map((m) => m.slug)),
     [options],
@@ -366,10 +433,17 @@ export function SubagentSettingsEditor({ kind }: { kind: string }) {
     <div>
       <SettingsPageHeader
         title={displayName}
-        description={tr({
-          zh: `DeepTutor 通过 consult_subagent 调用本机 ${displayName} 时使用的模型、推理强度与运行参数。设置后即覆盖 CLI 的默认值；留空表示沿用 CLI 默认。`,
-          en: `Model, reasoning effort, and run parameters DeepTutor drives the local ${displayName} with when consulting it. These override the CLI defaults; leave blank to keep the CLI's own default.`,
-        })}
+        description={
+          isRemote
+            ? tr({
+                zh: "配置 DeepTutor 通过 HTTP 调用的远程 Hermes 网关、模型与运行参数。",
+                en: "Configure the remote Hermes gateway, model, and run parameters DeepTutor uses over HTTP.",
+              })
+            : tr({
+                zh: `DeepTutor 通过 consult_subagent 调用本机 ${displayName} 时使用的模型、推理强度与运行参数。设置后即覆盖 CLI 的默认值；留空表示沿用 CLI 默认。`,
+                en: `Model, reasoning effort, and run parameters DeepTutor drives the local ${displayName} with when consulting it. These override the CLI defaults; leave blank to keep the CLI's own default.`,
+              })
+        }
       />
 
       {loading && (
@@ -391,13 +465,29 @@ export function SubagentSettingsEditor({ kind }: { kind: string }) {
               the user can re-pull them on demand. */}
           <SettingSection
             title={tr({ zh: "连接与同步", en: "Connection & sync" })}
-            description={tr({
-              zh: "供应商会不定期增删模型与推理档位——随时点同步即可重新拉取最新列表。",
-              en: "Vendors add and retire models and effort levels over time — sync any time to re-pull the latest lists.",
-            })}
+            description={
+              isRemote
+                ? tr({
+                    zh: "检查已配置网关的连通性与认证状态。",
+                    en: "Check connectivity and authentication for the configured gateway.",
+                  })
+                : isGrok
+                  ? tr({
+                      zh: "检测后端环境中的 Grok CLI。模型和推理强度可留空使用 CLI 默认值，或手动填写。",
+                      en: "Detect Grok CLI in the backend environment. Leave model and reasoning effort blank for CLI defaults, or enter them manually.",
+                    })
+                  : tr({
+                      zh: "供应商会不定期增删模型与推理档位——随时点同步即可重新拉取最新列表。",
+                      en: "Vendors add and retire models and effort levels over time — sync any time to re-pull the latest lists.",
+                    })
+            }
           >
             <SettingRow
-              title={tr({ zh: "本机状态", en: "On this machine" })}
+              title={
+                isRemote
+                  ? tr({ zh: "网关状态", en: "Gateway status" })
+                  : tr({ zh: "本机状态", en: "On this machine" })
+              }
               description={
                 options.available
                   ? options.version
@@ -422,39 +512,136 @@ export function SubagentSettingsEditor({ kind }: { kind: string }) {
                     <XCircle className="h-3.5 w-3.5" />
                   )}
                   {options.available
-                    ? tr({ zh: "已安装", en: "Installed" })
-                    : tr({ zh: "未检测到", en: "Not detected" })}
+                    ? isRemote
+                      ? tr({ zh: "可连接", en: "Reachable" })
+                      : tr({ zh: "已安装", en: "Installed" })
+                    : isRemote
+                      ? tr({ zh: "不可用", en: "Unavailable" })
+                      : tr({ zh: "未检测到", en: "Not detected" })}
                 </span>
               }
             />
             <SettingRow
               title={tr({ zh: "模型列表", en: "Model list" })}
               description={
-                options.synced_at
+                isGrok
                   ? tr({
-                      zh: `上次同步：${formatTs(options.synced_at, zh)}`,
-                      en: `Last synced: ${formatTs(options.synced_at, zh)}`,
+                      zh: "不预设模型列表；请填写当前 Grok CLI 支持的模型名。同步仅重新检测 CLI。",
+                      en: "No model catalog is assumed. Enter a model supported by your Grok CLI; sync only detects the CLI again.",
                     })
-                  : tr({
-                      zh: "该 CLI 无可枚举的模型接口，下方为常用别名，可自定义任意模型名。",
-                      en: "This CLI has no model-list API; below are the common aliases, and any model name is accepted.",
-                    })
+                  : options.synced_at
+                    ? tr({
+                        zh: `上次同步：${formatTs(options.synced_at, zh)}`,
+                        en: `Last synced: ${formatTs(options.synced_at, zh)}`,
+                      })
+                    : isRemote
+                      ? tr({
+                          zh: "远程网关当前不提供模型枚举；可以留空使用网关默认值，或手动填写模型名。",
+                          en: "The remote gateway does not currently enumerate models here; use its default or enter a model name manually.",
+                        })
+                      : tr({
+                          zh: "该 CLI 无可枚举的模型接口，下方为常用别名，可自定义任意模型名。",
+                          en: "This CLI has no model-list API; below are the common aliases, and any model name is accepted.",
+                        })
               }
               control={
-                <button
-                  type="button"
-                  disabled={syncing}
-                  onClick={() => void sync()}
-                  className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--border)] px-2.5 py-1.5 text-[12px] font-medium text-[var(--foreground)] transition-colors hover:border-[var(--foreground)]/40 disabled:opacity-60"
-                >
-                  <RefreshCw
-                    className={`h-3.5 w-3.5 ${syncing ? "animate-spin" : ""}`}
-                  />
-                  {tr({ zh: "同步", en: "Sync" })}
-                </button>
+                isRemote ? (
+                  <span className="text-[12px] text-[var(--muted-foreground)]">
+                    {tr({ zh: "网关模型由服务端提供", en: "Gateway models are server-managed" })}
+                  </span>
+                ) : (
+                  <button
+                    type="button"
+                    disabled={syncing}
+                    onClick={() => void sync()}
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--border)] px-2.5 py-1.5 text-[12px] font-medium text-[var(--foreground)] transition-colors hover:border-[var(--foreground)]/40 disabled:opacity-60"
+                  >
+                    <RefreshCw
+                      className={`h-3.5 w-3.5 ${syncing ? "animate-spin" : ""}`}
+                    />
+                    {tr({ zh: "同步", en: "Sync" })}
+                  </button>
+                )
               }
             />
           </SettingSection>
+
+          {isRemote && (
+            <SettingSection
+              title={tr({ zh: "远程网关", en: "Remote gateway" })}
+              description={tr({
+                zh: "密钥只从环境变量读取；这里仅保存变量名，不保存密钥值。",
+                en: "The bearer is read only from the environment; this stores the variable name, never the secret.",
+              })}
+            >
+              <SettingRow
+                title={tr({ zh: "网关 URL", en: "Gateway URL" })}
+                control={
+                  <input
+                    className={`${inputClass} w-[260px]`}
+                    disabled={busy}
+                    value={config.base_url ?? ""}
+                    placeholder={tr({
+                      zh: "例如：http://hermes-uni:8642",
+                      en: "e.g. http://hermes-uni:8642",
+                    })}
+                    onChange={(e) => setConfig((p) => ({ ...p, base_url: e.target.value }))}
+                    onBlur={(e) => void save({ base_url: e.target.value.trim() })}
+                  />
+                }
+              />
+              <SettingRow
+                title={tr({ zh: "密钥环境变量", en: "API key environment variable" })}
+                control={
+                  <input
+                    className={`${inputClass} w-[260px]`}
+                    disabled={busy}
+                    value={config.api_key_env ?? "DEEPTUTOR_HERMES_REMOTE_API_KEY"}
+                    onChange={(e) => setConfig((p) => ({ ...p, api_key_env: e.target.value }))}
+                    onBlur={(e) => void save({ api_key_env: e.target.value.trim() })}
+                  />
+                }
+              />
+              <SettingRow
+                title={tr({ zh: "配置 profile", en: "Profile label" })}
+                description={tr({
+                  zh: "仅作部署标识，不会把密钥写入设置。",
+                  en: "Informational deployment label; it never stores a key.",
+                })}
+                control={
+                  <input
+                    className={`${inputClass} w-[260px]`}
+                    disabled={busy}
+                    value={config.profile ?? ""}
+                    onChange={(e) => setConfig((p) => ({ ...p, profile: e.target.value }))}
+                    onBlur={(e) => void save({ profile: e.target.value.trim() })}
+                  />
+                }
+              />
+              <SettingRow
+                title={tr({ zh: "空闲超时（秒）", en: "Idle timeout (seconds)" })}
+                control={
+                  <input
+                    className={`${inputClass} w-[260px]`}
+                    disabled={busy}
+                    type="number"
+                    min={1}
+                    max={86400}
+                    value={config.idle_timeout_seconds ?? 600}
+                    onChange={(e) =>
+                      setConfig((p) => ({
+                        ...p,
+                        idle_timeout_seconds: Number.parseInt(e.target.value, 10),
+                      }))
+                    }
+                    onBlur={(e) =>
+                      void save({ idle_timeout_seconds: Number.parseInt(e.target.value, 10) })
+                    }
+                  />
+                }
+              />
+            </SettingSection>
+          )}
 
           <SettingSection
             title={tr({ zh: "模型", en: "Model" })}
@@ -482,13 +669,16 @@ export function SubagentSettingsEditor({ kind }: { kind: string }) {
               control={
                 <div className="flex w-[260px] flex-col items-end gap-2">
                   <select
+                    aria-label={tr({ zh: "模型", en: "Model" })}
                     className={selectClass}
                     disabled={busy}
                     value={showCustomModel ? CUSTOM : (config.model ?? "")}
                     onChange={(e) => onModelSelect(e.target.value)}
                   >
                     <option value="">
-                      {tr({ zh: "CLI 默认", en: "CLI default" })}
+                      {isRemote
+                        ? tr({ zh: "网关默认", en: "Gateway default" })
+                        : tr({ zh: "CLI 默认", en: "CLI default" })}
                     </option>
                     {options.models.map((m) => (
                       <option key={m.slug} value={m.slug}>
@@ -503,6 +693,7 @@ export function SubagentSettingsEditor({ kind }: { kind: string }) {
                   </select>
                   {showCustomModel && (
                     <input
+                      aria-label={tr({ zh: "自定义模型", en: "Custom model" })}
                       className={inputClass}
                       disabled={busy}
                       placeholder={tr({
@@ -525,21 +716,45 @@ export function SubagentSettingsEditor({ kind }: { kind: string }) {
               <SettingRow
                 title={tr({ zh: "推理强度", en: "Reasoning effort" })}
                 control={
-                  <select
-                    className={`${selectClass} w-[260px]`}
-                    disabled={busy || effortChoices.length === 0}
-                    value={config.effort ?? ""}
-                    onChange={(e) => void save({ effort: e.target.value })}
-                  >
-                    <option value="">
-                      {tr({ zh: "CLI 默认", en: "CLI default" })}
-                    </option>
-                    {effortChoices.map((eff) => (
-                      <option key={eff} value={eff}>
-                        {eff}
+                  isGrok ? (
+                    <input
+                      aria-label={tr({
+                        zh: "推理强度",
+                        en: "Reasoning effort",
+                      })}
+                      className={`${inputClass} w-[260px]`}
+                      disabled={busy}
+                      placeholder={tr({
+                        zh: "留空使用 CLI 默认值",
+                        en: "Blank uses CLI default",
+                      })}
+                      value={config.effort ?? ""}
+                      onChange={(e) =>
+                        setConfig((p) => ({ ...p, effort: e.target.value }))
+                      }
+                      onBlur={(e) =>
+                        void save({ effort: e.target.value.trim() })
+                      }
+                    />
+                  ) : (
+                    <select
+                      className={`${selectClass} w-[260px]`}
+                      disabled={busy || effortChoices.length === 0}
+                      value={config.effort ?? ""}
+                      onChange={(e) => void save({ effort: e.target.value })}
+                    >
+                      <option value="">
+                        {isRemote
+                          ? tr({ zh: "网关默认", en: "Gateway default" })
+                          : tr({ zh: "CLI 默认", en: "CLI default" })}
                       </option>
-                    ))}
-                  </select>
+                      {effortChoices.map((eff) => (
+                        <option key={eff} value={eff}>
+                          {eff}
+                        </option>
+                      ))}
+                    </select>
+                  )
                 }
               />
             )}
@@ -557,6 +772,7 @@ export function SubagentSettingsEditor({ kind }: { kind: string }) {
             >
               <div className="py-4">
                 <textarea
+                  aria-label={tr({ zh: "系统提示", en: "System prompt" })}
                   className={`${inputClass} min-h-[96px] resize-y leading-relaxed`}
                   disabled={busy}
                   placeholder={tr({
@@ -583,23 +799,31 @@ export function SubagentSettingsEditor({ kind }: { kind: string }) {
             {features.permissionMode && (
               <SettingRow
                 title={tr({ zh: "权限模式", en: "Permission mode" })}
-                description={tr({
-                  zh: "非「绕过权限」的模式可能让无人值守的运行卡住等待确认。",
-                  en: "Modes other than bypass may stall an unattended run waiting for a prompt.",
-                })}
+                description={
+                  isGrok
+                    ? tr({
+                        zh: "默认 dontAsk 会拒绝需审批的操作。其它模式遵循 Grok CLI 权限规则；无人值守运行无法回答交互审批。",
+                        en: "The default dontAsk mode denies operations that need approval. Other modes follow Grok CLI permissions; unattended runs cannot answer interactive prompts.",
+                      })
+                    : tr({
+                        zh: "非「绕过权限」的模式可能让无人值守的运行卡住等待确认。",
+                        en: "Modes other than bypass may stall an unattended run waiting for a prompt.",
+                      })
+                }
                 control={
                   <select
+                    aria-label={tr({ zh: "权限模式", en: "Permission mode" })}
                     className={`${selectClass} w-[260px]`}
                     disabled={busy}
-                    value={config.permission_mode ?? DEFAULTS.permission_mode}
+                    value={
+                      config.permission_mode ??
+                      defaultsForKind(kind).permission_mode
+                    }
                     onChange={(e) =>
                       void save({ permission_mode: e.target.value })
                     }
                   >
-                    {(kind === "gemini"
-                      ? GEMINI_PERMISSION_MODES
-                      : PERMISSION_MODES
-                    ).map((o) => (
+                    {permissionModes.map((o) => (
                       <option key={o.value} value={o.value}>
                         {tr(o.label)}
                       </option>

@@ -4,9 +4,15 @@ from __future__ import annotations
 
 import pytest
 
+from deeptutor.services.config.embedding_endpoint import normalize_embedding_endpoint_for_display
 from deeptutor.services.config.provider_runtime import (
     EMBEDDING_PROVIDERS,
     resolve_embedding_runtime_config,
+)
+from deeptutor.services.embedding.config import get_embedding_config
+
+NATIVE_GEMINI2_ENDPOINT = (
+    "https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-2:batchEmbedContents"
 )
 
 
@@ -72,6 +78,184 @@ def test_embedding_explicit_binding_and_headers() -> None:
     assert resolved.dimension == 1024
 
 
+def test_lemonade_embedding_is_local_even_for_qwen_model_and_docker_hostname() -> None:
+    catalog = _build_catalog(
+        embedding_profile={
+            "id": "embedding-p",
+            "name": "Lemonade Server",
+            "binding": "lemonade",
+            "base_url": "http://lemonade:13305/api/v1/embeddings",
+            "api_key": "",
+            "models": [
+                {
+                    "id": "embedding-m",
+                    "name": "Qwen3",
+                    "model": "Qwen3-Embedding-0.6B-GGUF",
+                }
+            ],
+        }
+    )
+
+    resolved = resolve_embedding_runtime_config(catalog=catalog)
+    assert resolved.provider_name == "lemonade"
+    assert resolved.provider_mode == "local"
+    assert resolved.api_key == ""
+    assert get_embedding_config(catalog=catalog).effective_url == (
+        "http://lemonade:13305/api/v1/embeddings"
+    )
+    assert normalize_embedding_endpoint_for_display("lemonade", "http://localhost:13305/v1") == (
+        "http://localhost:13305/v1/embeddings"
+    )
+
+
+def test_lemonade_connection_shared_from_llm_resolves_embedding_endpoint() -> None:
+    catalog = _build_catalog(
+        embedding_profile={
+            "id": "embedding-p",
+            "name": "Lemonade embedding",
+            "provider_ref": {"connection_id": "lemonade-connection"},
+            "models": [
+                {
+                    "id": "embedding-m",
+                    "model": "Qwen3-Embedding-0.6B-GGUF",
+                }
+            ],
+        }
+    )
+    catalog["connections"] = [
+        {
+            "id": "lemonade-connection",
+            "name": "Lemonade Server",
+            "binding": "lemonade",
+            "base_url": "http://lemonade:13305/api/v1",
+            "api_key": "",
+            "source_service": "llm",
+        }
+    ]
+
+    resolved = resolve_embedding_runtime_config(catalog=catalog)
+    assert resolved.provider_name == "lemonade"
+    assert resolved.provider_mode == "local"
+    assert resolved.effective_url == "http://lemonade:13305/api/v1/embeddings"
+    assert get_embedding_config(catalog=catalog).api_key == ""
+
+
+def test_legacy_custom_lemonade_endpoint_stays_keyless() -> None:
+    catalog = _build_catalog(
+        embedding_profile={
+            "id": "embedding-p",
+            "binding": "custom",
+            "base_url": "http://localhost:13305/v1/embeddings",
+            "api_key": "",
+            "models": [
+                {
+                    "id": "embedding-m",
+                    "model": "Qwen3-Embedding-0.6B-GGUF",
+                }
+            ],
+        }
+    )
+
+    resolved = resolve_embedding_runtime_config(catalog=catalog)
+    assert resolved.provider_name == "lemonade"
+    assert get_embedding_config(catalog=catalog).api_key == ""
+
+
+def test_explicit_openai_binding_to_local_lemonade_is_keyless() -> None:
+    catalog = _build_catalog(
+        embedding_profile={
+            "id": "embedding-p",
+            "binding": "openai",
+            "base_url": "http://lemonade:13305/api/v1/embeddings",
+            "api_key": "",
+            "models": [
+                {
+                    "id": "embedding-m",
+                    "model": "Qwen3-Embedding-0.6B-GGUF",
+                }
+            ],
+        }
+    )
+
+    resolved = resolve_embedding_runtime_config(catalog=catalog)
+    assert resolved.provider_name == "lemonade"
+    assert resolved.provider_mode == "local"
+    assert get_embedding_config(catalog=catalog).api_key == ""
+
+
+def test_remote_openai_compatible_endpoint_still_requires_key() -> None:
+    catalog = _build_catalog(
+        embedding_profile={
+            "id": "embedding-p",
+            "binding": "openai",
+            "base_url": "https://api.example.com:13305/api/v1/embeddings",
+            "api_key": "",
+            "models": [
+                {
+                    "id": "embedding-m",
+                    "model": "Qwen3-Embedding-0.6B-GGUF",
+                }
+            ],
+        }
+    )
+
+    resolved = resolve_embedding_runtime_config(catalog=catalog)
+    assert resolved.provider_name == "openai"
+    assert resolved.provider_mode != "local"
+    with pytest.raises(ValueError, match="Embedding API key not set"):
+        get_embedding_config(catalog=catalog)
+
+
+def test_embedding_orcarouter_binding_uses_default_endpoint() -> None:
+    catalog = _build_catalog(
+        embedding_profile={
+            "id": "embedding-p",
+            "name": "Embedding",
+            "binding": "orcarouter",
+            "base_url": "",
+            "api_key": "sk-orca-test-key",
+            "api_version": "",
+            "extra_headers": {},
+            "models": [
+                {
+                    "id": "embedding-m",
+                    "name": "orcarouter",
+                    "model": "openai/text-embedding-3-large",
+                    "dimension": "3072",
+                }
+            ],
+        }
+    )
+    resolved = resolve_embedding_runtime_config(catalog=catalog)
+    assert resolved.provider_name == "orcarouter"
+    assert resolved.provider_mode == "standard"
+    assert resolved.effective_url == "https://api.orcarouter.ai/v1/embeddings"
+    assert resolved.dimension == 3072
+
+
+def test_embedding_runtime_preserves_api_key_array() -> None:
+    catalog = _build_catalog(
+        embedding_profile={
+            "id": "embedding-p",
+            "name": "Embedding pool",
+            "binding": "openai",
+            "base_url": "https://api.example.com/v1/embeddings",
+            "api_key": ["key-a", "key-b"],
+            "api_version": "",
+            "extra_headers": {},
+            "models": [
+                {
+                    "id": "embedding-m",
+                    "name": "m",
+                    "model": "text-embedding-3-small",
+                    "dimension": "1536",
+                }
+            ],
+        }
+    )
+    assert resolve_embedding_runtime_config(catalog=catalog).api_key == ["key-a", "key-b"]
+
+
 def test_embedding_alias_canonicalization_google_to_gemini() -> None:
     catalog = _build_catalog(
         embedding_profile={
@@ -91,6 +275,9 @@ def test_embedding_alias_canonicalization_google_to_gemini() -> None:
 
 
 def test_embedding_gemini_default_base_and_profile_key() -> None:
+    """An existing gemini-embedding-001 profile with no explicit endpoint must
+    keep the OpenAI-compatible URL — the native route sends a taskType and
+    L2-normalizes, so moving it would invalidate the index built from it."""
     catalog = _build_catalog(
         embedding_profile={
             "id": "embedding-p",
@@ -111,6 +298,69 @@ def test_embedding_gemini_default_base_and_profile_key() -> None:
         resolved.effective_url
         == "https://generativelanguage.googleapis.com/v1beta/openai/embeddings"
     )
+
+
+def test_embedding_gemini_defaults_to_stable_embedding2() -> None:
+    spec = EMBEDDING_PROVIDERS["gemini"]
+
+    assert spec.adapter == "gemini"
+    assert spec.default_model == "gemini-embedding-2"
+    assert spec.default_dim == 3072
+    assert spec.default_api_base == NATIVE_GEMINI2_ENDPOINT
+
+
+def test_embedding_gemini_embedding2_defaults_to_the_native_endpoint() -> None:
+    """Embedding 2 is new, so nothing has an index on it yet — it can default
+    straight to the native batch endpoint that carries its features."""
+    catalog = _build_catalog(
+        embedding_profile={
+            "id": "embedding-p",
+            "name": "Embedding",
+            "binding": "gemini",
+            "base_url": "",
+            "api_key": "gemini-test-key",
+            "api_version": "",
+            "extra_headers": {},
+            "models": [
+                {
+                    "id": "embedding-m",
+                    "name": "m",
+                    "model": "gemini-embedding-2",
+                }
+            ],
+        }
+    )
+
+    resolved = resolve_embedding_runtime_config(catalog=catalog)
+
+    assert resolved.effective_url == NATIVE_GEMINI2_ENDPOINT
+
+
+def test_embedding_gemini_explicit_native_endpoint_opts_any_model_in() -> None:
+    """A saved native URL is used verbatim, which is how an older model can
+    still be pointed at the native route deliberately."""
+    catalog = _build_catalog(
+        embedding_profile={
+            "id": "embedding-p",
+            "name": "Embedding",
+            "binding": "gemini",
+            "base_url": NATIVE_GEMINI2_ENDPOINT,
+            "api_key": "gemini-test-key",
+            "api_version": "",
+            "extra_headers": {},
+            "models": [
+                {
+                    "id": "embedding-m",
+                    "name": "m",
+                    "model": "gemini-embedding-2",
+                }
+            ],
+        }
+    )
+
+    resolved = resolve_embedding_runtime_config(catalog=catalog)
+
+    assert resolved.effective_url == NATIVE_GEMINI2_ENDPOINT
 
 
 def test_embedding_local_fallback_from_base_url() -> None:
@@ -205,12 +455,6 @@ def test_embedding_send_dimensions_parsed_from_catalog(
     )
     resolved = resolve_embedding_runtime_config(catalog=catalog)
     assert resolved.send_dimensions is expected
-
-
-def test_embedding_send_dimensions_catalog_unset_stays_auto() -> None:
-    catalog = _build_catalog()
-    resolved = resolve_embedding_runtime_config(catalog=catalog)
-    assert resolved.send_dimensions is None
 
 
 def test_embedding_send_dimensions_resolves_from_catalog() -> None:
