@@ -32,6 +32,7 @@ from deeptutor.agents._shared.tool_composition import (
     compose_enabled_tools,
     default_optional_tools,
     partner_can_record_questions,
+    selected_kbs_have_weknora,
     user_has_mastery_topics,
     user_has_memory,
     user_has_notebooks,
@@ -736,6 +737,7 @@ class AgenticLoopPipeline:
                 # is read via its own tools, never rag) so a pure-vault turn still
                 # doesn't mount rag, while co-selected LlamaIndex KBs do (#650).
                 has_kb=bool(self._coexisting_rag_kbs(context)),
+                has_weknora_kb=selected_kbs_have_weknora(self._coexisting_rag_kbs(context)),
                 # read_source is owned by the explore_context pre-pass (it runs
                 # the investigation over attached sources), not the answer loop.
                 # Keep it off the answer surface even when sources are present.

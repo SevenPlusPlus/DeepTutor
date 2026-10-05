@@ -46,6 +46,8 @@ AUTO_MOUNTED_TOOLS: frozenset[str] = frozenset(CONFIGURABLE_BUILTIN_TOOL_NAMES)
 # Insertion order fixes the default surface's conditional-tool order.
 _CONDITIONAL_MOUNT_FLAGS: dict[str, str] = {
     "rag": "has_kb",
+    "wiki_search": "has_weknora_kb",
+    "wiki_read_page": "has_weknora_kb",
     "kb_files": "has_kb",
     "knowledge_frontier": "has_kb",
     "read_source": "has_sources",
@@ -65,7 +67,13 @@ _CONDITIONAL_MOUNT_FLAGS: dict[str, str] = {
 
 # Built-ins that survive an exclusive knowledge capability when other KBs are
 # co-selected: retrieval over them, and enumeration of what they hold.
-_KB_COEXISTING_TOOLS: tuple[str, ...] = ("rag", "kb_files", "knowledge_frontier")
+_KB_COEXISTING_TOOLS: tuple[str, ...] = (
+    "rag",
+    "wiki_search",
+    "wiki_read_page",
+    "kb_files",
+    "knowledge_frontier",
+)
 
 # The workspace is the user's shared content surface, not a capability or an
 # optional enhancement.  These tools therefore survive exclusive capability
@@ -149,6 +157,7 @@ class ToolMountFlags:
     """
 
     has_kb: bool = False
+    has_weknora_kb: bool = False
     has_sources: bool = False
     has_memory: bool = False
     has_notebooks: bool = False
@@ -234,15 +243,12 @@ def compose_enabled_tools(
         # touch (e.g. LlamaIndex KBs alongside an Obsidian vault). The caller
         # sets ``has_kb`` only for those coexisting KBs, so a pure-capability
         # turn still mounts nothing but ``owned`` + the ``ask_user`` floor (#650).
-        extra = (
-            [
-                name
-                for name in _KB_COEXISTING_TOOLS
-                if builtin_whitelist is None or name in builtin_whitelist
-            ]
-            if mount_flags.has_kb
-            else []
-        )
+        extra = [
+            name
+            for name in _KB_COEXISTING_TOOLS
+            if getattr(mount_flags, _CONDITIONAL_MOUNT_FLAGS[name])
+            and (builtin_whitelist is None or name in builtin_whitelist)
+        ]
         return _finalize(
             [*WORKSPACE_BASELINE_TOOLS, *owned, *extra, "ask_user"], forced, suppressed
         )
@@ -370,6 +376,29 @@ def partner_can_record_questions() -> bool:
         return False
 
 
+def selected_kbs_have_weknora(kb_refs: Iterable[str]) -> bool:
+    """Whether any access-checked selected KB is a WeKnora pointer.
+
+    We mount the Wiki tools for every WeKnora pointer and let the live server
+    capability check decide whether Wiki is currently enabled.  This avoids a
+    stale connection-time capability snapshot hiding tools after an operator
+    turns Wiki on in WeKnora.
+    """
+
+    try:
+        from deeptutor.knowledge.kb_types import WEKNORA_KB_TYPE
+        from deeptutor.multi_user.knowledge_access import resolve_kb_metadata
+
+        return any(
+            isinstance(metadata := resolve_kb_metadata(str(kb_ref)), dict)
+            and metadata.get("type") == WEKNORA_KB_TYPE
+            for kb_ref in kb_refs
+            if str(kb_ref).strip()
+        )
+    except Exception:
+        return False
+
+
 __all__ = [
     "AUTO_MOUNTED_TOOLS",
     "ToolMountFlags",
@@ -378,6 +407,7 @@ __all__ = [
     "compose_enabled_tools",
     "default_optional_tools",
     "partner_can_record_questions",
+    "selected_kbs_have_weknora",
     "user_has_mastery_topics",
     "user_has_memory",
     "user_has_notebooks",

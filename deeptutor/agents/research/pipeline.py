@@ -45,6 +45,7 @@ from deeptutor.agents._shared.tool_composition import (
     ToolMountFlags,
     compose_enabled_tools,
     default_optional_tools,
+    selected_kbs_have_weknora,
     user_has_memory,
     user_has_notebooks,
 )
@@ -2093,16 +2094,22 @@ class ResearchPipeline:
           (mis-configured backend, missing dep) doesn't end up in the
           prompt.
         """
+        rag_kbs = (
+            [self.kb_name]
+            if (
+                self.kb_name
+                and not self._is_obsidian_kb
+                and not getattr(self, "_pageindex_tool_context", None)
+            )
+            else []
+        )
         composed = compose_enabled_tools(
             registry=self.registry,
             requested_tools=self.enabled_tools,
             optional_whitelist=RESEARCH_OPTIONAL_TOOLS,
             mount_flags=ToolMountFlags(
-                has_kb=bool(
-                    self.kb_name
-                    and not self._is_obsidian_kb
-                    and not getattr(self, "_pageindex_tool_context", None)
-                ),
+                has_kb=bool(rag_kbs),
+                has_weknora_kb=selected_kbs_have_weknora(rag_kbs),
                 has_sources=False,
                 has_memory=user_has_memory(),
                 has_notebooks=user_has_notebooks(),

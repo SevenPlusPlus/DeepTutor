@@ -361,6 +361,148 @@ def test_pipeline_uses_native_wiki_for_wiki_only_kb(tmp_path: Path) -> None:
     ]
 
 
+def test_pipeline_falls_back_from_natural_language_to_wiki_title(tmp_path: Path) -> None:
+    """Wiki v0.8.2 treats the query as one POSIX expression, not tokenized text.
+
+    The adapter must own that provider-specific mismatch so every caller gets
+    the same title fallback instead of relying on an LLM to guess a short query.
+    """
+
+    class TitleOnlyClient:
+        def __init__(self) -> None:
+            self.queries: list[str] = []
+
+        async def get_knowledge_base(self) -> dict:
+            return {
+                "id": "kb-1",
+                "capabilities": {
+                    "vector": False,
+                    "keyword": False,
+                    "wiki": True,
+                    "graph": False,
+                    "faq": False,
+                },
+            }
+
+        async def search_wiki(self, query: str, *, limit: int) -> list[dict]:
+            self.queries.append(query)
+            if query != "秋天的怀念":
+                return []
+            return [
+                {
+                    "id": "page-autumn",
+                    "knowledge_base_id": "kb-1",
+                    "slug": "秋天的怀念",
+                    "title": "《秋天的怀念》",
+                    "summary": "史铁生回忆母亲的散文。",
+                }
+            ]
+
+        async def get_wiki_page(self, slug: str) -> dict:
+            assert slug == "秋天的怀念"
+            return {
+                "id": "page-autumn",
+                "knowledge_base_id": "kb-1",
+                "slug": slug,
+                "title": "《秋天的怀念》",
+                "summary": "史铁生回忆母亲的散文。",
+                "content": "文章记述作者瘫痪后与母亲相处的最后时光。",
+            }
+
+    client = TitleOnlyClient()
+    base = _kb_base(
+        tmp_path,
+        {
+            "type": WEKNORA_KB_TYPE,
+            "rag_provider": "weknora",
+            "server_url": "http://localhost:8080",
+            "api_key": "secret",
+            "knowledge_base_id": "kb-1",
+        },
+    )
+
+    result = asyncio.run(
+        WeKnoraPipeline(base, client_factory=lambda _config: client).search(
+            "请仅根据 mida 知识库回答：秋天的怀念主要讲了什么？", "remote"
+        )
+    )
+
+    assert client.queries == [
+        "请仅根据 mida 知识库回答：秋天的怀念主要讲了什么？",
+        "秋天的怀念",
+    ]
+    assert result["sources"][0]["slug"] == "秋天的怀念"
+    assert "相处的最后时光" in result["content"]
+    assert result["weknora_wiki_queries"] == client.queries
+
+
+def test_pipeline_exposes_search_then_read_wiki_interface(tmp_path: Path) -> None:
+    """Search stays lightweight; full page hydration is an explicit second step."""
+
+    class NavigatingClient:
+        def __init__(self) -> None:
+            self.read_slugs: list[str] = []
+
+        async def get_knowledge_base(self) -> dict:
+            return {
+                "id": "kb-1",
+                "capabilities": {"wiki": True, "vector": False, "keyword": False},
+            }
+
+        async def search_wiki(self, query: str, *, limit: int) -> list[dict]:
+            assert query == "秋天的怀念|史铁生"
+            assert limit == 3
+            return [
+                {
+                    "id": "page-autumn",
+                    "knowledge_base_id": "kb-1",
+                    "slug": "秋天的怀念",
+                    "title": "《秋天的怀念》",
+                    "summary": "史铁生回忆母亲的散文。",
+                    "match_snippet": "母亲提出去北海看花。",
+                }
+            ]
+
+        async def get_wiki_page(self, slug: str) -> dict:
+            self.read_slugs.append(slug)
+            return {
+                "id": "page-autumn",
+                "knowledge_base_id": "kb-1",
+                "slug": slug,
+                "title": "《秋天的怀念》",
+                "summary": "史铁生回忆母亲的散文。",
+                "content": "文章记述作者瘫痪后与母亲相处的最后时光。",
+                "out_links": ["史铁生", "好好儿活"],
+                "source_refs": ["doc-1|秋天的怀念拓展阅读.pdf"],
+            }
+
+    client = NavigatingClient()
+    base = _kb_base(
+        tmp_path,
+        {
+            "type": WEKNORA_KB_TYPE,
+            "rag_provider": "weknora",
+            "server_url": "http://localhost:8080",
+            "api_key": "secret",
+            "knowledge_base_id": "kb-1",
+        },
+    )
+    pipeline = WeKnoraPipeline(base, client_factory=lambda _config: client)
+
+    hits = asyncio.run(
+        pipeline.search_wiki_pages("秋天的怀念|史铁生", "remote", limit=3, regex=True)
+    )
+    assert client.read_slugs == []
+    assert hits["pages"][0]["slug"] == "秋天的怀念"
+    assert hits["pages"][0]["match_snippet"] == "母亲提出去北海看花。"
+
+    page = asyncio.run(pipeline.read_wiki_pages(["秋天的怀念"], "remote"))
+    assert client.read_slugs == ["秋天的怀念"]
+    assert page["sources"][0]["out_links"] == ["史铁生", "好好儿活"]
+    assert page["sources"][0]["source_refs"] == ["doc-1|秋天的怀念拓展阅读.pdf"]
+    assert "相处的最后时光" in page["content"]
+
+
 def test_pipeline_refreshes_saved_capabilities_from_weknora(tmp_path: Path) -> None:
     wiki_transport = _wiki_transport()
 

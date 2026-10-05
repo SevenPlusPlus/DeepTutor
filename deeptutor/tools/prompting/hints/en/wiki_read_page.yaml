@@ -1,0 +1,6 @@
+short_description: "Read full WeKnora Wiki pages selected by wiki_search."
+when_to_use: "Use after wiki_search when a page summary is relevant but insufficient to answer."
+input_format: "{\"slugs\": [\"page-slug\"], \"kb_name\": \"attached WeKnora KB\"}."
+guideline: "Read only the most relevant pages. Follow returned Wiki links only to close a specific evidence gap."
+note: "For exact or disputed details, use the page's source references to verify the original material when an appropriate reader is available."
+phase: "exploration"

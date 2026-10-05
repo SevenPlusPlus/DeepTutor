@@ -1931,6 +1931,8 @@ USER_TOGGLEABLE_TOOL_NAMES: tuple[str, ...] = (
 # any capability.
 CONFIGURABLE_BUILTIN_TOOL_NAMES: tuple[str, ...] = (
     "rag",
+    "wiki_search",
+    "wiki_read_page",
     "kb_files",
     "knowledge_frontier",
     "read_source",

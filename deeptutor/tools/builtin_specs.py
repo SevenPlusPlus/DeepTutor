@@ -70,6 +70,13 @@ BUILTIN_TOOL_SPECS: tuple[BuiltinToolSpec, ...] = (
             ("geogebra_analysis", "GeoGebraAnalysisTool"),
         ),
     ),
+    *_specs(
+        "deeptutor.tools.weknora_wiki",
+        (
+            ("wiki_search", "WeKnoraWikiSearchTool"),
+            ("wiki_read_page", "WeKnoraWikiReadPageTool"),
+        ),
+    ),
     BuiltinToolSpec("exec", "deeptutor.tools.exec_tool:ExecTool"),
     *_specs(
         "deeptutor.tools.workspace",

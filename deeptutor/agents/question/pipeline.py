@@ -39,6 +39,7 @@ from deeptutor.agents._shared.tool_composition import (
     ToolMountFlags,
     compose_enabled_tools,
     default_optional_tools,
+    selected_kbs_have_weknora,
     user_has_memory,
     user_has_notebooks,
     user_has_question_bank,
@@ -1594,8 +1595,14 @@ class QuestionPipeline:
         return [tool.name for tool in tool_context.tools] if tool_context is not None else []
 
     def _mount_flags(self, context: UnifiedContext) -> ToolMountFlags:
+        rag_kbs = (
+            [self.kb_name]
+            if self.kb_name and not getattr(self, "_pageindex_tool_context", None)
+            else []
+        )
         return ToolMountFlags(
-            has_kb=bool(self.kb_name and not getattr(self, "_pageindex_tool_context", None)),
+            has_kb=bool(rag_kbs),
+            has_weknora_kb=selected_kbs_have_weknora(rag_kbs),
             has_sources=bool(self._source_index(context)),
             has_memory=user_has_memory(),
             has_notebooks=user_has_notebooks(),

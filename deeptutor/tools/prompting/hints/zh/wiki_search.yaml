@@ -1,0 +1,6 @@
+short_description: "在已挂载的 WeKnora Wiki 中定位候选页面。"
+when_to_use: "问题涉及概念概览、实体、关系或 Wiki 中可能存在的主题时，优先用它寻找入口。"
+input_format: "{\"query\": \"精确标题|候选词\", \"kb_name\": \"已挂载的 WeKnora 知识库\", \"regex\": true}。"
+guideline: "优先搜索精确页面标题；多个候选词使用 POSIX OR（词1|词2），不要拼成空格分隔的关键词列表。对有希望的 slug 再调用 wiki_read_page。"
+note: "搜索只返回导航摘要，不是完整证据。长查询无结果时，必须先尝试精确标题或简短候选词，再判断知识库没有内容。"
+phase: "exploration"

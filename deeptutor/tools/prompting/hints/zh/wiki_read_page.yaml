@@ -1,0 +1,6 @@
+short_description: "读取 wiki_search 选中的 WeKnora Wiki 完整页面。"
+when_to_use: "wiki_search 返回的页面摘要相关但不足以回答时使用。"
+input_format: "{\"slugs\": [\"页面 slug\"], \"kb_name\": \"已挂载的 WeKnora 知识库\"}。"
+guideline: "只读取最相关的少量页面；仅在补齐具体证据缺口时沿返回的 Wiki 链接继续阅读。"
+note: "精确或有争议的细节，应在存在合适阅读工具时根据页面的 source_refs 回查原始资料。"
+phase: "exploration"

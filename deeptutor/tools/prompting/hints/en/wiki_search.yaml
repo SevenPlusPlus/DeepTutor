@@ -1,0 +1,6 @@
+short_description: "Locate candidate pages in an attached WeKnora Wiki."
+when_to_use: "Use first for conceptual overviews, entities, relationships, or topics likely covered by a WeKnora Wiki."
+input_format: "{\"query\": \"exact title|alternative term\", \"kb_name\": \"attached WeKnora KB\", \"regex\": true}."
+guideline: "Prefer an exact page title. For alternatives use POSIX OR (term1|term2), not a space-separated keyword list. Read promising slugs with wiki_read_page."
+note: "Search returns navigation summaries, not the complete evidence. Do not conclude from a zero-result long query until trying the exact title or concise alternatives."
+phase: "exploration"
