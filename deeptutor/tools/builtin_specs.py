@@ -70,6 +70,7 @@ BUILTIN_TOOL_SPECS: tuple[BuiltinToolSpec, ...] = (
             ("geogebra_analysis", "GeoGebraAnalysisTool"),
         ),
     ),
+    BuiltinToolSpec("task_board", "deeptutor.tools.task_board:TaskBoardTool"),
     *_specs(
         "deeptutor.tools.weknora_wiki",
         (

@@ -201,6 +201,18 @@ deeptutor notebook replace-md <id> <record_id> ./updated.md
 deeptutor notebook remove-record <id> <record_id>
 ```
 
+### `task` — 任务看板
+
+```bash
+deeptutor task add "周五前复习绝对值" --note "完成错题本第 1～20 题"
+deeptutor task list [--status todo|doing|done] [--all]
+deeptutor task show <id>
+deeptutor task update <id> --title "新标题" --note "新备注" --status doing
+deeptutor task complete <id>
+deeptutor task archive <id>
+deeptutor task restore <id>
+```
+
 ### `memory` — 长期记忆
 
 ```bash

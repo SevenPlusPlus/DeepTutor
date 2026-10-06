@@ -61,6 +61,11 @@ class NotebookEntryItem(BaseModel):
     difficulty: str = ""
     user_answer: str = ""
     user_answer_images: list[AnswerImageItem] = []
+    question_images: list[AnswerImageItem] = []
+    source_locator: dict[str, Any] = {}
+    answer_origin: str = ""
+    recognition_meta: dict[str, Any] = {}
+    course_id: str = ""
     source: AssessmentSource = "deep_question"
     material_id: str = ""
     material_title: str = ""
@@ -383,6 +388,7 @@ async def list_entries(
         bookmarked=bookmarked,
         is_correct=is_correct,
         session_ids=session_ids,
+        course_id=course_id,
         source=source,
         material_id=material_id,
         section_id=section_id,
@@ -534,7 +540,7 @@ async def question_bank_stats(
     """
     store = get_sqlite_session_store()
     session_ids = await _course_session_ids(store, course_id)
-    return QuestionBankStats(**await store.question_bank_stats(session_ids))
+    return QuestionBankStats(**await store.question_bank_stats(session_ids, course_id))
 
 
 @router.get("/materials", response_model=list[QuestionBankMaterial])
@@ -546,7 +552,7 @@ async def list_question_bank_materials(
     session_ids = await _course_session_ids(store, course_id)
     return [
         QuestionBankMaterial(**item)
-        for item in await store.list_question_bank_materials(session_ids)
+        for item in await store.list_question_bank_materials(session_ids, course_id)
     ]
 
 
@@ -562,7 +568,7 @@ async def list_categories(course_id: str = Query(default="")):
     """
     store = get_sqlite_session_store()
     session_ids = await _course_session_ids(store, course_id)
-    return await store.list_categories(session_ids)
+    return await store.list_categories(session_ids, course_id)
 
 
 @router.post("/categories", response_model=CategoryItem, status_code=201)

@@ -151,6 +151,60 @@ it("shows independent provenance without inventing an original-session link", ()
   expect(screen.getByText("lesson.csv")).toBeVisible();
 });
 
+it("renders persisted question images and links to the original attachment", () => {
+  const entry = {
+    id: 4,
+    question: "Imported image question",
+    question_type: "short_answer",
+    options: {},
+    correct_answer: "",
+    user_answer: "",
+    result: "ungraded",
+    source: "import",
+    origin_type: "external_import",
+    origin_ref: "WeChatIMG2.jpeg",
+    session_id: "",
+    categories: [],
+    question_images: [{
+      id: "source",
+      url: "/files/attachments/practice-recognition-rec_1/source/WeChatIMG2.jpeg",
+      filename: "WeChatIMG2.jpeg",
+      mime_type: "image/jpeg",
+    }],
+    created_at: 100,
+    updated_at: 100,
+  } as unknown as NotebookEntry;
+  render(
+    <ul>
+      <QuestionCard
+        entry={entry}
+        categories={[]}
+        selected={false}
+        disabled={false}
+        onToggleSelected={vi.fn()}
+        onToggleBookmark={vi.fn()}
+        onToggleResolved={vi.fn()}
+        onDelete={vi.fn()}
+        onFile={vi.fn()}
+        onUnfile={vi.fn()}
+        onCreateAndFile={vi.fn()}
+      />
+    </ul>
+  );
+
+  const image = screen.getByRole("img", { name: "Source image for question 1" });
+  expect(image).toHaveAttribute(
+    "src",
+    "/files/attachments/practice-recognition-rec_1/source/WeChatIMG2.jpeg",
+  );
+  const imageLink = image.closest("a");
+  expect(imageLink).toHaveAttribute(
+    "href",
+    "/files/attachments/practice-recognition-rec_1/source/WeChatIMG2.jpeg",
+  );
+  expect(within(imageLink as HTMLElement).getByText("WeChatIMG2.jpeg")).toBeVisible();
+});
+
 it("keeps legacy Partner notebook entries readable without a synthetic chat link", () => {
   const entry = {
     id: 3,

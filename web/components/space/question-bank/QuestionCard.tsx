@@ -186,6 +186,7 @@ export default function QuestionCard({
   const options = entry.options || {};
   const hasOptions = Object.keys(options).length > 0;
   const isCode = entry.question_type === "coding";
+  const questionImages = (entry.question_images || []).filter(image => Boolean(image.url));
   const filed = entry.categories || [];
   const result = entryResult(entry);
   const badge = resultBadge(entry);
@@ -348,6 +349,40 @@ export default function QuestionCard({
           allowHtml={false}
         />
       </div>
+
+      {questionImages.length > 0 && (
+        <div
+          className={`mt-3 grid gap-2 sm:pl-[1.625rem] ${
+            questionImages.length > 1 ? "md:grid-cols-2" : ""
+          }`}
+        >
+          {questionImages.map((image, index) => {
+            const label = image.filename || t("Source image for question {{number}}", {
+              number: index + 1,
+            });
+            return (
+              <a
+                key={`${image.id || image.url}-${index}`}
+                href={image.url}
+                target="_blank"
+                rel="noreferrer"
+                className="group/image overflow-hidden rounded-lg border border-[var(--border)] bg-[var(--muted)]/20 transition-colors hover:border-[var(--primary)]/40"
+              >
+                {/* Workspace-scoped attachment URLs are served dynamically by the backend. */}
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
+                  src={image.url}
+                  alt={t("Source image for question {{number}}", { number: index + 1 })}
+                  className="max-h-80 w-full object-contain"
+                />
+                <span className="block truncate border-t border-[var(--border)] px-2.5 py-1.5 text-[11px] text-[var(--muted-foreground)] group-hover/image:text-[var(--foreground)]">
+                  {label}
+                </span>
+              </a>
+            );
+          })}
+        </div>
+      )}
 
       {/* Aligned with the question text: checkbox (0.875rem) + gap (0.75rem). */}
       <div className="mt-3 space-y-2" style={{ paddingLeft: "1.625rem" }}>

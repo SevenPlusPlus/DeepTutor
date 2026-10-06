@@ -1,0 +1,6 @@
+short_description: "管理用户的任务看板：新增、查看、修改、完成、归档和恢复任务。"
+when_to_use: "用户明确要求新增或管理任务、待办、行动项、学习作业时使用。未来某个时间提醒用户属于 cron；需要出现在「任务看板」上的事项才使用 task_board。"
+input_format: "新增：{\"action\": \"create\", \"title\": \"周五前复习绝对值\", \"note\": \"完成错题本第 1～20 题\"}。查看：{\"action\": \"list\"}。操作已有任务：先 list 取得 card_id，再用 get/update/complete/archive/restore。"
+guideline: "绝不编造 card_id。用户只用标题指代已有任务时，先列出任务，仅在匹配结果唯一时继续操作。只有用户明确要求变更时才新增或修改任务；最终根据工具结果说明任务标题和最新状态。"
+note: "伙伴渠道必须是已关联账号的私聊；未关联消息和群聊不能访问个人任务看板。"
+phase: "synthesis"

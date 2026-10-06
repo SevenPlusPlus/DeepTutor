@@ -16,12 +16,17 @@ vi.mock("@/lib/practice-api", async importOriginal => ({
   checkPracticeAnswer: vi.fn(),
   savePracticeReview: vi.fn(),
   previewPracticeImport: vi.fn(),
+  startPracticeRecognition: vi.fn(),
+  getCurrentPracticeRecognition: vi.fn(),
+  getPracticeRecognition: vi.fn(),
+  stagePracticeRecognition: vi.fn(),
   commitPracticeImport: vi.fn(),
   downloadPracticeTemplate: vi.fn(),
 }));
 initI18n("en");
 beforeEach(() => {
   vi.clearAllMocks();
+  vi.mocked(api.getCurrentPracticeRecognition).mockResolvedValue(null);
   vi.mocked(api.getPracticeQuestion).mockResolvedValue({
     entry: {
       id: 8,
@@ -191,4 +196,115 @@ it("keeps a successful preview available when import saving fails", async () => 
   fireEvent.click(screen.getByRole("button", { name: "Confirm import" }));
   await waitFor(() => expect(onImported).toHaveBeenCalledOnce());
   expect(api.previewPracticeImport).toHaveBeenCalledWith(expect.any(File), "mistakes", "");
+});
+
+it("reviews recognized image questions before staging and committing", async () => {
+  vi.mocked(api.startPracticeRecognition).mockResolvedValue({
+    job_id: "rec_1",
+    status: "queued",
+    created_at: 100,
+  });
+  vi.mocked(api.getPracticeRecognition).mockResolvedValue({
+    job_id: "rec_1",
+    status: "ready",
+    stage: "recognizing",
+    progress_message: "Recognized 1 question",
+    completed_units: 1,
+    total_units: 1,
+    version: 3,
+    drafts: [{
+      draft_id: "q_001",
+      ordinal: 1,
+      question: "2 + 2 = ?",
+      question_type: "single_choice",
+      options: { A: "3", B: "4" },
+      correct_answer: "B",
+      explanation: "",
+      difficulty: "easy",
+      tags: ["Math"],
+      question_images: [{
+        id: "source",
+        url: "/files/attachments/rec_1/source/question.png",
+        filename: "question.png",
+        mime_type: "image/png",
+      }],
+      source_locator: { page_numbers: [1] },
+      answer_origin: "document",
+      review_level: "normal",
+      warnings: [],
+    }],
+    summary: { total: 1, normal: 1, review: 0, required: 0 },
+    error_code: "",
+    error_message: "",
+    expires_at: 200,
+  });
+  vi.mocked(api.stagePracticeRecognition).mockResolvedValue({
+    token: "b".repeat(32),
+    total: 1,
+    valid: 1,
+    errors: [],
+    samples: [{
+      question: "2 + 2 = ?",
+      question_type: "single_choice",
+      correct_answer: "B",
+      tags: ["Math"],
+    }],
+  });
+  vi.mocked(api.commitPracticeImport).mockResolvedValue({ created: 1, duplicates: 0 });
+  const onImported = vi.fn();
+  render(<PracticeImport onClose={vi.fn()} onImported={onImported} initialTarget="bank" />);
+
+  fireEvent.click(screen.getByRole("tab", { name: "Photo / PDF recognition" }));
+  const recognitionInput = await screen.findByLabelText(/Choose a photo, screenshot, or PDF/);
+  expect(recognitionInput).toHaveAttribute("accept", expect.stringContaining("application/pdf"));
+  fireEvent.change(recognitionInput, {
+    target: { files: [new File(["image"], "question.png", { type: "image/png" })] },
+  });
+  expect(await screen.findByDisplayValue("2 + 2 = ?")).toBeInTheDocument();
+  expect(screen.getByRole("img", { name: "Source image for question 1" })).toHaveAttribute(
+    "src",
+    "/files/attachments/rec_1/source/question.png",
+  );
+  expect(screen.getByText("Correct answer (optional)")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Continue to import preview" }));
+  expect(await screen.findByRole("button", { name: "Confirm import" })).toBeEnabled();
+  fireEvent.click(screen.getByRole("button", { name: "Confirm import" }));
+
+  await waitFor(() => expect(onImported).toHaveBeenCalledOnce());
+  expect(api.stagePracticeRecognition).toHaveBeenCalledWith(
+    "rec_1",
+    3,
+    [expect.objectContaining({ draft_id: "q_001", selected: true })],
+  );
+});
+
+it("recovers and displays the current recognition task after reopening import", async () => {
+  const current: api.RecognitionSnapshot = {
+    job_id: "rec_pdf",
+    filename: "worksheet.pdf",
+    target: "bank",
+    status: "recognizing",
+    stage: "recognizing",
+    progress_message: "Recognizing PDF page 8 of 12",
+    completed_units: 7,
+    total_units: 12,
+    version: 8,
+    drafts: [],
+    summary: { total: 0, normal: 0, review: 0, required: 0 },
+    error_code: "",
+    error_message: "",
+    expires_at: 200,
+  };
+  vi.mocked(api.getCurrentPracticeRecognition).mockResolvedValue(current);
+  vi.mocked(api.getPracticeRecognition).mockResolvedValue(current);
+
+  render(<PracticeImport onClose={vi.fn()} onImported={vi.fn()} initialTarget="mistakes" />);
+  fireEvent.click(screen.getByRole("tab", { name: "Photo / PDF recognition" }));
+
+  expect(await screen.findByText("worksheet.pdf")).toBeInTheDocument();
+  expect(screen.getByRole("combobox", { name: "Import into" })).toHaveValue("bank");
+  expect(screen.getByText("Recognizing PDF page 8 of 12")).toBeInTheDocument();
+  expect(screen.getByText("7 of 12 pages processed")).toBeInTheDocument();
+  expect(screen.queryByLabelText(/Choose a photo, screenshot, or PDF/)).not.toBeInTheDocument();
+  expect(api.startPracticeRecognition).not.toHaveBeenCalled();
 });

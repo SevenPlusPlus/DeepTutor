@@ -33,15 +33,22 @@ from .sessions import PartnerSessionStore
 
 
 def actor_for_account(user_id: str) -> CurrentUser | None:
-    """Rebuild the ``CurrentUser`` for a stored account id, or None if it is gone.
+    """Rebuild the ``CurrentUser`` for an account id, or None if it is gone.
 
     Channel traffic carries no session, so an identity established earlier (by
     linking a chat account) has to be reconstituted from the account store on
-    every turn — and a user who has since been deleted must resolve to nobody
-    rather than to a scope that no longer belongs to anyone.
+    every turn.  Single-user mode has one synthetic ``local-admin`` identity
+    that is deliberately absent from that store; restore it only while auth is
+    disabled.  A stored user who has since been deleted must still resolve to
+    nobody rather than to a scope that no longer belongs to anyone.
     """
     from deeptutor.multi_user.identity import get_user_by_id
-    from deeptutor.multi_user.paths import scope_for_user
+    from deeptutor.multi_user.models import LOCAL_ADMIN_ID
+    from deeptutor.multi_user.paths import local_admin_user, scope_for_user
+    from deeptutor.services.auth import AUTH_ENABLED
+
+    if user_id == LOCAL_ADMIN_ID and not AUTH_ENABLED:
+        return local_admin_user()
 
     found = get_user_by_id(user_id)
     if found is None:

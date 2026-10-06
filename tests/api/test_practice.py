@@ -15,9 +15,11 @@ import pytest
 from deeptutor.api.routers import practice, question_notebook
 from deeptutor.core.assessment import ASSESSMENT_SOURCES
 from deeptutor.services.practice.importing import normalize_question, preview
+from deeptutor.services.practice.recognition import QuestionRecognitionService
 from deeptutor.services.practice.scheduler import DAY, day_bounds, schedule
 from deeptutor.services.practice.storage import PracticeStore, ReviewConflict
 from deeptutor.services.session.sqlite_store import SQLiteSessionStore
+from deeptutor.services.storage.attachment_store import LocalDiskAttachmentStore
 
 
 @pytest.fixture
@@ -194,6 +196,75 @@ def test_import_preview_commit_retries_dedup_tags_and_no_source_overwrite(bank):
     assert repo.overview("UTC")["mistakes"] == 1
 
 
+def test_image_recognition_api_requires_review_then_reuses_import_commit(bank, monkeypatch):
+    store, _, client = bank
+
+    class Extractor:
+        async def extract(self, request):
+            return [
+                {
+                    "question": "Water freezes at?",
+                    "question_type": "single_choice",
+                    "options": {"A": "0°C", "B": "100°C"},
+                    "correct_answer": "A",
+                    "answer_origin": "document",
+                }
+            ]
+
+    recognition = QuestionRecognitionService(
+        store.db_path,
+        Extractor(),
+        attachment_store=LocalDiskAttachmentStore(store.db_path.parent / "attachments"),
+    )
+    monkeypatch.setattr(practice, "_recognition_service", lambda: recognition)
+    started = client.post(
+        "/practice/import/recognize",
+        files={"file": ("page.png", b"\x89PNG\r\n\x1a\nimage", "image/png")},
+    )
+    assert started.status_code == 202
+    job_id = started.json()["job_id"]
+    current = client.get("/practice/import/recognize")
+    assert current.status_code == 200
+    assert current.json()["job_id"] == job_id
+    assert current.json()["filename"] == "page.png"
+    snapshot = None
+    for _ in range(20):
+        response = client.get(f"/practice/import/recognize/{job_id}")
+        assert response.status_code == 200
+        snapshot = response.json()
+        if snapshot["status"] in {"ready", "failed"}:
+            break
+    assert snapshot is not None and snapshot["status"] == "ready"
+
+    staged = client.post(
+        f"/practice/import/recognize/{job_id}/stage",
+        json={
+            "expected_version": snapshot["version"],
+            "drafts": [{**snapshot["drafts"][0], "selected": True}],
+        },
+    )
+    assert staged.status_code == 200
+    committed = client.post(
+        "/practice/import/commit",
+        json={"token": staged.json()["token"]},
+    )
+    assert committed.json() == {"created": 1, "duplicates": 0, "total": 1}
+    assert client.get(f"/practice/import/recognize/{job_id}").json()["status"] == "committed"
+    assert client.get("/practice/import/recognize").json() is None
+    listing = asyncio.run(store.list_notebook_entries())
+    assert listing["items"][0]["question_images"][0]["filename"] == "page.png"
+
+
+def test_image_recognition_api_rejects_mime_mismatch(bank):
+    _, _, client = bank
+    response = client.post(
+        "/practice/import/recognize",
+        files={"file": ("fake.png", b"not-a-png", "image/png")},
+    )
+    assert response.status_code == 422
+    assert "declared type" in response.json()["detail"]
+
+
 def test_invalid_row_blocks_entire_import_and_reports_line(bank):
     _, repo, client = bank
     result = client.post(
@@ -331,12 +402,13 @@ def test_course_imports_keep_their_course_and_file_provenance(bank, monkeypatch)
     assert item["origin_type"] == "external_import"
     assert item["origin_ref"] == "practice-import"
     assert item["material_id"].startswith("import:")
+    assert item["course_id"] == "course-a"
     assert repo.overview("UTC")["mistakes"] == 1
-    # Import provenance must not manufacture a conversation or leak into a
-    # conversation-derived course scope.
+    # Import provenance must not manufacture a conversation. Explicit course
+    # ownership makes the independent entry visible only in its selected course.
     assert asyncio.run(store.list_sessions()) == []
-    assert client.get("/bank/entries?course_id=course-a").json()["total"] == 0
-    assert client.get("/practice/summary?course_id=course-a").json()["mistakes"] == 0
+    assert client.get("/bank/entries?course_id=course-a").json()["total"] == 1
+    assert client.get("/practice/summary?course_id=course-a").json()["mistakes"] == 1
     assert client.get("/bank/entries?course_id=course-b").json()["total"] == 0
 
 

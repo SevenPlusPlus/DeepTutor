@@ -214,6 +214,7 @@ export interface NotebookEntry {
   difficulty: string;
   user_answer: string;
   user_answer_images?: NotebookAnswerImage[];
+  question_images?: NotebookAnswerImage[];
   source: AssessmentSource;
   material_id: string;
   material_title: string;

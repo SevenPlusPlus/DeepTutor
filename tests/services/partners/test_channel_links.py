@@ -216,6 +216,45 @@ async def test_link_command_binds_the_sender_mid_conversation(partners_root, fak
 
 
 @pytest.mark.asyncio
+async def test_link_command_binds_the_synthetic_local_admin_in_single_user_mode(
+    partners_root, fake_orchestrator, monkeypatch
+):
+    from deeptutor.multi_user.models import LOCAL_ADMIN_ID, LOCAL_ADMIN_USERNAME
+    from deeptutor.services import auth as auth_service
+
+    monkeypatch.setattr(auth_service, "AUTH_ENABLED", False)
+    runner = PartnerRunner("ada", PartnerConfig(name="Ada"), MessageBus())
+    code = links.issue_link_code("ada", LOCAL_ADMIN_ID).code
+    message = InboundMessage(
+        channel="weixin",
+        sender_id="wechat-owner",
+        chat_id="private:wechat-owner",
+        content=f"/link {code}",
+    )
+
+    reply = await runner.process_message(message)
+
+    assert LOCAL_ADMIN_USERNAME in reply
+    assert links.linked_user_id("ada", "weixin", "wechat-owner") == LOCAL_ADMIN_ID
+
+
+@pytest.mark.asyncio
+async def test_link_command_does_not_restore_local_admin_after_auth_is_enabled(
+    partners_root, fake_orchestrator, monkeypatch
+):
+    from deeptutor.multi_user.models import LOCAL_ADMIN_ID
+    from deeptutor.services import auth as auth_service
+
+    monkeypatch.setattr(auth_service, "AUTH_ENABLED", True)
+    runner = PartnerRunner("ada", PartnerConfig(name="Ada"), MessageBus())
+    code = links.issue_link_code("ada", LOCAL_ADMIN_ID).code
+
+    reply = await runner.process_message(_dm(f"/link {code}"))
+
+    assert reply == "That code belongs to an account that no longer exists."
+
+
+@pytest.mark.asyncio
 async def test_link_command_refuses_a_group_chat(partners_root, fake_orchestrator):
     runner = PartnerRunner("ada", PartnerConfig(name="Ada"), MessageBus())
     code = links.issue_link_code("ada", "u_alice").code

@@ -3253,8 +3253,8 @@ def test_compose_enabled_tools_mounts_mastery_plugin_only_in_mastery_mode(
     assert set(MASTERY_TOOL_NAMES).issubset(mastery_tools)
     # Additive plugin surface: a mastery turn reuses chat's full built-in
     # surface (always-on defaults included) and just adds its owned tools.
-    assert {"web_fetch", "github", "cron"}.issubset(mastery_tools)
-    assert {"web_fetch", "github", "cron"}.issubset(ordinary_tools)
+    assert {"web_fetch", "github", "cron", "task_board"}.issubset(mastery_tools)
+    assert {"web_fetch", "github", "cron", "task_board"}.issubset(ordinary_tools)
 
 
 def test_augment_tool_kwargs_injects_mastery_path_id() -> None:

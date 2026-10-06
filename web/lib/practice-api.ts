@@ -51,6 +51,49 @@ export interface ImportPreview {
   errors: { row: number; message: string }[]
   samples: { question: string; question_type: string; correct_answer: string; tags: string[] }[]
 }
+export type RecognitionStatus =
+  | 'queued'
+  | 'validating'
+  | 'parsing'
+  | 'recognizing'
+  | 'ready'
+  | 'staged'
+  | 'committed'
+  | 'failed'
+  | 'expired'
+export interface RecognitionDraft {
+  draft_id: string
+  ordinal: number
+  question: string
+  question_type: 'single_choice' | 'multi_choice' | 'true_false' | 'fill_blank' | 'short_answer'
+  options: Record<string, string>
+  correct_answer: string
+  explanation: string
+  difficulty: string
+  tags: string[]
+  question_images: { id?: string; url?: string; filename?: string; mime_type?: string }[]
+  source_locator: { page_numbers?: number[]; bounding_boxes?: number[][] }
+  answer_origin: 'document' | 'user' | 'model_suggested' | 'missing'
+  review_level: 'normal' | 'review' | 'required'
+  warnings: string[]
+  selected?: boolean
+}
+export interface RecognitionSnapshot {
+  job_id: string
+  filename?: string
+  target?: 'bank' | 'mistakes'
+  status: RecognitionStatus
+  stage: string
+  progress_message: string
+  completed_units: number
+  total_units: number
+  version: number
+  drafts: RecognitionDraft[]
+  summary: { total: number; normal: number; review: number; required: number }
+  error_code: string
+  error_message: string
+  expires_at: number
+}
 export class PracticeRequestError extends Error {
   constructor(
     message: string,
@@ -123,6 +166,33 @@ export function previewPracticeImport(file: File, target: 'bank' | 'mistakes', c
   data.append('course_id', courseId)
   return request<ImportPreview>('/import/preview', { method: 'POST', body: data })
 }
+export function startPracticeRecognition(
+  file: File,
+  target: 'bank' | 'mistakes',
+  courseId = ''
+) {
+  const data = new FormData()
+  data.append('file', file)
+  data.append('target', target)
+  data.append('course_id', courseId)
+  return request<{ job_id: string; status: RecognitionStatus; created_at: number }>(
+    '/import/recognize',
+    { method: 'POST', body: data }
+  )
+}
+export const getPracticeRecognition = (jobId: string) =>
+  request<RecognitionSnapshot>(`/import/recognize/${encodeURIComponent(jobId)}`)
+export const getCurrentPracticeRecognition = () =>
+  request<RecognitionSnapshot | null>('/import/recognize')
+export const stagePracticeRecognition = (
+  jobId: string,
+  expectedVersion: number,
+  drafts: RecognitionDraft[]
+) =>
+  request<ImportPreview>(
+    `/import/recognize/${encodeURIComponent(jobId)}/stage`,
+    json({ expected_version: expectedVersion, drafts })
+  )
 export const commitPracticeImport = (token: string) =>
   request<{ created: number; duplicates: number }>('/import/commit', json({ token }))
 export async function downloadPracticeTemplate(format: 'csv' | 'xlsx') {

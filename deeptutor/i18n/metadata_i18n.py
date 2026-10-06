@@ -70,6 +70,10 @@ _TOOL_DESCRIPTIONS: dict[str, dict[str, str]] = {
         "en": "Generate images from a text prompt with the configured model.",
         "zh": "用已配置的模型，根据文字描述生成图片。",
     },
+    "task_board": {
+        "en": "Create, view, update, complete, and archive Task Board items.",
+        "zh": "新增、查看、修改、完成和归档任务看板事项。",
+    },
     "videogen": {
         "en": "Generate short videos from a text prompt with the configured model.",
         "zh": "用已配置的模型，根据文字描述生成短视频。",

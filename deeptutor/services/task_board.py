@@ -96,14 +96,51 @@ class TaskBoardStore:
         with closing(self._connect()) as connection:
             return self._snapshot(connection)
 
+    def get(self, card_id: str) -> TaskCard:
+        """Return one task card by id without changing the board."""
+        if not self.path.exists():
+            raise KeyError(card_id)
+        with closing(self._connect()) as connection:
+            row = connection.execute("SELECT * FROM cards WHERE id = ?", (card_id,)).fetchone()
+            if row is None:
+                raise KeyError(card_id)
+            return TaskCard.model_validate(dict(row))
+
+    @staticmethod
+    def _insert(connection: sqlite3.Connection, payload: CreateCard) -> TaskCard:
+        now = datetime.now(timezone.utc).isoformat()
+        card = TaskCard(
+            id=uuid4().hex,
+            title=payload.title,
+            note=payload.note,
+            status="todo",
+            archived=False,
+            created_at=now,
+            updated_at=now,
+        )
+        connection.execute(
+            "INSERT INTO cards VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                card.id,
+                card.title,
+                card.note,
+                card.status,
+                card.archived,
+                card.created_at,
+                card.updated_at,
+            ),
+        )
+        return card
+
+    def add(self, payload: CreateCard) -> TaskCard:
+        """Add a task and return the exact card committed by this transaction."""
+        with closing(self._connect()) as connection, connection:
+            return self._insert(connection, payload)
+
     def create(self, payload: CreateCard) -> TaskBoard:
         """Add a task and return the snapshot committed by this transaction."""
-        now = datetime.now(timezone.utc).isoformat()
         with closing(self._connect()) as connection, connection:
-            connection.execute(
-                "INSERT INTO cards VALUES (?, ?, ?, 'todo', 0, ?, ?)",
-                (uuid4().hex, payload.title, payload.note, now, now),
-            )
+            self._insert(connection, payload)
             return self._snapshot(connection)
 
     def update(self, card_id: str, payload: UpdateCard) -> TaskBoard:

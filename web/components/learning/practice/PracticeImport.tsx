@@ -9,6 +9,7 @@ import {
   previewPracticeImport,
   type ImportPreview,
 } from "@/lib/practice-api";
+import { RecognitionImport } from "./RecognitionImport";
 
 export function PracticeImport({
   onClose,
@@ -22,6 +23,7 @@ export function PracticeImport({
   courseId?: string;
 }) {
   const { t } = useTranslation();
+  const [mode, setMode] = useState<"structured" | "recognition">("structured");
   const [target, setTarget] = useState(initialTarget);
   const [preview, setPreview] = useState<ImportPreview | null>(null);
   const [filename, setFilename] = useState("");
@@ -80,10 +82,34 @@ export function PracticeImport({
         </button>
       </div>
       <p className="mt-2 text-sm leading-relaxed text-muted-foreground">
-        {t(
-          "Import XLSX, CSV, TSV or JSON. Up to 500 questions and 5 MB per file. XLSX uses the active sheet. Chinese and English column names are supported.",
-        )}
+        {mode === "structured"
+          ? t(
+              "Import XLSX, CSV, TSV or JSON. Up to 500 questions and 5 MB per file. XLSX uses the active sheet. Chinese and English column names are supported.",
+            )
+          : t(
+              "Recognize printed questions from a photo, screenshot, or PDF. Review and edit every result before it is added to your question bank.",
+            )}
       </p>
+      <div className="mt-4 inline-flex rounded-xl bg-muted p-1 text-sm" role="tablist">
+        {(["structured", "recognition"] as const).map(value => (
+          <button
+            key={value}
+            type="button"
+            role="tab"
+            aria-selected={mode === value}
+            disabled={busy}
+            onClick={() => {
+              setMode(value);
+              setPreview(null);
+              setFilename("");
+              setError("");
+            }}
+            className={`rounded-lg px-3 py-1.5 ${mode === value ? "bg-background font-medium shadow-sm" : "text-muted-foreground"}`}
+          >
+            {value === "structured" ? t("Structured file") : t("Photo / PDF recognition")}
+          </button>
+        ))}
+      </div>
       <div className="mt-4 flex flex-wrap items-center gap-3">
         <label className="flex items-center gap-2 text-sm">
           {t("Import into")}
@@ -101,7 +127,7 @@ export function PracticeImport({
             <option value="mistakes">{t("Mistakes")}</option>
           </select>
         </label>
-        {(["xlsx", "csv"] as const).map(format => (
+        {mode === "structured" && (["xlsx", "csv"] as const).map(format => (
           <button
             key={format}
             type="button"
@@ -115,7 +141,7 @@ export function PracticeImport({
           </button>
         ))}
       </div>
-      <label className="mt-4 block rounded-xl border border-dashed border-border bg-muted/20 p-5 text-sm">
+      {mode === "structured" ? <label className="mt-4 block rounded-xl border border-dashed border-border bg-muted/20 p-5 text-sm">
         <span className="mb-2 block font-medium">{t("Choose a question file")}</span>
         <input
           key={target}
@@ -133,7 +159,18 @@ export function PracticeImport({
             "Question and answer are required. Use tags to organize imported questions. Review the preview before saving.",
           )}
         </span>
-      </label>
+      </label> : (
+        <RecognitionImport
+          target={target}
+          courseId={courseId}
+          disabled={busy}
+          onTargetRecovered={setTarget}
+          onStaged={(result, sourceFilename) => {
+            setPreview(result);
+            setFilename(sourceFilename);
+          }}
+        />
+      )}
       {busy && (
         <p role="status" className="mt-3 flex items-center gap-2 text-sm">
           <Loader2 size={16} className="animate-spin" />

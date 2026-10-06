@@ -22,6 +22,7 @@ from deeptutor.partners.channels.weixin import (
     WeixinConfig,
     _parse_aes_key,
     _pkcs7_unpad_safe,
+    _render_weixin_text,
 )
 from deeptutor.partners.config import paths as partner_paths
 from deeptutor.partners.helpers import ensure_dir
@@ -324,6 +325,40 @@ class TestInboundProcessing:
 
 
 class TestOutbound:
+    @pytest.mark.parametrize(
+        ("source", "expected"),
+        [
+            (
+                r"速度是 $\frac{a+b}{2} \leq \sqrt{x}$",
+                "速度是 (a+b)/(2) ≤ √(x)",
+            ),
+            (
+                r"$x^2 + a_{n+1} \neq \infty$",
+                "x² + aₙ₊₁ ≠ ∞",
+            ),
+            (r"$\alpha \rightarrow \beta$", "α → β"),
+            (r"\(\theta \ge 90^\circ\)", "θ ≥ 90°"),
+            (r"\[x_1 + x_2 = 10\]", "x₁ + x₂ = 10"),
+            (r"$\left\{x \mid x \ge 0\right\}$", "{x | x ≥ 0}"),
+            ("Tickets cost $5 and $10.", "Tickets cost $5 and $10."),
+        ],
+    )
+    def test_weixin_text_renders_common_latex(self, source, expected):
+        assert _render_weixin_text(source) == expected
+
+    def test_weixin_text_preserves_code_and_non_math_backslashes(self):
+        source = (
+            '`price = "$5"` and `value = r"\\pi"`\n\n'
+            '```python\npath = r"C:\\Users\\name"\n```\n\n'
+            r"Outside math: C:\Users\name; formula: $\pi$."
+        )
+
+        assert _render_weixin_text(source) == (
+            '`price = "$5"` and `value = r"\\pi"`\n\n'
+            '```python\npath = r"C:\\Users\\name"\n```\n\n'
+            "Outside math: C:\\Users\\name; formula: π."
+        )
+
     @pytest.mark.asyncio
     async def test_send_requires_authenticated_client(self, state_dir):
         ch = _make_channel(state_dir=str(state_dir))
@@ -344,6 +379,33 @@ class TestOutbound:
         assert body["msg"]["context_token"] == "ctx-1"
         assert body["msg"]["item_list"][0]["text_item"]["text"] == "hello"
         assert body["msg"]["client_id"].startswith("deeptutor-")
+
+    @pytest.mark.asyncio
+    async def test_send_renders_latex_as_readable_weixin_text(self, state_dir):
+        ch = _make_channel(state_dir=str(state_dir))
+        ch._client = object()
+        ch._token = "token"
+        ch._context_tokens["wx-user-1"] = "ctx-1"
+        ch._context_token_at["wx-user-1"] = time.time()
+        ch._send_text = AsyncMock()
+        ch._get_typing_ticket = AsyncMock(return_value="")
+        ch._stop_typing = AsyncMock()
+
+        await ch.send(
+            OutboundMessage(
+                channel="weixin",
+                chat_id="wx-user-1",
+                content=(
+                    r"对啦！周长 $C = \pi d = \pi \times 1 = \pi$。"
+                    "\n\n"
+                    r"$$-1 + \pi = \pi - 1$$"
+                ),
+            )
+        )
+
+        assert ch._send_text.await_args.args[1] == (
+            "对啦！周长 C = π d = π × 1 = π。\n\n-1 + π = π - 1"
+        )
 
     @pytest.mark.asyncio
     async def test_send_text_raises_api_error(self, state_dir):

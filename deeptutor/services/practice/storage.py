@@ -58,6 +58,34 @@ def initialize_practice(conn: sqlite3.Connection) -> None:
             created_at REAL NOT NULL,
             result_json TEXT
         );
+        CREATE TABLE IF NOT EXISTS practice_recognition_jobs (
+            id TEXT PRIMARY KEY,
+            workspace_key TEXT NOT NULL,
+            filename TEXT NOT NULL,
+            mime_type TEXT NOT NULL,
+            source_hash TEXT NOT NULL,
+            source_attachment_json TEXT NOT NULL DEFAULT '{}',
+            target TEXT NOT NULL,
+            course_id TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL,
+            stage TEXT NOT NULL DEFAULT '',
+            completed_units INTEGER NOT NULL DEFAULT 0,
+            total_units INTEGER NOT NULL DEFAULT 0,
+            progress_message TEXT NOT NULL DEFAULT '',
+            parser_signature TEXT NOT NULL DEFAULT '',
+            model_ref TEXT NOT NULL DEFAULT '',
+            drafts_json TEXT NOT NULL DEFAULT '[]',
+            summary_json TEXT NOT NULL DEFAULT '{}',
+            version INTEGER NOT NULL DEFAULT 1,
+            import_token TEXT NOT NULL DEFAULT '',
+            error_code TEXT NOT NULL DEFAULT '',
+            error_message TEXT NOT NULL DEFAULT '',
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            expires_at REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_practice_recognition_scope_created
+        ON practice_recognition_jobs(workspace_key, created_at DESC);
         CREATE TRIGGER IF NOT EXISTS practice_capture_insert
         AFTER INSERT ON notebook_entries
         WHEN NEW.is_correct = 0 AND COALESCE(NEW.result, '') != 'ungraded'
@@ -113,23 +141,35 @@ class PracticeStore:
             conn.close()
 
     @staticmethod
-    def _scope(session_ids: list[str] | None) -> tuple[str, list]:
+    def _scope(
+        session_ids: list[str] | None,
+        course_id: str = "",
+    ) -> tuple[str, list]:
         # Independent imports/document questions have no chat to delete. They
         # stay visible in the global bank, while an explicit course/session
         # scope continues to select conversation-backed entries only.
         sql = "(n.session_id IS NULL OR s.deleted_at IS NULL)"
         params: list = []
-        if session_ids is not None:
+        if course_id:
+            placeholders = ",".join("?" for _ in (session_ids or ())) or "NULL"
+            sql += f" AND (n.course_id = ? OR n.session_id IN ({placeholders}))"
+            params.append(course_id)
+            params.extend(session_ids or ())
+        elif session_ids is not None:
             sql += " AND n.session_id IN (" + (",".join("?" for _ in session_ids) or "NULL") + ")"
             params.extend(session_ids)
         return sql, params
 
     def overview(
-        self, timezone: str, session_ids: list[str] | None = None, now: float | None = None
+        self,
+        timezone: str,
+        session_ids: list[str] | None = None,
+        now: float | None = None,
+        course_id: str = "",
     ) -> dict:
         now = time.time() if now is None else now
         start, end = day_bounds(timezone, now)
-        scope, params = self._scope(session_ids)
+        scope, params = self._scope(session_ids, course_id)
         with self.connect() as conn:
             row = conn.execute(
                 f"""
@@ -159,10 +199,11 @@ class PracticeStore:
         days: int = 30,
         session_ids: list[str] | None = None,
         now: float | None = None,
+        course_id: str = "",
     ) -> dict:
         from .analytics import analytics
 
-        scope, params = self._scope(session_ids)
+        scope, params = self._scope(session_ids, course_id)
         with self.connect() as conn:
             return analytics(
                 conn, timezone, days, time.time() if now is None else now, scope, params
@@ -175,10 +216,11 @@ class PracticeStore:
         category_id: int | None = None,
         limit: int = 20,
         now: float | None = None,
+        course_id: str = "",
     ) -> list[int]:
         now = time.time() if now is None else now
         day_bounds(timezone, now)
-        scope, params = self._scope(session_ids)
+        scope, params = self._scope(session_ids, course_id)
         if category_id is not None:
             scope += " AND EXISTS(SELECT 1 FROM notebook_entry_categories c WHERE c.entry_id=n.id AND c.category_id=?)"
             params.append(category_id)
@@ -360,6 +402,7 @@ class PracticeStore:
                 raise ValueError("Import preview expired. Select the file again.")
             payload = json.loads(staged["payload_json"])
             questions = payload if isinstance(payload, list) else payload["questions"]
+            course_id = "" if isinstance(payload, list) else str(payload.get("course_id") or "")
             # All practice-file imports share one durable origin namespace.
             # ``question_id`` is a content hash, so re-importing the same
             # question remains idempotent without tying ownership to an
@@ -372,8 +415,10 @@ class PracticeStore:
                     INSERT OR IGNORE INTO notebook_entries(
                         session_id, origin_type, origin_ref, question_id, question, question_type,
                         options_json, correct_answer, explanation, difficulty, user_answer, source,
-                        result, assessment_type, created_at, updated_at, material_title, material_id)
-                    VALUES(NULL, 'external_import', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'import', ?, 'quiz', ?, ?, ?, ?)
+                        result, assessment_type, created_at, updated_at, material_title, material_id,
+                        course_id, question_images_json, source_locator_json, answer_origin,
+                        recognition_meta_json)
+                    VALUES(NULL, 'external_import', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'import', ?, 'quiz', ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                     (
                         origin_ref,
@@ -390,6 +435,11 @@ class PracticeStore:
                         now,
                         staged["filename"],
                         "import:" + token,
+                        course_id,
+                        json.dumps(question.get("question_images", []), ensure_ascii=False),
+                        json.dumps(question.get("source_locator", {}), ensure_ascii=False),
+                        str(question.get("answer_origin") or ""),
+                        json.dumps(question.get("recognition_meta", {}), ensure_ascii=False),
                     ),
                 )
                 created += cursor.rowcount
@@ -424,5 +474,13 @@ class PracticeStore:
             conn.execute(
                 "UPDATE practice_imports SET result_json=?, payload_json='[]' WHERE token=?",
                 (json.dumps(result), token),
+            )
+            conn.execute(
+                """
+                UPDATE practice_recognition_jobs
+                SET status='committed', updated_at=?, version=version+1
+                WHERE import_token=? AND status='staged'
+                """,
+                (now, token),
             )
         return result

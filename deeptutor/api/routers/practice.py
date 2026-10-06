@@ -6,7 +6,7 @@ import asyncio
 import csv
 import io
 import time
-from typing import Literal
+from typing import Any, Literal
 import zipfile
 
 from defusedxml.ElementTree import ParseError
@@ -15,9 +15,17 @@ from pydantic import BaseModel, Field
 
 from deeptutor.services.practice.answers import check_answer
 from deeptutor.services.practice.importing import MAX_BYTES, preview
+from deeptutor.services.practice.recognition import (
+    QuestionRecognitionService,
+    StageDraftsRequest,
+    StartRecognitionRequest,
+)
+from deeptutor.services.practice.recognition.extractor import LLMImageQuestionExtractor
+from deeptutor.services.practice.recognition.service import MAX_SOURCE_BYTES
 from deeptutor.services.practice.scheduler import Rating, day_bounds
 from deeptutor.services.practice.storage import PracticeStore, ReviewConflict
 from deeptutor.services.session import get_sqlite_session_store
+from deeptutor.services.workspace.context import current_workspace_id
 
 from .question_notebook import NotebookEntryItem, _course_session_ids
 
@@ -83,6 +91,34 @@ class CommitRequest(BaseModel):
     token: str = Field(min_length=32, max_length=32, pattern=r"^[a-f0-9]+$")
 
 
+class RecognitionStageRequest(BaseModel):
+    expected_version: int = Field(ge=1)
+    drafts: list[dict[str, Any]] = Field(min_length=1, max_length=100)
+
+
+def _recognition_service() -> QuestionRecognitionService:
+    return QuestionRecognitionService(
+        get_sqlite_session_store().db_path,
+        LLMImageQuestionExtractor(),
+    )
+
+
+def _recognition_mime(declared: str, data: bytes) -> str:
+    """Use magic bytes for generic browser uploads; reject conflicting types later."""
+
+    if declared in {"image/jpeg", "image/png", "image/webp", "application/pdf"}:
+        return declared
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return "image/webp"
+    if data.startswith(b"%PDF-"):
+        return "application/pdf"
+    return declared
+
+
 def _validate_timezone(timezone: str) -> tuple[float, float]:
     try:
         return day_bounds(timezone, time.time())
@@ -127,7 +163,12 @@ async def summary(timezone: str = "UTC", course_id: str = "", all_workspaces: bo
     store = get_sqlite_session_store()
     sessions = await _course_session_ids(store, course_id)
     try:
-        return await asyncio.to_thread(PracticeStore(store.db_path).overview, timezone, sessions)
+        return await asyncio.to_thread(
+            PracticeStore(store.db_path).overview,
+            timezone,
+            sessions,
+            course_id=course_id,
+        )
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
 
@@ -162,7 +203,14 @@ async def queue(
     practice = PracticeStore(store.db_path)
     sessions = await _course_session_ids(store, course_id)
     try:
-        ids = await asyncio.to_thread(practice.queue, timezone, sessions, category_id, limit)
+        ids = await asyncio.to_thread(
+            practice.queue,
+            timezone,
+            sessions,
+            category_id,
+            limit,
+            course_id=course_id,
+        )
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
     from deeptutor.services.workspace.context import current_workspace_id
@@ -219,7 +267,11 @@ async def practice_analytics(
     sessions = await _course_session_ids(store, course_id)
     try:
         return await asyncio.to_thread(
-            PracticeStore(store.db_path).analytics, timezone, days, sessions
+            PracticeStore(store.db_path).analytics,
+            timezone,
+            days,
+            sessions,
+            course_id=course_id,
         )
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
@@ -354,6 +406,82 @@ async def import_preview(
         "errors": parsed["errors"],
         "samples": parsed["questions"][:5],
     }
+
+
+@router.post("/import/recognize", status_code=202)
+async def start_recognition_import(
+    file: UploadFile = File(...),
+    target: Literal["bank", "mistakes"] = Form("bank"),
+    course_id: str = Form("", max_length=200),
+):
+    """Start image or PDF recognition without changing the question bank."""
+
+    store = get_sqlite_session_store()
+    await _course_session_ids(store, course_id)
+    try:
+        data = await file.read(MAX_SOURCE_BYTES + 1)
+        mime_type = _recognition_mime(file.content_type or "", data)
+        ref = await _recognition_service().start(
+            StartRecognitionRequest(
+                filename=file.filename or "upload",
+                mime_type=mime_type,
+                data=data,
+                workspace_key=current_workspace_id() or "default",
+                target=target,
+                course_id=course_id,
+            )
+        )
+    except (ValueError, OSError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+    finally:
+        await file.close()
+    return {
+        "job_id": ref.job_id,
+        "status": ref.status,
+        "created_at": ref.created_at,
+    }
+
+
+@router.get("/import/recognize")
+async def latest_recognition_import():
+    """Return the current running or reviewable recognition job, if any."""
+
+    return await asyncio.to_thread(
+        _recognition_service().latest,
+        current_workspace_id() or "default",
+    )
+
+
+@router.get("/import/recognize/{job_id}")
+async def recognition_import_status(job_id: str):
+    try:
+        return await asyncio.to_thread(
+            _recognition_service().snapshot,
+            job_id,
+            current_workspace_id() or "default",
+        )
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@router.post("/import/recognize/{job_id}/stage")
+async def stage_recognition_import(job_id: str, payload: RecognitionStageRequest):
+    try:
+        return await asyncio.to_thread(
+            _recognition_service().stage,
+            job_id,
+            current_workspace_id() or "default",
+            StageDraftsRequest(
+                expected_version=payload.expected_version,
+                drafts=payload.drafts,
+            ),
+        )
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        message = str(exc)
+        status = 409 if "changed" in message else 422
+        raise HTTPException(status, message) from exc
 
 
 @router.post("/import/commit")

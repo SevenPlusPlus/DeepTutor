@@ -1,6 +1,6 @@
 ---
 name: deeptutor-cli
-description: Configure, manage, and use DeepTutor through its CLI, including capabilities, knowledge bases, partners, memory, sessions, notebooks, providers, skills, and the server or Web app.
+description: Configure, manage, and use DeepTutor through its CLI, including capabilities, knowledge bases, partners, tasks, memory, sessions, notebooks, providers, skills, and the server or Web app.
 ---
 
 # DeepTutor CLI Skill
@@ -16,7 +16,7 @@ Use this skill when the user wants to:
 - Create, manage, or run Partners (IM-connected companions)
 - Search, install, or manage skills from a hub (ClawHub)
 - Inspect or maintain interactive Books
-- View or manage learning memory, sessions, or notebooks
+- View or manage tasks, learning memory, sessions, or notebooks
 - Start the DeepTutor API server or the full Web app
 
 ## Prerequisites
@@ -116,6 +116,18 @@ deeptutor book refresh-fingerprints <book_id>       # Re-snapshot KB fingerprint
 deeptutor memory show [<target>]    # target: L3 (all global docs, default) | L2 (all surfaces) | a doc name (e.g. profile, chat)
 deeptutor memory clear [<target>]   # target: all (default) | trace (all L1) | a surface name (clears that surface's L1)
 #   --force/-f   Skip confirmation
+```
+
+### Task Board
+
+```bash
+deeptutor task add "Review absolute values by Friday" --note "Finish mistakes 1-20"
+deeptutor task list [--status todo|doing|done] [--all] [--format rich|json]
+deeptutor task show <id> [--format rich|json]
+deeptutor task update <id> [--title "..."] [--note "..."] [--status todo|doing|done]
+deeptutor task complete <id>
+deeptutor task archive <id>
+deeptutor task restore <id>
 ```
 
 ### Sessions

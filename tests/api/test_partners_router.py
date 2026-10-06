@@ -494,6 +494,7 @@ class TestConfigAndSoul:
         # use the mandatory partner_read / partner_memorize / partner_search
         # instead, so they never surface in the partner config UI.
         assert "rag" in builtin_names
+        assert "task_board" in builtin_names
         assert "read_memory" not in builtin_names
         assert "write_memory" not in builtin_names
 

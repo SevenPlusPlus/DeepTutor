@@ -81,6 +81,10 @@ const TASK_TEXT: Record<string, { label: string; detail: string }> = {
     label: "Reading questions",
     detail: "Writes practice questions from what you are reading.",
   },
+  question_import_recognition: {
+    label: "Question import recognition",
+    detail: "Structures questions found in uploaded photos and documents.",
+  },
 };
 
 /** Section heading per task group, in the order the backend returns them. */
@@ -88,6 +92,7 @@ const GROUP_TEXT: Record<string, string> = {
   chat: "Conversation",
   mastery: "Mastery path",
   reading: "Immersive reading",
+  question_bank: "Question bank",
 };
 
 type TaskChoice = NonNullable<RegistryEdit["task"]>;

@@ -110,6 +110,226 @@ _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".ico"
 _VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".flv"}
 _VOICE_EXTS = {".mp3", ".wav", ".amr", ".silk", ".ogg", ".m4a", ".aac", ".flac"}
 
+_MARKDOWN_CODE_RE = re.compile(r"(```[\s\S]*?```|~~~[\s\S]*?~~~|`[^`\n]*`)")
+_DISPLAY_DOLLAR_MATH_RE = re.compile(r"(?<!\\)\$\$(.+?)(?<!\\)\$\$", re.DOTALL)
+_DISPLAY_BRACKET_MATH_RE = re.compile(r"\\\[(.+?)\\\]", re.DOTALL)
+_INLINE_PAREN_MATH_RE = re.compile(r"\\\((.+?)\\\)", re.DOTALL)
+_INLINE_DOLLAR_MATH_RE = re.compile(r"(?<![\\$])\$(?![\s$])([^\n$]*?\S)(?<!\\)\$(?!\$)")
+
+_LATEX_SYMBOLS = {
+    # Greek letters.
+    "alpha": "α",
+    "beta": "β",
+    "gamma": "γ",
+    "delta": "δ",
+    "epsilon": "ε",
+    "varepsilon": "ε",
+    "zeta": "ζ",
+    "eta": "η",
+    "theta": "θ",
+    "vartheta": "ϑ",
+    "iota": "ι",
+    "kappa": "κ",
+    "lambda": "λ",
+    "mu": "μ",
+    "nu": "ν",
+    "xi": "ξ",
+    "omicron": "ο",
+    "pi": "π",
+    "varpi": "ϖ",
+    "rho": "ρ",
+    "sigma": "σ",
+    "tau": "τ",
+    "upsilon": "υ",
+    "phi": "φ",
+    "varphi": "ϕ",
+    "chi": "χ",
+    "psi": "ψ",
+    "omega": "ω",
+    "Gamma": "Γ",
+    "Delta": "Δ",
+    "Theta": "Θ",
+    "Lambda": "Λ",
+    "Xi": "Ξ",
+    "Pi": "Π",
+    "Sigma": "Σ",
+    "Upsilon": "Υ",
+    "Phi": "Φ",
+    "Psi": "Ψ",
+    "Omega": "Ω",
+    # Operators, relations, sets, and arrows commonly produced by tutors.
+    "times": "×",
+    "cdot": "·",
+    "div": "÷",
+    "pm": "±",
+    "mp": "∓",
+    "le": "≤",
+    "leq": "≤",
+    "ge": "≥",
+    "geq": "≥",
+    "ne": "≠",
+    "neq": "≠",
+    "approx": "≈",
+    "equiv": "≡",
+    "propto": "∝",
+    "infty": "∞",
+    "partial": "∂",
+    "nabla": "∇",
+    "sum": "∑",
+    "prod": "∏",
+    "int": "∫",
+    "in": "∈",
+    "notin": "∉",
+    "ni": "∋",
+    "subset": "⊂",
+    "subseteq": "⊆",
+    "supset": "⊃",
+    "supseteq": "⊇",
+    "cup": "∪",
+    "cap": "∩",
+    "emptyset": "∅",
+    "varnothing": "∅",
+    "forall": "∀",
+    "exists": "∃",
+    "neg": "¬",
+    "land": "∧",
+    "lor": "∨",
+    "rightarrow": "→",
+    "to": "→",
+    "leftarrow": "←",
+    "leftrightarrow": "↔",
+    "Rightarrow": "⇒",
+    "Leftarrow": "⇐",
+    "Leftrightarrow": "⇔",
+    "angle": "∠",
+    "perp": "⟂",
+    "parallel": "∥",
+    "mid": "|",
+    "vert": "|",
+    "lvert": "|",
+    "rvert": "|",
+    "Vert": "∥",
+    "circ": "∘",
+    "degree": "°",
+    "ldots": "…",
+    "cdots": "⋯",
+    "therefore": "∴",
+    "because": "∵",
+}
+
+_SUPERSCRIPT_CHARS = str.maketrans("0123456789+-=()ni", "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾ⁿⁱ")
+_SUBSCRIPT_CHARS = str.maketrans(
+    "0123456789+-=()aehijklmnoprstuvx",
+    "₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎ₐₑₕᵢⱼₖₗₘₙₒₚᵣₛₜᵤᵥₓ",
+)
+
+
+def _script_text(value: str, table: dict[int, int | str | None], marker: str) -> str:
+    translated = value.translate(table)
+    if len(translated) == len(value) and all(ord(char) > 127 for char in translated):
+        return translated
+    return f"{marker}({value})"
+
+
+def _latex_math_to_plain_text(value: str) -> str:
+    """Render a bounded LaTeX math span as readable Unicode text."""
+
+    value = re.sub(
+        r"\\(?:begin|end)\s*\{(?:aligned|align\*?|gathered|cases|matrix|pmatrix|bmatrix)\}",
+        "",
+        value,
+    )
+    value = value.replace(r"\\", "\n").replace("&", "")
+    value = re.sub(r"\\(?:left|right|displaystyle|textstyle)\b", "", value)
+    value = re.sub(r"\^\s*(?:\{\\circ\}|\\circ)", "°", value)
+
+    # Resolve innermost structural commands repeatedly so nested fractions and
+    # roots degrade predictably instead of exposing command syntax.
+    previous = None
+    while previous != value:
+        previous = value
+        value = re.sub(
+            r"\\frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}",
+            lambda match: f"({match.group(1)})/({match.group(2)})",
+            value,
+        )
+        value = re.sub(
+            r"\\sqrt(?:\[([^\]]+)\])?\s*\{([^{}]*)\}",
+            lambda match: (
+                f"√({match.group(2)})"
+                if not match.group(1)
+                else f"root[{match.group(1)}]({match.group(2)})"
+            ),
+            value,
+        )
+        value = re.sub(
+            r"\\(?:text|textrm|mathrm|mathbf|mathit|mathsf|mathtt|operatorname|"
+            r"overline|underline)\s*\{([^{}]*)\}",
+            lambda match: match.group(1),
+            value,
+        )
+
+    value = re.sub(
+        r"\^\{([^{}]+)\}",
+        lambda match: _script_text(match.group(1), _SUPERSCRIPT_CHARS, "^"),
+        value,
+    )
+    value = re.sub(
+        r"_\{([^{}]+)\}",
+        lambda match: _script_text(match.group(1), _SUBSCRIPT_CHARS, "_"),
+        value,
+    )
+    value = re.sub(
+        r"\^([0-9ni])",
+        lambda match: _script_text(match.group(1), _SUPERSCRIPT_CHARS, "^"),
+        value,
+    )
+    value = re.sub(
+        r"_([0-9aehijklmnoprstuvx])",
+        lambda match: _script_text(match.group(1), _SUBSCRIPT_CHARS, "_"),
+        value,
+    )
+
+    value = value.replace(r"\{", "\x00WXLBRACE\x00")
+    value = value.replace(r"\}", "\x00WXRBRACE\x00")
+    value = value.replace(r"\|", "∥")
+    value = re.sub(r"\\([_#&])", lambda match: match.group(1), value)
+    value = re.sub(r"\\(?:[,;:!]|quad\b|qquad\b)", " ", value)
+    value = re.sub(
+        r"\\([A-Za-z]+)",
+        lambda match: _LATEX_SYMBOLS.get(match.group(1), match.group(1)),
+        value,
+    )
+    value = value.replace(r"\%", "%").replace(r"\$", "$")
+    value = value.replace("{", "(").replace("}", ")")
+    value = value.replace("\x00WXLBRACE\x00", "{").replace("\x00WXRBRACE\x00", "}")
+    lines = [re.sub(r"[ \t]+", " ", line).strip() for line in value.splitlines()]
+    return "\n".join(lines).strip()
+
+
+def _render_weixin_text(text: str) -> str:
+    """Keep Markdown intact while degrading its LaTeX spans for WeChat."""
+
+    code_spans: list[str] = []
+
+    def _mask_code(match: re.Match[str]) -> str:
+        code_spans.append(match.group(0))
+        return f"\x00WXCODE{len(code_spans) - 1}\x00"
+
+    rendered = _MARKDOWN_CODE_RE.sub(_mask_code, text)
+
+    def _render_match(match: re.Match[str]) -> str:
+        return _latex_math_to_plain_text(match.group(1))
+
+    rendered = _DISPLAY_DOLLAR_MATH_RE.sub(_render_match, rendered)
+    rendered = _DISPLAY_BRACKET_MATH_RE.sub(_render_match, rendered)
+    rendered = _INLINE_PAREN_MATH_RE.sub(_render_match, rendered)
+    rendered = _INLINE_DOLLAR_MATH_RE.sub(_render_match, rendered)
+
+    for index, code in enumerate(code_spans):
+        rendered = rendered.replace(f"\x00WXCODE{index}\x00", code)
+    return rendered
+
 
 def _has_downloadable_media_locator(media: dict[str, Any] | None) -> bool:
     if not isinstance(media, dict):
@@ -966,7 +1186,9 @@ class WeixinChannel(BaseChannel):
             self.logger.debug("Dropped invisible reasoning delta for {}", msg.chat_id)
             return
 
-        content = msg.content.strip()
+        # WeChat receives a plain text item and does not render the LaTeX that
+        # the shared tutor prompt intentionally produces for the Web UI.
+        content = _render_weixin_text(msg.content.strip())
 
         # Empty progress messages (e.g. after_iteration tool_events) must
         # NOT act as separators — they have no visible content.

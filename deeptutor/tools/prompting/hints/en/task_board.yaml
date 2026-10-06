@@ -1,0 +1,6 @@
+short_description: "Manage the learner's Task Board: create, inspect, edit, complete, archive, and restore tasks."
+when_to_use: "Use when the learner explicitly asks to add or manage a task, todo, action item, or study assignment. A reminder at a future time belongs to cron instead; use task_board when the item should appear on the Task Board."
+input_format: "create: {\"action\": \"create\", \"title\": \"Review absolute values by Friday\", \"note\": \"Finish mistakes 1–20\"}. list: {\"action\": \"list\"}. Existing cards: list first to obtain card_id, then use get/update/complete/archive/restore with that id."
+guideline: "Never invent card_id. If the user identifies an existing task only by title, list tasks first and choose only an unambiguous match. Create or mutate a task only when the user clearly requests that change; report the title and resulting status from the tool result."
+note: "Partner messages need a linked direct-chat account. Unlinked or group messages cannot access a personal Task Board."
+phase: "synthesis"

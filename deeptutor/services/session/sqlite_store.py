@@ -197,6 +197,7 @@ class QuestionBankQuery:
     resolved: bool | None = None
     score_trend: str = ""
     search: str = ""
+    course_id: str = ""
     session_id: str | None = None
     session_ids: Sequence[str] | None = None
     sort: str = "recent"
@@ -229,6 +230,7 @@ class QuestionBankQuery:
             if (self.score_trend or "").strip() in SCORE_TRENDS
             else "",
             search=(self.search or "").strip()[:200],
+            course_id=(self.course_id or "").strip()[:200],
             session_id=self.session_id,
             session_ids=None if self.session_ids is None else tuple(self.session_ids),
             sort="oldest" if self.sort == "oldest" else "recent",
@@ -365,6 +367,11 @@ class SQLiteSessionStore:
                     difficulty TEXT DEFAULT '',
                     user_answer TEXT DEFAULT '',
                     user_answer_images_json TEXT DEFAULT '[]',
+                    question_images_json TEXT NOT NULL DEFAULT '[]',
+                    source_locator_json TEXT NOT NULL DEFAULT '{}',
+                    answer_origin TEXT NOT NULL DEFAULT '',
+                    recognition_meta_json TEXT NOT NULL DEFAULT '{}',
+                    course_id TEXT NOT NULL DEFAULT '',
                     source TEXT NOT NULL DEFAULT 'deep_question',
                     material_id TEXT NOT NULL DEFAULT '',
                     material_title TEXT NOT NULL DEFAULT '',
@@ -494,6 +501,7 @@ class SQLiteSessionStore:
             self._migrate_notebook_entries_add_assessment_review(conn)
             self._migrate_notebook_entries_add_assessment_v2(conn)
             self._migrate_notebook_entry_origins(conn)
+            self._migrate_notebook_entries_add_recognition_fields(conn)
             self._migrate_assessment_attempt_origins(conn)
             self._migrate_assessment_attempt_link_state(conn)
             self._migrate_turn_runtime_columns(conn)
@@ -810,6 +818,35 @@ class SQLiteSessionStore:
                 PRIMARY KEY (material_id, locator, question_id)
             )
             """
+        )
+
+    @staticmethod
+    def _migrate_notebook_entries_add_recognition_fields(
+        conn: sqlite3.Connection,
+    ) -> None:
+        """Add course ownership and recognition provenance without rewriting rows.
+
+        This migration intentionally runs after the legacy origin-table rebuild,
+        otherwise that rebuild could discard columns that did not exist in the
+        historical schema it copies.
+        """
+
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(notebook_entries)").fetchall()}
+        if not cols:
+            return
+        additions = {
+            "question_images_json": "TEXT NOT NULL DEFAULT '[]'",
+            "source_locator_json": "TEXT NOT NULL DEFAULT '{}'",
+            "answer_origin": "TEXT NOT NULL DEFAULT ''",
+            "recognition_meta_json": "TEXT NOT NULL DEFAULT '{}'",
+            "course_id": "TEXT NOT NULL DEFAULT ''",
+        }
+        for name, definition in additions.items():
+            if name not in cols:
+                conn.execute(f"ALTER TABLE notebook_entries ADD COLUMN {name} {definition}")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_notebook_entries_course "
+            "ON notebook_entries(course_id, created_at DESC)"
         )
 
     @staticmethod
@@ -3506,6 +3543,11 @@ class SQLiteSessionStore:
             raw_images = _json_loads(row["user_answer_images_json"], [])
             if isinstance(raw_images, list):
                 images = [r for r in raw_images if isinstance(r, dict)]
+        question_images: list[dict[str, Any]] = []
+        if "question_images_json" in keys:
+            raw_question_images = _json_loads(row["question_images_json"], [])
+            if isinstance(raw_question_images, list):
+                question_images = [r for r in raw_question_images if isinstance(r, dict)]
         is_correct = bool(row["is_correct"])
         stored_result = (row["result"] or "") if "result" in keys else ""
         if stored_result in ASSESSMENT_RESULTS:
@@ -3533,6 +3575,15 @@ class SQLiteSessionStore:
             "difficulty": row["difficulty"] or "",
             "user_answer": row["user_answer"] or "",
             "user_answer_images": images,
+            "question_images": question_images,
+            "source_locator": _json_loads(
+                row["source_locator_json"] if "source_locator_json" in keys else "{}", {}
+            ),
+            "answer_origin": (row["answer_origin"] or "") if "answer_origin" in keys else "",
+            "recognition_meta": _json_loads(
+                row["recognition_meta_json"] if "recognition_meta_json" in keys else "{}", {}
+            ),
+            "course_id": (row["course_id"] or "") if "course_id" in keys else "",
             "is_correct": is_correct,
             "source": (row["source"] or "deep_question") if "source" in keys else "deep_question",
             "material_id": (row["material_id"] or "") if "material_id" in keys else "",
@@ -3643,7 +3694,15 @@ class SQLiteSessionStore:
         if query.session_id is not None:
             conditions.append("n.session_id = ?")
             params.append(query.session_id)
-        if query.session_ids is not None:
+        if query.course_id:
+            # Imported questions have no chat session, so an explicit course
+            # owns them directly. Conversation-backed questions keep their
+            # historical course membership through the matching session ids.
+            placeholders = ",".join("?" for _ in (query.session_ids or ())) or "NULL"
+            conditions.append(f"(n.course_id = ? OR n.session_id IN ({placeholders}))")
+            params.append(query.course_id)
+            params.extend(query.session_ids or ())
+        elif query.session_ids is not None:
             # Only the placeholder shape is interpolated; session ids remain
             # bound parameters. ``IN (NULL)`` is the explicit empty-set case.
             placeholders = ",".join("?" for _ in query.session_ids) or "NULL"
@@ -3717,6 +3776,8 @@ class SQLiteSessionStore:
                 n.question, n.question_type, n.options_json,
                 n.correct_answer, n.explanation, n.difficulty,
                 n.user_answer, n.user_answer_images_json, n.source, n.material_id,
+                n.question_images_json, n.source_locator_json, n.answer_origin,
+                n.recognition_meta_json, n.course_id,
                 n.material_title, n.section_id, n.section_title, n.score_trend,
                 n.assessment_type, n.result, n.mastery_path_id, n.knowledge_point_id,
                 n.attempt_count, n.hints_used, n.confidence, n.response_time, n.quality,
@@ -3768,6 +3829,7 @@ class SQLiteSessionStore:
         resolved: bool | None = None,
         score_trend: str = "",
         search: str = "",
+        course_id: str = "",
         uncategorized: bool = False,
         mistakes_only: bool = False,
         sort: str = "recent",
@@ -3791,6 +3853,7 @@ class SQLiteSessionStore:
                 resolved=resolved,
                 score_trend=score_trend,
                 search=search,
+                course_id=course_id,
                 session_id=session_id,
                 session_ids=session_ids,
                 sort=sort,
@@ -3799,7 +3862,11 @@ class SQLiteSessionStore:
             ),
         )
 
-    def _question_bank_stats_sync(self, session_ids: Sequence[str] | None = None) -> dict[str, int]:
+    def _question_bank_stats_sync(
+        self,
+        session_ids: Sequence[str] | None = None,
+        course_id: str = "",
+    ) -> dict[str, int]:
         with self._connect() as conn:
             # Same ``None`` vs ``[]`` contract as the listing: absent means "do
             # not scope", empty means "scoped to nothing". The rail's counts sit
@@ -3807,7 +3874,11 @@ class SQLiteSessionStore:
             # here either.
             where = ""
             params: list[str] = []
-            if session_ids is not None:
+            if course_id:
+                placeholders = ",".join("?" for _ in (session_ids or ())) or "NULL"
+                where = f"WHERE (course_id = ? OR session_id IN ({placeholders}))"
+                params = [course_id, *(session_ids or ())]
+            elif session_ids is not None:
                 placeholders = ",".join("?" for _ in session_ids) or "NULL"
                 where = f"WHERE session_id IN ({placeholders})"
                 params = list(session_ids)
@@ -3862,20 +3933,27 @@ class SQLiteSessionStore:
     async def question_bank_stats(
         self,
         session_ids: Sequence[str] | None = None,
+        course_id: str = "",
     ) -> dict[str, int]:
         """Counts behind the bank's filter chips (and the agent's overview)."""
         return await self._run(
             self._question_bank_stats_sync,
             None if session_ids is None else tuple(session_ids),
+            course_id,
         )
 
     def _list_question_bank_materials_sync(
         self,
         session_ids: Sequence[str] | None = None,
+        course_id: str = "",
     ) -> list[dict[str, Any]]:
         where = "material_id != ''"
         params: list[str] = []
-        if session_ids is not None:
+        if course_id:
+            placeholders = ",".join("?" for _ in (session_ids or ())) or "NULL"
+            where += f" AND (course_id = ? OR session_id IN ({placeholders}))"
+            params.extend([course_id, *(session_ids or ())])
+        elif session_ids is not None:
             placeholders = ",".join("?" for _ in session_ids) or "NULL"
             where += f" AND session_id IN ({placeholders})"
             params.extend(session_ids)
@@ -3900,11 +3978,13 @@ class SQLiteSessionStore:
     async def list_question_bank_materials(
         self,
         session_ids: Sequence[str] | None = None,
+        course_id: str = "",
     ) -> list[dict[str, Any]]:
         """Distinct materials for review filters, with wrong-review counts."""
         return await self._run(
             self._list_question_bank_materials_sync,
             None if session_ids is None else tuple(session_ids),
+            course_id,
         )
 
     def _get_notebook_entry_sync(self, entry_id: int) -> dict[str, Any] | None:
@@ -4082,6 +4162,7 @@ class SQLiteSessionStore:
     def _list_categories_sync(
         self,
         session_ids: Sequence[str] | None = None,
+        course_id: str = "",
     ) -> list[dict[str, Any]]:
         # The scope narrows the *count*, never the list: a category the learner
         # created still exists inside a course that has not filled it yet, and
@@ -4089,7 +4170,11 @@ class SQLiteSessionStore:
         # on the join instead of a WHERE clause.
         join = "LEFT JOIN notebook_entries e ON e.id = ec.entry_id"
         params: list[str] = []
-        if session_ids is not None:
+        if course_id:
+            placeholders = ",".join("?" for _ in (session_ids or ())) or "NULL"
+            join += f" AND (e.course_id = ? OR e.session_id IN ({placeholders}))"
+            params = [course_id, *(session_ids or ())]
+        elif session_ids is not None:
             placeholders = ",".join("?" for _ in session_ids) or "NULL"
             join += f" AND e.session_id IN ({placeholders})"
             params = list(session_ids)
@@ -4119,10 +4204,12 @@ class SQLiteSessionStore:
     async def list_categories(
         self,
         session_ids: Sequence[str] | None = None,
+        course_id: str = "",
     ) -> list[dict[str, Any]]:
         return await self._run(
             self._list_categories_sync,
             None if session_ids is None else tuple(session_ids),
+            course_id,
         )
 
     def _rename_category_sync(self, category_id: int, name: str) -> bool:
