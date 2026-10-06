@@ -327,6 +327,76 @@ it("stages parser URL edits immediately and keeps them when changing parser pane
   expect(resources["document-parsing"].engines).not.toHaveProperty("mineru");
 });
 
+it("hydrates document parsing metadata around a restored writable-only draft", async () => {
+  resources["document-parsing"] = {
+    engine: "text_only",
+    engines: {
+      docling: { mode: "local", api_base_url: "" },
+      mineru: { mode: "local" },
+    },
+    available_engines: [
+      {
+        id: "text_only",
+        name: "Text-only",
+        description: "Built in",
+        needs_local_models: false,
+        available: true,
+      },
+      {
+        id: "docling",
+        name: "Docling",
+        description: "Structured parsing",
+        needs_local_models: true,
+        available: true,
+      },
+    ],
+    readiness: {},
+    installable: [],
+    mineru: { api_token_set: false },
+  };
+  stored = {
+    catalog: live,
+    extensions: {
+      "document-parsing": {
+        engine: "docling",
+        engines: {
+          docling: { mode: "remote", api_base_url: "http://draft-parser" },
+        },
+      },
+    },
+  };
+  const implementation = mocks.fetch.getMockImplementation()!;
+  mocks.fetch.mockImplementation(async (url: string, init?: RequestInit) => {
+    if (
+      url === "/api/settings/document-parsing" &&
+      init?.method === "PUT"
+    ) {
+      const patch = JSON.parse(String(init.body));
+      resources["document-parsing"] = {
+        ...resources["document-parsing"],
+        ...patch,
+        engines: {
+          ...resources["document-parsing"].engines,
+          ...patch.engines,
+        },
+      };
+      return reply(resources["document-parsing"]);
+    }
+    return implementation(url, init);
+  });
+
+  render(<App page="document-parsing" />);
+  await ready();
+
+  expect(await screen.findByText("Docling")).toBeInTheDocument();
+  expect(
+    await screen.findByDisplayValue("http://draft-parser"),
+  ).toBeInTheDocument();
+  await act(() => settings.applyCatalog());
+  expect(settings.draftState).toBe("clean");
+  expect(screen.getByText("Docling")).toBeInTheDocument();
+});
+
 it("stages MinerU credentials and restores them when revisiting the page", async () => {
   resources.mineru = {
     settings: { mode: "cloud", api_base_url: "http://mineru" },

@@ -2,7 +2,13 @@
 
 import { useSettings } from "@/features/settings/store/SettingsStore";
 import { useStagedSettings } from "@/features/settings/store/useStagedSettings";
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type SetStateAction,
+} from "react";
 import { CheckCircle2, Download, Loader2, XCircle } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
@@ -30,6 +36,7 @@ type Readiness = { ready: boolean; reason: string; message: string };
 
 type DocumentParsingPayload = {
   engine: string;
+  image_caption?: boolean;
   engines: Record<string, Record<string, unknown>>;
   available_engines: EngineMeta[];
   readiness: Record<string, Readiness>;
@@ -37,6 +44,27 @@ type DocumentParsingPayload = {
   mineru: { api_token_set: boolean; local_cli?: unknown };
   docling?: { api_token_set: boolean };
 };
+
+type DocumentParsingDraft = Partial<DocumentParsingPayload>;
+
+function mergeDocumentParsingDraft(
+  live: DocumentParsingPayload | null,
+  staged: DocumentParsingDraft | null,
+): DocumentParsingPayload | null {
+  if (!live) return null;
+
+  const engines = { ...live.engines };
+  for (const [name, patch] of Object.entries(staged?.engines ?? {})) {
+    engines[name] = { ...(live.engines[name] ?? {}), ...patch };
+  }
+
+  return {
+    ...live,
+    engine: staged?.engine ?? live.engine,
+    image_caption: staged?.image_caption ?? live.image_caption,
+    engines,
+  };
+}
 
 const PIP_HINT: Record<string, string> = {
   docling: "pip install deeptutor[parse-docling]",
@@ -71,7 +99,25 @@ const ENGINE_DESCRIPTION_KEYS: Record<string, string> = {
 export default function DocumentParsingSettingsPage() {
   const { t } = useTranslation();
   const [liveData, setLiveData] = useState<DocumentParsingPayload | null>(null);
-  const [data, setData] = useStagedSettings("document-parsing", liveData, setLiveData);
+  const setHydratedLiveData = useCallback(
+    (action: SetStateAction<DocumentParsingPayload | null>) => {
+      setLiveData((current) => {
+        const next = typeof action === "function" ? action(current) : action;
+        if (!current || !next) return next;
+        return mergeDocumentParsingDraft(current, next);
+      });
+    },
+    [],
+  );
+  const [stagedData, setData] = useStagedSettings<DocumentParsingPayload | null>(
+    "document-parsing",
+    liveData,
+    setHydratedLiveData,
+  );
+  // Drafts intentionally contain only writable fields (for example presets
+  // stage just `engine` and `engines`). Keep runtime metadata from the live
+  // GET response instead of treating that partial draft as a full payload.
+  const data = mergeDocumentParsingDraft(liveData, stagedData);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const { applying: busy, draftRevision } = useSettings();
@@ -105,7 +151,7 @@ export default function DocumentParsingSettingsPage() {
   const putDocumentParsing = async (body: Record<string, unknown>) => {
     setData((current) => {
       if (!current) return current;
-      const engines = { ...current.engines };
+      const engines = { ...(current.engines ?? {}) };
       for (const [name, patch] of Object.entries((body.engines ?? {}) as Record<string, Record<string, unknown>>)) {
         engines[name] = { ...engines[name], ...patch };
       }
