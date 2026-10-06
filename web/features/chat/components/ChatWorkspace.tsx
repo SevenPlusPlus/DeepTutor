@@ -3,6 +3,7 @@
 import { ResourceReuseContext, useResourceReusePolicy } from "@/components/chat/home/ResourceReuse";
 import { retainedKnowledgeBases } from "@/lib/resource-reuse";
 import { knowledgeBaseRef } from "@/lib/knowledge-helpers";
+import { workspaceKnowledgeDefaults } from "@/lib/workspace-knowledge-defaults";
 import { scopedUrl } from "@/lib/workspace-scope";
 import { WATCHING_HOME, watchingRoute } from "@/lib/learning-routes";
 
@@ -371,6 +372,7 @@ export default function ChatWorkspace({
   const launchCourseRef = useRef<string | null>(null);
   const launchIntentAppliedRef = useRef(false);
   const courseDefaultsAppliedRef = useRef(false);
+  const workspaceDefaultsAppliedRef = useRef(new Set<string>());
   useEffect(() => {
     void listCourses()
       .then(setCourses)
@@ -1306,6 +1308,46 @@ export default function ChatWorkspace({
     const pruned = selected.filter((name) => availableKbNames.has(name));
     if (pruned.length !== selected.length) setKBs(pruned);
   }, [availableKbNames, knowledgeBasesLoaded, state.knowledgeBases, setKBs]);
+
+  // An explicit workspace KB assignment is both the workspace's retrieval
+  // allowlist and the starting scope for each new conversation in it. Apply it
+  // once per draft: after that the learner owns the selector and may clear or
+  // replace the defaults without this effect putting them back. Existing
+  // conversations retain their durable session preference. Course launches
+  // are more specific and keep their own material defaults.
+  useEffect(() => {
+    const key = state.sessionKey;
+    if (
+      workspaceDefaultsAppliedRef.current.has(key) ||
+      sessionIdParam ||
+      state.sessionId ||
+      hasMessages ||
+      !knowledgeBasesLoaded ||
+      !activeWorkspace ||
+      searchParams.get("course")?.trim()
+    ) {
+      return;
+    }
+
+    const assigned = activeWorkspace.resources?.knowledge_bases;
+    if (assigned === undefined || assigned === null) return;
+
+    workspaceDefaultsAppliedRef.current.add(key);
+    if (state.knowledgeBases.length) return;
+    const defaults = workspaceKnowledgeDefaults(activeWorkspace, knowledgeBases);
+    if (defaults.length) setKBs(defaults);
+  }, [
+    activeWorkspace,
+    hasMessages,
+    knowledgeBases,
+    knowledgeBasesLoaded,
+    searchParams,
+    sessionIdParam,
+    setKBs,
+    state.knowledgeBases.length,
+    state.sessionId,
+    state.sessionKey,
+  ]);
 
   const refreshUserEnabledTools = useCallback(
     async (options?: { force?: boolean }) => {

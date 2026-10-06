@@ -4788,6 +4788,7 @@
   "{{resource}} assignment mode": "{{resource}}分配方式",
   "Inherit available resources": "继承原有可用资源",
   "Only selected resources": "仅使用所选资源",
+  "Selected knowledge bases are automatically selected in new conversations for this workspace.": "所选知识库会在此工作区的新对话中自动选中。",
   "Manage library": "管理资源库",
   "Keeps existing access rules. Newly available resources are included automatically.": "沿用原有访问规则，无需逐项分配。知识库保留该空间原有的可用范围。",
   "Loading resources…": "正在加载资源…",

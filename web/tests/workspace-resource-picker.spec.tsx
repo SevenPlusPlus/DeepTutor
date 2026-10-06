@@ -58,6 +58,20 @@ it('keeps stale selections visible and removable instead of silently enabling ev
   await waitFor(() => expect(screen.getByTestId('policy')).toHaveTextContent('"skills":[]'))
 })
 
+it('explains that assigned knowledge bases seed new conversations', async () => {
+  fixture.catalog.mockResolvedValue({ skills: [], mcp: [], knowledge_bases: [] })
+  render(<Picker />)
+  fireEvent.change(screen.getByRole('combobox', { name: 'Knowledge bases assignment mode' }), {
+    target: { value: 'selected' },
+  })
+  expect(
+    screen.getByText(
+      'Selected knowledge bases are automatically selected in new conversations for this workspace.'
+    )
+  ).toBeInTheDocument()
+  await screen.findByText('No resources available. Add resources in Learning Space first.')
+})
+
 it('keeps same-name KB identities distinct while preserving legacy names', () => {
   expect(knowledgeBaseRef({ id: 'account:kb:Math', name: 'Math' })).toBe('account:kb:Math')
   expect(knowledgeBaseRef({ id: 'workspace:ws_a:kb:Math', name: 'Math' })).toBe(

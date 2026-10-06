@@ -5056,6 +5056,7 @@
   "Only administrators can manage providers.": "Seuls les administrateurs peuvent gérer les fournisseurs.",
   "Only new content is saved here. Your existing materials remain visible in all workspaces.": "Seul le nouveau contenu est enregistré ici. Vos documents existants restent visibles dans tous les espaces de travail.",
   "Only selected resources": "Uniquement les ressources sélectionnées",
+  "Selected knowledge bases are automatically selected in new conversations for this workspace.": "Les bases de connaissances sélectionnées sont automatiquement choisies dans les nouvelles conversations de cet espace de travail.",
   "Only the first {{count}} available sections were selected.": "Seules les {{count}} premières sections disponibles ont été sélectionnées.",
   "Open a session and the tutor will read your materials, ask what you already know and how much time you have, then design the outline with you.": "Ouvrez une session et le tuteur lira vos documents, vous demandera ce que vous savez déjà et le temps dont vous disposez, puis concevra le plan avec vous.",
   "Open book": "Ouvrir le livre",

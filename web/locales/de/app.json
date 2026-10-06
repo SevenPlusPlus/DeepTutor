@@ -4788,6 +4788,7 @@
   "{{resource}} assignment mode": "{{resource}}-Zuweisungsmodus",
   "Inherit available resources": "Verfügbare Ressourcen übernehmen",
   "Only selected resources": "Nur ausgewählte Ressourcen",
+  "Selected knowledge bases are automatically selected in new conversations for this workspace.": "Ausgewählte Knowledge Bases werden in neuen Unterhaltungen dieses Arbeitsbereichs automatisch ausgewählt.",
   "Manage library": "Bibliothek verwalten",
   "Keeps existing access rules. Newly available resources are included automatically.": "Behält bestehende Zugriffsregeln bei. Neu verfügbare Ressourcen werden automatisch einbezogen.",
   "Loading resources…": "Ressourcen werden geladen…",

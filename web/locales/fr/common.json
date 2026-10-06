@@ -13,6 +13,7 @@
   "{{resource}} assignment mode": "Mode d'attribution {{resource}}",
   "Inherit available resources": "Hériter des ressources disponibles",
   "Only selected resources": "Uniquement les ressources sélectionnées",
+  "Selected knowledge bases are automatically selected in new conversations for this workspace.": "Les bases de connaissances sélectionnées sont automatiquement choisies dans les nouvelles conversations de cet espace de travail.",
   "Manage library": "Gérer la bibliothèque",
   "Keeps existing access rules. Newly available resources are included automatically.": "Conserve les règles d'accès existantes. Les ressources nouvellement disponibles sont incluses automatiquement.",
   "Loading resources…": "Chargement des ressources…",

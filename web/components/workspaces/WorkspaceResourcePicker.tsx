@@ -103,6 +103,13 @@ export function WorkspaceResourcePicker({
               </p>
             ) : (
               <>
+                {key === 'knowledge_bases' && (
+                  <p className="mt-2 text-xs text-[var(--muted-foreground)]">
+                    {t(
+                      'Selected knowledge bases are automatically selected in new conversations for this workspace.'
+                    )}
+                  </p>
+                )}
                 {!catalog && !error && (
                   <p role="status" className="mt-2 text-xs">
                     {t('Loading resources…')}

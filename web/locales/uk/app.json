@@ -4805,6 +4805,7 @@
   "{{resource}} assignment mode": "Режим призначення {{resource}}",
   "Inherit available resources": "Успадковувати доступні ресурси",
   "Only selected resources": "Лише вибрані ресурси",
+  "Selected knowledge bases are automatically selected in new conversations for this workspace.": "Вибрані бази знань автоматично вибираються в нових розмовах цього робочого простору.",
   "Manage library": "Керувати бібліотекою",
   "Keeps existing access rules. Newly available resources are included automatically.": "Зберігає існуючі правила доступу. Нові доступні ресурси включаються автоматично.",
   "Loading resources…": "Завантаження ресурсів…",

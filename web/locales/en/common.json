@@ -13,6 +13,7 @@
   "{{resource}} assignment mode": "{{resource}} assignment mode",
   "Inherit available resources": "Inherit available resources",
   "Only selected resources": "Only selected resources",
+  "Selected knowledge bases are automatically selected in new conversations for this workspace.": "Selected knowledge bases are automatically selected in new conversations for this workspace.",
   "Manage library": "Manage library",
   "Keeps existing access rules. Newly available resources are included automatically.": "Keeps existing access rules. Newly available resources are included automatically.",
   "Loading resources…": "Loading resources…",
