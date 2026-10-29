@@ -1,0 +1,15 @@
+{
+  "instance_id": "i-your-instance-id",
+  "host": "203.0.113.10",
+  "region": "cn-hangzhou",
+  "profile": "default",
+  "base": "/opt/deeptutor",
+  "user": "deeptutor-deploy",
+  "service": "deeptutor-ecs.service",
+  "python": "/usr/bin/python3.11",
+  "node": "/usr/local/bin/node",
+  "uv": "/opt/deeptutor/bin/uv",
+  "pip_index": "https://mirrors.aliyun.com/pypi/simple/",
+  "npm_registry": "https://registry.npmmirror.com",
+  "public_url": "https://203.0.113.10:8443"
+}

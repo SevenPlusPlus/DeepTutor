@@ -91,6 +91,56 @@ def test_env_admin_can_log_in_after_first_account_is_created(env_admin):
     assert payload.role == "admin"
 
 
+@pytest.mark.parametrize("has_stored_user", [False, True])
+def test_partner_actor_restores_bootstrap_admin_without_persisting_it(env_admin, has_stored_user):
+    from deeptutor.multi_user.identity import USERS_FILE, save_user
+    from deeptutor.services.partners.interaction import actor_for_account
+
+    if has_stored_user:
+        save_user("student1", "$2b$12$placeholder", role="user")
+    before = USERS_FILE.read_bytes() if USERS_FILE.exists() else None
+
+    actor = actor_for_account("env-admin")
+
+    assert actor is not None
+    assert actor.id == "env-admin" and actor.username == env_admin
+    assert actor.is_admin and actor.scope.kind == "admin"
+    assert (USERS_FILE.read_bytes() if USERS_FILE.exists() else None) == before
+
+
+@pytest.mark.parametrize("credential", ["AUTH_USERNAME", "AUTH_PASSWORD_HASH"])
+def test_partner_actor_rechecks_revoked_bootstrap_credentials(env_admin, monkeypatch, credential):
+    from deeptutor.services import auth as auth_service
+    from deeptutor.services.partners.interaction import actor_for_account
+
+    assert actor_for_account("env-admin") is not None
+    monkeypatch.setattr(auth_service, credential, "")
+
+    assert actor_for_account("env-admin") is None
+
+
+@pytest.mark.parametrize("disabled", [False, True])
+def test_partner_actor_uses_stored_account_over_bootstrap_admin(env_admin, disabled):
+    import json
+
+    from deeptutor.multi_user.identity import USERS_FILE, load_users, save_user
+    from deeptutor.services.partners.interaction import actor_for_account
+
+    record = save_user(env_admin, "$2b$12$adopted", role="admin")
+    if disabled:
+        users = load_users()
+        users[env_admin]["disabled"] = True
+        USERS_FILE.write_text(json.dumps(users), encoding="utf-8")
+
+    assert actor_for_account("env-admin") is None
+    actor = actor_for_account(record["id"])
+    if disabled:
+        assert actor is None
+    else:
+        assert actor is not None and actor.id == record["id"]
+        assert actor.username == env_admin and actor.is_admin
+
+
 def test_env_admin_is_never_written_into_the_user_store(env_admin):
     """The bootstrap admin is an in-memory overlay, not a persisted record.
 

@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="description" content="DeepTutor 错题掌握闭环交互原型：收题、打标、个性化复习、变式验证与掌握关闭。">
+<title>DeepTutor · 错题掌握计划</title>
+<link rel="stylesheet" href="mistake-mastery-assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <a class="brand" href="#today"><span class="brand-mark">d</span>DeepTutor</a>
+  <div class="space-label">我的学习空间</div>
+  <label class="profile"><span class="avatar">禾</span><span><strong id="profile-name">小禾的学习</strong><select id="learner" aria-label="切换演示学段"><option value="7">初中 · 七年级</option><option value="5">小学 · 五年级</option></select></span></label>
+  <div class="nav-caption">每天进步一点</div>
+  <nav id="navigation" aria-label="主要导航">
+    <a href="#today" data-view="today"><i data-icon="CalendarCheck"></i>今日复习<span class="nav-count" id="due-count"></span></a>
+    <a href="#library" data-view="library"><i data-icon="BookOpen"></i>我的错题</a>
+    <a href="#inbox" data-view="inbox"><i data-icon="Camera"></i>微信与拍照<span class="tiny-dot"></span></a>
+    <a href="#mastery" data-view="mastery"><i data-icon="ShieldCheck"></i>掌握档案</a>
+  </nav>
+  <div class="sidebar-note"><i data-icon="Lightbulb"></i><p>错过的题，<br>也是学会的机会。</p></div>
+  <a class="design-link" href="#design" data-view="design"><i data-icon="SlidersHorizontal"></i>看看这份设计</a>
+  <div class="sidebar-foot"><span class="live-dot"></span>静态交互 Demo<button id="reset" aria-label="重置演示" title="重置演示"><i data-icon="RotateCcw"></i></button></div>
+</aside>
+<div class="shell">
+  <header class="topbar"><div class="crumb">个性化学习<span>/</span><strong id="crumb-title">今日复习</strong></div><div class="top-actions"><span>10 月 29 日 · 周四</span><button class="btn small" id="role-toggle"><i data-icon="GraduationCap"></i><span>家长视角</span></button></div></header>
+  <main id="main"></main>
+  <footer class="page-foot"><span>每一次独立思考，都值得被记住。 <a class="text-btn" href="#design">设计说明</a></span><span>演示数据 · 仅本页内存保存 · 刷新重置</span></footer>
+</div>
+<div id="modal-root"></div>
+<div id="toast" role="status" aria-live="polite"></div>
+<script src="mistake-mastery-assets/icons.js"></script>
+<script src="mistake-mastery-assets/weixin.js"></script>
+<script src="mistake-mastery-assets/app.js"></script>
+</body>
+</html>

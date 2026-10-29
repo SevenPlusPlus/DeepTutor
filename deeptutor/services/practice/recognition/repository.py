@@ -42,6 +42,17 @@ class RecognitionJobRepository:
             ).fetchone()
             if active is not None:
                 raise ValueError("A question recognition job is already running")
+            if (
+                conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='photo_inbox_items'"
+                ).fetchone()
+                and conn.execute(
+                    "SELECT 1 FROM photo_inbox_items WHERE workspace_key=? "
+                    "AND status='recognizing' AND lease_until>? LIMIT 1",
+                    (row["workspace_key"], self.clock()),
+                ).fetchone()
+            ):
+                raise ValueError("A photo recognition job is already running")
             conn.execute(
                 """
                 INSERT INTO practice_recognition_jobs(

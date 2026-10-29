@@ -1,0 +1,66 @@
+[
+  {
+    "case": "跨天+变式+延迟验证关闭",
+    "pass": true
+  },
+  {
+    "case": "关闭后进入掌握档案",
+    "pass": true
+  },
+  {
+    "case": "提前抽检正确保留已掌握",
+    "pass": true
+  },
+  {
+    "case": "同技能抽检错误重开",
+    "pass": true
+  },
+  {
+    "case": "看解析后正确不关闭",
+    "pass": true
+  },
+  {
+    "case": "看答案后重新开练仍不计独立",
+    "pass": true
+  },
+  {
+    "case": "进阶新技能失败不重开基础母题",
+    "pass": true
+  },
+  {
+    "case": "标签编辑后可检索并提前练习",
+    "pass": true
+  },
+  {
+    "case": "入库前必须核对确认",
+    "pass": true
+  },
+  {
+    "case": "示例题核对后进入错题与复习",
+    "pass": true
+  },
+  {
+    "case": "模糊题隔离不进入复习",
+    "pass": true
+  },
+  {
+    "case": "重复照片合并保留历史",
+    "pass": true
+  },
+  {
+    "case": "小学与初中题目隔离",
+    "pass": true
+  },
+  {
+    "case": "小学家长协助说明",
+    "pass": true
+  },
+  {
+    "case": "整组复习完成汇总",
+    "pass": true
+  },
+  {
+    "case": "看答案不提交退出后仍保留暴露记录",
+    "pass": true
+  }
+]

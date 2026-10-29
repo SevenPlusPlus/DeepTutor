@@ -22,11 +22,11 @@ Two properties this owes the caller:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import logging
 import secrets
 import threading
 import time
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -296,6 +296,8 @@ async def _persist_token(partner_id: str, outcome: QrOutcome) -> None:
     channels = dict(getattr(existing, "channels", None) or {})
     entry = dict(channels.get(CHANNEL) or {})
     entry["token"] = outcome.token
+    if outcome.bot_id:
+        entry["bot_id"] = outcome.bot_id
     if outcome.base_url:
         entry["base_url"] = outcome.base_url
     entry["enabled"] = True

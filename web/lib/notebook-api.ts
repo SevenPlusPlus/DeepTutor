@@ -1,4 +1,5 @@
 import { apiFetch, apiUrl } from "@/lib/api";
+import { activeWorkspaceId, scopedUrl } from "@/lib/workspace-scope";
 
 // ── Notebooks (file-backed under data/user/workspace/notebook) ──
 //
@@ -199,6 +200,7 @@ export interface NotebookAnswerImage {
 
 export interface NotebookEntry {
   id: number;
+  content_workspace_id?: string;
   session_id: string;
   session_title: string;
   /** Present on servers with independent Question Bank provenance support. */
@@ -215,6 +217,16 @@ export interface NotebookEntry {
   user_answer: string;
   user_answer_images?: NotebookAnswerImage[];
   question_images?: NotebookAnswerImage[];
+  recognition_meta?: {
+    subject?: string;
+    grade?: string;
+    first_uploaded_at?: number;
+    photo_receipt_id?: string;
+    photo_source_channel?: string;
+    photo_partner_id?: string;
+    note?: string;
+    [key: string]: unknown;
+  };
   source: AssessmentSource;
   material_id: string;
   material_title: string;
@@ -245,6 +257,10 @@ export interface NotebookEntry {
     review_count: number;
     last_answer: string | null;
     last_rating: "again" | "hard" | "good" | "easy" | null;
+    version?: number;
+    learning_status?: "open" | "verify" | "closed";
+    paused?: boolean | number;
+    closed_at?: number | null;
   } | null;
 }
 
@@ -324,6 +340,9 @@ export interface NotebookEntryFilter {
   mastery_path_id?: string;
   knowledge_point_id?: string;
   resolved?: boolean;
+  learning_status?: "active" | "open" | "verify" | "closed" | "paused";
+  subject?: string;
+  grade?: string;
   score_trend?: ScoreTrend;
   search?: string;
   sort?: "recent" | "oldest";
@@ -342,6 +361,7 @@ export interface NotebookEntryFilter {
 
 export async function listNotebookEntries(
   filter: NotebookEntryFilter = {},
+  workspaceId = activeWorkspaceId(),
 ): Promise<NotebookEntryListResponse> {
   const params = new URLSearchParams();
   if (filter.mistakes_only) params.set("mistakes_only", "true");
@@ -363,6 +383,9 @@ export async function listNotebookEntries(
     params.set("knowledge_point_id", filter.knowledge_point_id);
   if (filter.resolved !== undefined)
     params.set("resolved", String(filter.resolved));
+  if (filter.learning_status) params.set("learning_status", filter.learning_status);
+  if (filter.subject) params.set("subject", filter.subject);
+  if (filter.grade) params.set("grade", filter.grade);
   if (filter.score_trend) params.set("score_trend", filter.score_trend);
   if (filter.search) params.set("search", filter.search);
   if (filter.sort) params.set("sort", filter.sort);
@@ -371,10 +394,11 @@ export async function listNotebookEntries(
   if (filter.course_id) params.set("course_id", filter.course_id);
   const query = params.toString();
   const response = await apiFetch(
-    apiUrl(`/api/question-notebook/entries${query ? `?${query}` : ""}`),
+    apiUrl(scopedUrl(`/api/question-notebook/entries${query ? `?${query}` : ""}`, workspaceId)),
     { cache: "no-store" },
   );
-  return expectJson<NotebookEntryListResponse>(response);
+  const listing = await expectJson<NotebookEntryListResponse>(response);
+  return { ...listing, items: listing.items.map(item => ({ ...item, content_workspace_id: workspaceId })) };
 }
 
 export async function getNotebookEntry(

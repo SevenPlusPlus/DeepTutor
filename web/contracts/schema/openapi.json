@@ -764,6 +764,17 @@
             "default": "",
             "title": "Search Mode",
             "type": "string"
+          },
+          "storage_workspace_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Storage Workspace Id"
           }
         },
         "required": [
@@ -913,6 +924,55 @@
           "file"
         ],
         "title": "Body_speech_to_text_api_voice_stt_post",
+        "type": "object"
+      },
+      "Body_start_recognition_import_api_question_notebook_practice_import_recognize_post": {
+        "properties": {
+          "course_id": {
+            "default": "",
+            "maxLength": 200,
+            "title": "Course Id",
+            "type": "string"
+          },
+          "file": {
+            "contentMediaType": "application/octet-stream",
+            "title": "File",
+            "type": "string"
+          },
+          "target": {
+            "default": "bank",
+            "enum": [
+              "bank",
+              "mistakes"
+            ],
+            "title": "Target",
+            "type": "string"
+          }
+        },
+        "required": [
+          "file"
+        ],
+        "title": "Body_start_recognition_import_api_question_notebook_practice_import_recognize_post",
+        "type": "object"
+      },
+      "Body_supplement_photo_api_question_notebook_practice_photo_inbox__item_id__supplement_post": {
+        "properties": {
+          "expected_version": {
+            "minimum": 1.0,
+            "title": "Expected Version",
+            "type": "integer"
+          },
+          "file": {
+            "contentMediaType": "application/octet-stream",
+            "title": "File",
+            "type": "string"
+          }
+        },
+        "required": [
+          "expected_version",
+          "file"
+        ],
+        "title": "Body_supplement_photo_api_question_notebook_practice_photo_inbox__item_id__supplement_post",
         "type": "object"
       },
       "Body_upload_avatar_api_auth_profile_avatar_put": {
@@ -2034,6 +2094,29 @@
           "knowledge_base_id"
         ],
         "title": "ConnectImaRequest",
+        "type": "object"
+      },
+      "ConnectKiwixRequest": {
+        "properties": {
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "server_url": {
+            "title": "Server Url",
+            "type": "string"
+          },
+          "zim_name": {
+            "title": "Zim Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "server_url",
+          "zim_name",
+          "name"
+        ],
+        "title": "ConnectKiwixRequest",
         "type": "object"
       },
       "ConnectLightRagServerRequest": {
@@ -3538,6 +3621,58 @@
         "title": "ExportDocxRequest",
         "type": "object"
       },
+      "ExposureRequest": {
+        "properties": {
+          "kind": {
+            "enum": [
+              "hint",
+              "answer"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "request_id": {
+            "maxLength": 100,
+            "minLength": 16,
+            "pattern": "^[a-zA-Z0-9_-]+$",
+            "title": "Request Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "request_id",
+          "kind"
+        ],
+        "title": "ExposureRequest",
+        "type": "object"
+      },
+      "ExposureResult": {
+        "properties": {
+          "entry_id": {
+            "title": "Entry Id",
+            "type": "integer"
+          },
+          "exposed_at": {
+            "title": "Exposed At",
+            "type": "number"
+          },
+          "kind": {
+            "enum": [
+              "hint",
+              "answer"
+            ],
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "entry_id",
+          "kind",
+          "exposed_at"
+        ],
+        "title": "ExposureResult",
+        "type": "object"
+      },
       "FetchModelsPayload": {
         "properties": {
           "api_format": {
@@ -4265,6 +4400,24 @@
         "title": "InvidiousSettings",
         "type": "object"
       },
+      "KiwixConnectionRequest": {
+        "properties": {
+          "server_url": {
+            "title": "Server Url",
+            "type": "string"
+          },
+          "zim_name": {
+            "title": "Zim Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "server_url",
+          "zim_name"
+        ],
+        "title": "KiwixConnectionRequest",
+        "type": "object"
+      },
       "KnowledgeBaseInfo": {
         "properties": {
           "assigned": {
@@ -4381,6 +4534,25 @@
           "statistics"
         ],
         "title": "KnowledgeBaseInfo",
+        "type": "object"
+      },
+      "KnowledgeMovePayload": {
+        "properties": {
+          "source_id": {
+            "minLength": 1,
+            "title": "Source Id",
+            "type": "string"
+          },
+          "target_workspace_id": {
+            "default": "",
+            "title": "Target Workspace Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_id"
+        ],
+        "title": "KnowledgeMovePayload",
         "type": "object"
       },
       "KnowledgePointInput": {
@@ -4717,6 +4889,25 @@
           }
         },
         "title": "LearningCaptureUpdateRequest",
+        "type": "object"
+      },
+      "LearningUpdateRequest": {
+        "properties": {
+          "paused": {
+            "title": "Paused",
+            "type": "boolean"
+          },
+          "version": {
+            "minimum": 0.0,
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "version",
+          "paused"
+        ],
+        "title": "LearningUpdateRequest",
         "type": "object"
       },
       "LightRagConfigUpdate": {
@@ -5545,6 +5736,42 @@
         "title": "MasteryCardSkip",
         "type": "object"
       },
+      "MasteryDetails": {
+        "properties": {
+          "decisions": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Decisions",
+            "type": "array"
+          },
+          "evidence": {
+            "additionalProperties": true,
+            "title": "Evidence",
+            "type": "object"
+          },
+          "history": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "History",
+            "type": "array"
+          },
+          "state": {
+            "additionalProperties": true,
+            "title": "State",
+            "type": "object"
+          }
+        },
+        "required": [
+          "state",
+          "evidence"
+        ],
+        "title": "MasteryDetails",
+        "type": "object"
+      },
       "MaterialDetail": {
         "properties": {
           "annotation_count": {
@@ -6222,6 +6449,11 @@
             "title": "Ai Judgment",
             "type": "string"
           },
+          "answer_origin": {
+            "default": "",
+            "title": "Answer Origin",
+            "type": "string"
+          },
           "assessment_type": {
             "default": "",
             "title": "Assessment Type",
@@ -6265,6 +6497,11 @@
           "correct_answer": {
             "default": "",
             "title": "Correct Answer",
+            "type": "string"
+          },
+          "course_id": {
+            "default": "",
+            "title": "Course Id",
             "type": "string"
           },
           "created_at": {
@@ -6375,10 +6612,24 @@
             "title": "Question Id",
             "type": "string"
           },
+          "question_images": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/AnswerImageItem"
+            },
+            "title": "Question Images",
+            "type": "array"
+          },
           "question_type": {
             "default": "",
             "title": "Question Type",
             "type": "string"
+          },
+          "recognition_meta": {
+            "additionalProperties": true,
+            "default": {},
+            "title": "Recognition Meta",
+            "type": "object"
           },
           "resolved": {
             "default": false,
@@ -6458,6 +6709,12 @@
             ],
             "title": "Source",
             "type": "string"
+          },
+          "source_locator": {
+            "additionalProperties": true,
+            "default": {},
+            "title": "Source Locator",
+            "type": "object"
           },
           "turn_id": {
             "default": "",
@@ -6823,6 +7080,110 @@
         "title": "PauseBookRequest",
         "type": "object"
       },
+      "PhotoConfirm": {
+        "properties": {
+          "confirmed": {
+            "default": false,
+            "title": "Confirmed",
+            "type": "boolean"
+          },
+          "drafts": {
+            "anyOf": [
+              {
+                "items": {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                "maxItems": 100,
+                "minItems": 1,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Drafts"
+          },
+          "expected_version": {
+            "minimum": 1.0,
+            "title": "Expected Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "expected_version"
+        ],
+        "title": "PhotoConfirm",
+        "type": "object"
+      },
+      "PhotoRevision": {
+        "properties": {
+          "expected_version": {
+            "minimum": 1.0,
+            "title": "Expected Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "expected_version"
+        ],
+        "title": "PhotoRevision",
+        "type": "object"
+      },
+      "PhotoUpdate": {
+        "properties": {
+          "drafts": {
+            "anyOf": [
+              {
+                "items": {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                "maxItems": 100,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Drafts"
+          },
+          "expected_version": {
+            "minimum": 1.0,
+            "title": "Expected Version",
+            "type": "integer"
+          },
+          "note": {
+            "anyOf": [
+              {
+                "maxLength": 20000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Note"
+          },
+          "subject": {
+            "anyOf": [
+              {
+                "maxLength": 30,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Subject"
+          }
+        },
+        "required": [
+          "expected_version"
+        ],
+        "title": "PhotoUpdate",
+        "type": "object"
+      },
       "PositionInfo": {
         "properties": {
           "locator": {
@@ -7001,6 +7362,16 @@
           "entry": {
             "$ref": "#/components/schemas/NotebookEntryItem"
           },
+          "recommendation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RecommendationMetadata"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "state": {
             "additionalProperties": true,
             "title": "State",
@@ -7012,6 +7383,39 @@
           "state"
         ],
         "title": "PracticeQuestion",
+        "type": "object"
+      },
+      "PracticeRecommendations": {
+        "properties": {
+          "budget_minutes": {
+            "title": "Budget Minutes",
+            "type": "integer"
+          },
+          "estimated_minutes": {
+            "title": "Estimated Minutes",
+            "type": "integer"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/PracticeQuestion"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "unavailable_workspaces": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Unavailable Workspaces",
+            "type": "array"
+          }
+        },
+        "required": [
+          "items",
+          "estimated_minutes",
+          "budget_minutes"
+        ],
+        "title": "PracticeRecommendations",
         "type": "object"
       },
       "PracticeSourceCounts": {
@@ -7044,6 +7448,11 @@
       },
       "PracticeSummary": {
         "properties": {
+          "closed": {
+            "default": 0,
+            "title": "Closed",
+            "type": "integer"
+          },
           "day_end": {
             "title": "Day End",
             "type": "number"
@@ -7067,8 +7476,18 @@
             ],
             "title": "Next Due At"
           },
+          "open": {
+            "default": 0,
+            "title": "Open",
+            "type": "integer"
+          },
           "overdue": {
             "title": "Overdue",
+            "type": "integer"
+          },
+          "paused": {
+            "default": 0,
+            "title": "Paused",
             "type": "integer"
           },
           "reviewed_today": {
@@ -7089,6 +7508,11 @@
             },
             "title": "Unavailable Workspaces",
             "type": "array"
+          },
+          "verify": {
+            "default": 0,
+            "title": "Verify",
+            "type": "integer"
           }
         },
         "required": [
@@ -7982,6 +8406,54 @@
         "title": "RebuildBookRequest",
         "type": "object"
       },
+      "RecognitionStageRequest": {
+        "properties": {
+          "drafts": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "maxItems": 100,
+            "minItems": 1,
+            "title": "Drafts",
+            "type": "array"
+          },
+          "expected_version": {
+            "minimum": 1.0,
+            "title": "Expected Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "expected_version",
+          "drafts"
+        ],
+        "title": "RecognitionStageRequest",
+        "type": "object"
+      },
+      "RecommendationMetadata": {
+        "properties": {
+          "estimated_minutes": {
+            "default": 1,
+            "title": "Estimated Minutes",
+            "type": "integer"
+          },
+          "reasons": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Reasons",
+            "type": "array"
+          },
+          "score": {
+            "default": 0,
+            "title": "Score",
+            "type": "number"
+          }
+        },
+        "title": "RecommendationMetadata",
+        "type": "object"
+      },
       "RegenerateBlockRequest": {
         "properties": {
           "block_id": {
@@ -8268,6 +8740,30 @@
             "title": "Answer",
             "type": "string"
           },
+          "answer_revealed": {
+            "default": false,
+            "title": "Answer Revealed",
+            "type": "boolean"
+          },
+          "attempt_kind": {
+            "default": "original",
+            "enum": [
+              "original",
+              "spotcheck"
+            ],
+            "title": "Attempt Kind",
+            "type": "string"
+          },
+          "auto_grade": {
+            "default": false,
+            "title": "Auto Grade",
+            "type": "boolean"
+          },
+          "hint_used": {
+            "default": false,
+            "title": "Hint Used",
+            "type": "boolean"
+          },
           "rating": {
             "enum": [
               "again",
@@ -8289,6 +8785,12 @@
             "default": false,
             "title": "Self Report",
             "type": "boolean"
+          },
+          "timezone": {
+            "default": "UTC",
+            "maxLength": 100,
+            "title": "Timezone",
+            "type": "string"
           },
           "version": {
             "minimum": 0.0,
@@ -12144,6 +12646,163 @@
         "title": "ValidationError",
         "type": "object"
       },
+      "VariantConfirmRequest": {
+        "properties": {
+          "confirmed": {
+            "default": false,
+            "title": "Confirmed",
+            "type": "boolean"
+          },
+          "draft_id": {
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Draft Id",
+            "type": "string"
+          },
+          "expected_version": {
+            "minimum": 1.0,
+            "title": "Expected Version",
+            "type": "integer"
+          },
+          "question": {
+            "additionalProperties": true,
+            "title": "Question",
+            "type": "object"
+          }
+        },
+        "required": [
+          "draft_id",
+          "expected_version",
+          "question"
+        ],
+        "title": "VariantConfirmRequest",
+        "type": "object"
+      },
+      "VariantDraft": {
+        "properties": {
+          "correct_answer": {
+            "title": "Correct Answer",
+            "type": "string"
+          },
+          "difficulty": {
+            "title": "Difficulty",
+            "type": "string"
+          },
+          "draft_id": {
+            "title": "Draft Id",
+            "type": "string"
+          },
+          "entry_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Entry Id"
+          },
+          "explanation": {
+            "title": "Explanation",
+            "type": "string"
+          },
+          "introduces_new_skill": {
+            "title": "Introduces New Skill",
+            "type": "boolean"
+          },
+          "kind": {
+            "enum": [
+              "similar",
+              "advanced"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "knowledge_point": {
+            "title": "Knowledge Point",
+            "type": "string"
+          },
+          "options": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Options",
+            "type": "object"
+          },
+          "parent_entry_id": {
+            "title": "Parent Entry Id",
+            "type": "integer"
+          },
+          "question": {
+            "title": "Question",
+            "type": "string"
+          },
+          "question_type": {
+            "title": "Question Type",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "ready",
+              "confirmed"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "target_skill": {
+            "title": "Target Skill",
+            "type": "string"
+          },
+          "version": {
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "draft_id",
+          "version",
+          "parent_entry_id",
+          "kind",
+          "status",
+          "question",
+          "question_type",
+          "options",
+          "correct_answer",
+          "explanation",
+          "difficulty",
+          "knowledge_point",
+          "target_skill",
+          "introduces_new_skill"
+        ],
+        "title": "VariantDraft",
+        "type": "object"
+      },
+      "VariantGenerateRequest": {
+        "properties": {
+          "kind": {
+            "enum": [
+              "similar",
+              "advanced"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "request_id": {
+            "maxLength": 100,
+            "minLength": 16,
+            "pattern": "^[a-zA-Z0-9_-]+$",
+            "title": "Request Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "request_id",
+          "kind"
+        ],
+        "title": "VariantGenerateRequest",
+        "type": "object"
+      },
       "VideoLearningSettingsRequest": {
         "properties": {
           "default_provider": {
@@ -12639,6 +13298,39 @@
           }
         },
         "title": "YouTubeSettings",
+        "type": "object"
+      },
+      "ZimArticleImportRequest": {
+        "properties": {
+          "article_path": {
+            "maxLength": 2048,
+            "minLength": 1,
+            "title": "Article Path",
+            "type": "string"
+          },
+          "kb_ref": {
+            "maxLength": 300,
+            "minLength": 1,
+            "title": "Kb Ref",
+            "type": "string"
+          },
+          "title": {
+            "default": "",
+            "maxLength": 300,
+            "title": "Title",
+            "type": "string"
+          },
+          "workspace_id": {
+            "default": "",
+            "title": "Workspace Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kb_ref",
+          "article_path"
+        ],
+        "title": "ZimArticleImportRequest",
         "type": "object"
       },
       "deeptutor__api__routers__book__ProgressRequest": {
@@ -20667,6 +21359,84 @@
         ]
       }
     },
+    "/api/knowledge-bases/connect-kiwix": {
+      "post": {
+        "description": "Bind a KB to a kiwix-serve archive; no ingest or index is created.",
+        "operationId": "connect_kiwix_route_api_knowledge_bases_connect_kiwix_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "Authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dt_token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dt Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConnectKiwixRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Connect Kiwix Route Api Knowledge Bases Connect Kiwix Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Connect Kiwix Route",
+        "tags": [
+          "knowledge-bases"
+        ]
+      }
+    },
     "/api/knowledge-bases/connect-lightrag-server": {
       "post": {
         "description": "Connect an external LightRAG server as a retrieval-only knowledge base.\n\nRe-probes server-side (never trusts the client's verdict), then registers a\npointer (``type: lightrag_server``). Retrieval is offloaded to the server's\n``/query`` endpoint — no copy, no local index.",
@@ -21302,6 +22072,186 @@
         ]
       }
     },
+    "/api/knowledge-bases/kiwix-articles": {
+      "get": {
+        "description": "List bounded article matches for Knowledge Center and Reading import.",
+        "operationId": "search_kiwix_articles_api_knowledge_bases_kiwix_articles_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "kb_ref",
+            "required": true,
+            "schema": {
+              "maxLength": 300,
+              "minLength": 1,
+              "title": "Kb Ref",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "q",
+            "required": true,
+            "schema": {
+              "maxLength": 500,
+              "minLength": 1,
+              "title": "Q",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dt_token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dt Token"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Search Kiwix Articles Api Knowledge Bases Kiwix Articles Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Search Kiwix Articles",
+        "tags": [
+          "knowledge-bases"
+        ]
+      }
+    },
+    "/api/knowledge-bases/kiwix-catalog": {
+      "get": {
+        "description": "List exact ZIM names from legacy OPDS; v2 can omit loaded archives.",
+        "operationId": "list_kiwix_catalog_api_knowledge_bases_kiwix_catalog_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "server_url",
+            "required": true,
+            "schema": {
+              "maxLength": 2048,
+              "minLength": 1,
+              "title": "Server Url",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "q",
+            "required": false,
+            "schema": {
+              "default": "",
+              "maxLength": 100,
+              "title": "Q",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dt_token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dt Token"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Kiwix Catalog Api Knowledge Bases Kiwix Catalog Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Kiwix Catalog",
+        "tags": [
+          "knowledge-bases"
+        ]
+      }
+    },
     "/api/knowledge-bases/list-ima": {
       "post": {
         "description": "List IMA knowledge bases without storing or echoing credentials.",
@@ -21521,6 +22471,84 @@
           }
         },
         "summary": "Probe Ima Route",
+        "tags": [
+          "knowledge-bases"
+        ]
+      }
+    },
+    "/api/knowledge-bases/probe-kiwix": {
+      "post": {
+        "description": "Verify that one archive is readable without copying its ZIM file.",
+        "operationId": "probe_kiwix_route_api_knowledge_bases_probe_kiwix_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "Authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dt_token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dt Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/KiwixConnectionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Probe Kiwix Route Api Knowledge Bases Probe Kiwix Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Probe Kiwix Route",
         "tags": [
           "knowledge-bases"
         ]
@@ -25205,6 +26233,88 @@
           }
         },
         "summary": "Upload Files",
+        "tags": [
+          "knowledge-bases"
+        ]
+      }
+    },
+    "/api/knowledge-bases/{kb_name}/visual-assets/{asset_id}": {
+      "get": {
+        "description": "Serve a verified source image from an access checked local KB.",
+        "operationId": "serve_kb_visual_asset_api_knowledge_bases__kb_name__visual_assets__asset_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "kb_name",
+            "required": true,
+            "schema": {
+              "title": "Kb Name",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "asset_id",
+            "required": true,
+            "schema": {
+              "title": "Asset Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dt_token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dt Token"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Serve Kb Visual Asset",
         "tags": [
           "knowledge-bases"
         ]
@@ -39271,6 +40381,46 @@
           },
           {
             "in": "query",
+            "name": "learning_status",
+            "required": false,
+            "schema": {
+              "default": "",
+              "enum": [
+                "",
+                "active",
+                "open",
+                "verify",
+                "closed",
+                "paused"
+              ],
+              "title": "Learning Status",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "subject",
+            "required": false,
+            "schema": {
+              "default": "",
+              "maxLength": 100,
+              "title": "Subject",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "grade",
+            "required": false,
+            "schema": {
+              "default": "",
+              "maxLength": 100,
+              "title": "Grade",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
             "name": "score_trend",
             "required": false,
             "schema": {
@@ -40385,6 +41535,296 @@
         ]
       }
     },
+    "/api/question-notebook/practice/import/recognize": {
+      "get": {
+        "description": "Return the current running or reviewable recognition job, if any.",
+        "operationId": "latest_recognition_import_api_question_notebook_practice_import_recognize_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "Authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dt_token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dt Token"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Latest Recognition Import",
+        "tags": [
+          "practice"
+        ]
+      },
+      "post": {
+        "description": "Start image or PDF recognition without changing the question bank.",
+        "operationId": "start_recognition_import_api_question_notebook_practice_import_recognize_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "Authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dt_token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dt Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_start_recognition_import_api_question_notebook_practice_import_recognize_post"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Start Recognition Import",
+        "tags": [
+          "practice"
+        ]
+      }
+    },
+    "/api/question-notebook/practice/import/recognize/{job_id}": {
+      "get": {
+        "operationId": "recognition_import_status_api_question_notebook_practice_import_recognize__job_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "title": "Job Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dt_token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dt Token"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Recognition Import Status",
+        "tags": [
+          "practice"
+        ]
+      }
+    },
+    "/api/question-notebook/practice/import/recognize/{job_id}/stage": {
+      "post": {
+        "operationId": "stage_recognition_import_api_question_notebook_practice_import_recognize__job_id__stage_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "title": "Job Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dt_token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dt Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RecognitionStageRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Stage Recognition Import",
+        "tags": [
+          "practice"
+        ]
+      }
+    },
     "/api/question-notebook/practice/import/template": {
       "get": {
         "operationId": "import_template_api_question_notebook_practice_import_template_get",
@@ -40457,6 +41897,729 @@
           }
         },
         "summary": "Import Template",
+        "tags": [
+          "practice"
+        ]
+      }
+    },
+    "/api/question-notebook/practice/photo-inbox": {
+      "get": {
+        "operationId": "list_photos_api_question_notebook_practice_photo_inbox_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "subject",
+            "required": false,
+            "schema": {
+              "default": "",
+              "maxLength": 30,
+              "title": "Subject",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "default": "",
+              "maxLength": 30,
+              "title": "Status",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "q",
+            "required": false,
+            "schema": {
+              "default": "",
+              "maxLength": 200,
+              "title": "Q",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "since",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Since"
+            }
+          },
+          {
+            "in": "query",
+            "name": "until",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Until"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Offset",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "all_workspaces",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "All Workspaces",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dt_token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dt Token"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Photos",
+        "tags": [
+          "practice"
+        ]
+      }
+    },
+    "/api/question-notebook/practice/photo-inbox/{item_id}": {
+      "get": {
+        "operationId": "photo_detail_api_question_notebook_practice_photo_inbox__item_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "item_id",
+            "required": true,
+            "schema": {
+              "title": "Item Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dt_token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dt Token"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Photo Detail",
+        "tags": [
+          "practice"
+        ]
+      },
+      "patch": {
+        "operationId": "update_photo_api_question_notebook_practice_photo_inbox__item_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "item_id",
+            "required": true,
+            "schema": {
+              "title": "Item Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dt_token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dt Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PhotoUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Photo",
+        "tags": [
+          "practice"
+        ]
+      }
+    },
+    "/api/question-notebook/practice/photo-inbox/{item_id}/confirm": {
+      "post": {
+        "operationId": "confirm_photo_api_question_notebook_practice_photo_inbox__item_id__confirm_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "item_id",
+            "required": true,
+            "schema": {
+              "title": "Item Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dt_token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dt Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PhotoConfirm"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Confirm Photo",
+        "tags": [
+          "practice"
+        ]
+      }
+    },
+    "/api/question-notebook/practice/photo-inbox/{item_id}/remove": {
+      "post": {
+        "operationId": "remove_photo_api_question_notebook_practice_photo_inbox__item_id__remove_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "item_id",
+            "required": true,
+            "schema": {
+              "title": "Item Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dt_token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dt Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PhotoRevision"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Remove Photo",
+        "tags": [
+          "practice"
+        ]
+      }
+    },
+    "/api/question-notebook/practice/photo-inbox/{item_id}/restore": {
+      "post": {
+        "operationId": "restore_photo_api_question_notebook_practice_photo_inbox__item_id__restore_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "item_id",
+            "required": true,
+            "schema": {
+              "title": "Item Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dt_token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dt Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PhotoRevision"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Restore Photo",
+        "tags": [
+          "practice"
+        ]
+      }
+    },
+    "/api/question-notebook/practice/photo-inbox/{item_id}/retry": {
+      "post": {
+        "operationId": "retry_photo_api_question_notebook_practice_photo_inbox__item_id__retry_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "item_id",
+            "required": true,
+            "schema": {
+              "title": "Item Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dt_token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dt Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PhotoRevision"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Retry Photo",
+        "tags": [
+          "practice"
+        ]
+      }
+    },
+    "/api/question-notebook/practice/photo-inbox/{item_id}/supplement": {
+      "post": {
+        "operationId": "supplement_photo_api_question_notebook_practice_photo_inbox__item_id__supplement_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "item_id",
+            "required": true,
+            "schema": {
+              "title": "Item Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dt_token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dt Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_supplement_photo_api_question_notebook_practice_photo_inbox__item_id__supplement_post"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Supplement Photo",
         "tags": [
           "practice"
         ]
@@ -40618,6 +42781,246 @@
         ]
       }
     },
+    "/api/question-notebook/practice/questions/{entry_id}/exposure": {
+      "post": {
+        "operationId": "record_exposure_api_question_notebook_practice_questions__entry_id__exposure_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "entry_id",
+            "required": true,
+            "schema": {
+              "title": "Entry Id",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dt_token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dt Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExposureRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExposureResult"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Record Exposure",
+        "tags": [
+          "practice"
+        ]
+      }
+    },
+    "/api/question-notebook/practice/questions/{entry_id}/learning": {
+      "post": {
+        "operationId": "update_learning_api_question_notebook_practice_questions__entry_id__learning_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "entry_id",
+            "required": true,
+            "schema": {
+              "title": "Entry Id",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dt_token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dt Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LearningUpdateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Learning",
+        "tags": [
+          "practice"
+        ]
+      }
+    },
+    "/api/question-notebook/practice/questions/{entry_id}/mastery": {
+      "get": {
+        "operationId": "mastery_details_api_question_notebook_practice_questions__entry_id__mastery_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "entry_id",
+            "required": true,
+            "schema": {
+              "title": "Entry Id",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dt_token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dt Token"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MasteryDetails"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Mastery Details",
+        "tags": [
+          "practice"
+        ]
+      }
+    },
     "/api/question-notebook/practice/questions/{entry_id}/review": {
       "post": {
         "operationId": "review_api_question_notebook_practice_questions__entry_id__review_post",
@@ -40695,6 +43098,174 @@
           }
         },
         "summary": "Review",
+        "tags": [
+          "practice"
+        ]
+      }
+    },
+    "/api/question-notebook/practice/questions/{entry_id}/variants/confirm": {
+      "post": {
+        "operationId": "confirm_variant_api_question_notebook_practice_questions__entry_id__variants_confirm_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "entry_id",
+            "required": true,
+            "schema": {
+              "title": "Entry Id",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dt_token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dt Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VariantConfirmRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PracticeQuestion"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Confirm Variant",
+        "tags": [
+          "practice"
+        ]
+      }
+    },
+    "/api/question-notebook/practice/questions/{entry_id}/variants/generate": {
+      "post": {
+        "operationId": "generate_variant_api_question_notebook_practice_questions__entry_id__variants_generate_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "entry_id",
+            "required": true,
+            "schema": {
+              "title": "Entry Id",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dt_token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dt Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VariantGenerateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VariantDraft"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Generate Variant",
         "tags": [
           "practice"
         ]
@@ -40822,6 +43393,184 @@
           }
         },
         "summary": "Queue",
+        "tags": [
+          "practice"
+        ]
+      }
+    },
+    "/api/question-notebook/practice/recommendations": {
+      "get": {
+        "operationId": "recommendations_api_question_notebook_practice_recommendations_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "timezone",
+            "required": false,
+            "schema": {
+              "default": "UTC",
+              "title": "Timezone",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "course_id",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Course Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "category_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Category Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "budget_minutes",
+            "required": false,
+            "schema": {
+              "default": 15,
+              "maximum": 60,
+              "minimum": 5,
+              "title": "Budget Minutes",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "subject",
+            "required": false,
+            "schema": {
+              "default": "",
+              "maxLength": 100,
+              "title": "Subject",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "query",
+            "required": false,
+            "schema": {
+              "default": "",
+              "maxLength": 200,
+              "title": "Query",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "include_early",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Include Early",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "all_workspaces",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "All Workspaces",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "grade",
+            "required": false,
+            "schema": {
+              "default": "",
+              "maxLength": 100,
+              "title": "Grade",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dt_token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dt Token"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PracticeRecommendations"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Recommendations",
         "tags": [
           "practice"
         ]
@@ -41440,6 +44189,84 @@
           }
         },
         "summary": "Import Urls",
+        "tags": [
+          "reading"
+        ]
+      }
+    },
+    "/api/reading/library/import-zim-article": {
+      "post": {
+        "description": "Open one selected Kiwix article in Immersive Reading.\n\nOnly its bounded text snapshot enters the reading store.  The ZIM archive\nstays on the existing kiwix-serve instance, without bulk extraction.",
+        "operationId": "import_zim_article_api_reading_library_import_zim_article_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "Authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dt_token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dt Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ZimArticleImportRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Import Zim Article Api Reading Library Import Zim Article Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Import Zim Article",
         "tags": [
           "reading"
         ]
@@ -52904,6 +55731,160 @@
           }
         },
         "summary": "Preview Workspace Data",
+        "tags": [
+          "workspace-settings"
+        ]
+      }
+    },
+    "/api/settings/workspace/knowledge-bases/move": {
+      "post": {
+        "operationId": "move_knowledge_base_api_settings_workspace_knowledge_bases_move_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "Authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dt_token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dt Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/KnowledgeMovePayload"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Move Knowledge Base Api Settings Workspace Knowledge Bases Move Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Move Knowledge Base",
+        "tags": [
+          "workspace-settings"
+        ]
+      }
+    },
+    "/api/settings/workspace/knowledge-bases/preview-move": {
+      "post": {
+        "operationId": "preview_knowledge_move_api_settings_workspace_knowledge_bases_preview_move_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "Authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dt_token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dt Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/KnowledgeMovePayload"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Preview Knowledge Move Api Settings Workspace Knowledge Bases Preview Move Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Preview Knowledge Move",
         "tags": [
           "workspace-settings"
         ]

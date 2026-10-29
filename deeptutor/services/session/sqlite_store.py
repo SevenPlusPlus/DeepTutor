@@ -195,6 +195,9 @@ class QuestionBankQuery:
     mastery_path_id: str = ""
     knowledge_point_id: str = ""
     resolved: bool | None = None
+    learning_status: str = ""
+    subject: str = ""
+    grade: str = ""
     score_trend: str = ""
     search: str = ""
     course_id: str = ""
@@ -226,6 +229,11 @@ class QuestionBankQuery:
             mastery_path_id=(self.mastery_path_id or "").strip(),
             knowledge_point_id=(self.knowledge_point_id or "").strip(),
             resolved=self.resolved,
+            learning_status=self.learning_status if self.learning_status in {
+                "active", "open", "verify", "closed", "paused"
+            } else "",
+            subject=(self.subject or "").strip()[:100],
+            grade=(self.grade or "").strip()[:100],
             score_trend=(self.score_trend or "").strip()
             if (self.score_trend or "").strip() in SCORE_TRENDS
             else "",
@@ -3638,10 +3646,38 @@ class SQLiteSessionStore:
             )
             """
         )
+        conditions.append(
+            "NOT EXISTS (SELECT 1 FROM practice_variants v "
+            "JOIN notebook_entries parent ON parent.id=v.parent_entry_id "
+            "JOIN sessions ps ON ps.id=parent.session_id "
+            "WHERE v.entry_id=n.id AND ps.deleted_at IS NOT NULL)"
+        )
         if query.mistakes_only:
             conditions.append(
                 "EXISTS (SELECT 1 FROM practice_review_state r WHERE r.entry_id = n.id AND r.is_mistake = 1)"
             )
+        if query.learning_status:
+            learning = "r.entry_id=n.id AND r.is_mistake=1"
+            if query.learning_status == "paused":
+                learning += " AND (r.paused=1 OR (n.resolved=1 AND r.learning_status!='closed'))"
+            elif query.learning_status == "closed":
+                learning += " AND r.learning_status='closed'"
+            else:
+                learning += " AND r.paused=0 AND n.resolved=0"
+                learning += (
+                    " AND NOT EXISTS (SELECT 1 FROM practice_variants v "
+                    "WHERE v.entry_id=n.id AND v.validation_status!='approved')"
+                )
+                if query.learning_status == "active":
+                    learning += " AND r.learning_status IN ('open','verify')"
+                else:
+                    learning += " AND r.learning_status=?"
+                    params.append(query.learning_status)
+            conditions.append(f"EXISTS (SELECT 1 FROM practice_review_state r WHERE {learning})")
+        for field, value in (("subject", query.subject), ("grade", query.grade)):
+            if value:
+                conditions.append(f"json_extract(n.recognition_meta_json, '$.{field}') = ?")
+                params.append(value)
         if query.category_id is not None:
             joins.append(" INNER JOIN notebook_entry_categories ec ON ec.entry_id = n.id")
             conditions.append("ec.category_id = ?")
@@ -3699,24 +3735,44 @@ class SQLiteSessionStore:
             # owns them directly. Conversation-backed questions keep their
             # historical course membership through the matching session ids.
             placeholders = ",".join("?" for _ in (query.session_ids or ())) or "NULL"
-            conditions.append(f"(n.course_id = ? OR n.session_id IN ({placeholders}))")
-            params.append(query.course_id)
-            params.extend(query.session_ids or ())
+            conditions.append(
+                f"(n.course_id = ? OR n.session_id IN ({placeholders}) OR EXISTS ("
+                "SELECT 1 FROM practice_variants v "
+                "JOIN notebook_entries parent ON parent.id=v.parent_entry_id "
+                "WHERE v.entry_id=n.id AND v.validation_status='approved' "
+                f"AND (parent.course_id=? OR parent.session_id IN ({placeholders}))))"
+            )
+            params.extend([
+                query.course_id, *(query.session_ids or ()),
+                query.course_id, *(query.session_ids or ()),
+            ])
         elif query.session_ids is not None:
             # Only the placeholder shape is interpolated; session ids remain
             # bound parameters. ``IN (NULL)`` is the explicit empty-set case.
             placeholders = ",".join("?" for _ in query.session_ids) or "NULL"
-            conditions.append(f"n.session_id IN ({placeholders})")
-            params.extend(query.session_ids)
+            conditions.append(
+                f"(n.session_id IN ({placeholders}) OR EXISTS ("
+                "SELECT 1 FROM practice_variants v "
+                "JOIN notebook_entries parent ON parent.id=v.parent_entry_id "
+                "WHERE v.entry_id=n.id AND v.validation_status='approved' "
+                f"AND parent.session_id IN ({placeholders})))"
+            )
+            params.extend([*query.session_ids, *query.session_ids])
         if query.search:
             # ESCAPE so a learner searching for "50%" or "a_b" gets literal
             # matches instead of the wildcards those characters would be.
-            needle = f"%{_escape_like(query.search)}%"
-            conditions.append(
-                "(n.question LIKE ? ESCAPE '\\' OR n.user_answer LIKE ? ESCAPE '\\' "
-                "OR n.correct_answer LIKE ? ESCAPE '\\' OR n.explanation LIKE ? ESCAPE '\\')"
-            )
-            params.extend([needle] * 4)
+            for token in query.search.split():
+                needle = f"%{_escape_like(token)}%"
+                conditions.append(
+                    "(n.question LIKE ? ESCAPE '\\' OR n.user_answer LIKE ? ESCAPE '\\' "
+                    "OR n.correct_answer LIKE ? ESCAPE '\\' OR n.explanation LIKE ? ESCAPE '\\' "
+                    "OR n.knowledge_point_id LIKE ? ESCAPE '\\' "
+                    "OR json_extract(n.recognition_meta_json, '$.note') LIKE ? ESCAPE '\\' "
+                    "OR EXISTS (SELECT 1 FROM notebook_entry_categories ec "
+                    "JOIN notebook_categories c ON c.id=ec.category_id "
+                    "WHERE ec.entry_id=n.id AND c.name LIKE ? ESCAPE '\\'))"
+                )
+                params.extend([needle] * 7)
 
         join_sql = "".join(joins)
         where_sql = (" WHERE " + " AND ".join(conditions)) if conditions else ""
@@ -3827,6 +3883,9 @@ class SQLiteSessionStore:
         mastery_path_id: str = "",
         knowledge_point_id: str = "",
         resolved: bool | None = None,
+        learning_status: str = "",
+        subject: str = "",
+        grade: str = "",
         score_trend: str = "",
         search: str = "",
         course_id: str = "",
@@ -3851,6 +3910,9 @@ class SQLiteSessionStore:
                 mastery_path_id=mastery_path_id,
                 knowledge_point_id=knowledge_point_id,
                 resolved=resolved,
+                learning_status=learning_status,
+                subject=subject,
+                grade=grade,
                 score_trend=score_trend,
                 search=search,
                 course_id=course_id,

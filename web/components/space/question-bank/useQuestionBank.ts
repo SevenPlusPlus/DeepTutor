@@ -2,6 +2,8 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { notify } from "@/lib/notifications";
+import { getPracticeQuestion, updatePracticeLearning } from "@/lib/practice-api";
+import { activeWorkspaceId } from "@/lib/workspace-scope";
 import {
   addEntryToCategory,
   bulkLinkEntriesToCategory,
@@ -47,6 +49,9 @@ export interface ReviewFilters {
   source: AssessmentSource | "";
   materialId: string;
   scoreTrend: ScoreTrend | "";
+  learningStatus?: "" | "active" | "open" | "verify" | "closed" | "paused";
+  subject?: string;
+  grade?: string;
 }
 
 /**
@@ -66,10 +71,12 @@ export function buildQuestionBankFilter(
     category_id: scope.kind === "category" ? scope.categoryId : undefined,
     uncategorized: scope.kind === "uncategorized" || undefined,
     bookmarked: scope.kind === "bookmarked" ? true : undefined,
-    is_correct: scope.kind === "wrong" || scope.kind === "unresolved" ? false : undefined,
+    is_correct: scope.kind === "wrong" ? false : undefined,
     source: filters.source || undefined,
     material_id: filters.materialId || undefined,
-    resolved: scope.kind === "unresolved" ? false : undefined,
+    learning_status: filters.learningStatus || (scope.kind === "unresolved" ? "active" : undefined),
+    subject: filters.subject || undefined,
+    grade: filters.grade || undefined,
     score_trend: filters.scoreTrend || undefined,
     search: search || undefined,
     sort,
@@ -150,6 +157,7 @@ export function useQuestionBank(
   options: { courseId?: string; mistakesOnly?: boolean } = {},
 ): QuestionBankController {
   const courseId = options.courseId ?? "";
+  const workspaceId = activeWorkspaceId();
   const mistakesOnly = options.mistakesOnly ?? false;
   const [page, setPage] = useState(0);
   const [items, setItems] = useState<NotebookEntry[]>([]);
@@ -158,7 +166,9 @@ export function useQuestionBank(
   const [stats, setStats] = useState<QuestionBankStats>(EMPTY_STATS);
   const [materials, setMaterials] = useState<QuestionBankMaterial[]>([]);
   const [scope, setScopeState] = useState<BankScope>(DEFAULT_SCOPE);
-  const [reviewFilters, setReviewFiltersState] = useState<ReviewFilters>(EMPTY_FILTERS);
+  const [reviewFilters, setReviewFiltersState] = useState<ReviewFilters>({
+    ...EMPTY_FILTERS, learningStatus: mistakesOnly ? "active" : "",
+  });
   const [sort, setSort] = useState<BankSort>("recent");
   const [searchInput, setSearchInput] = useState("");
   const [search, setSearch] = useState("");
@@ -190,7 +200,7 @@ export function useQuestionBank(
         ...buildQuestionBankFilter(scope, reviewFilters, search, sort, courseId),
         mistakes_only: mistakesOnly,
         offset: page * PAGE_SIZE,
-      });
+      }, workspaceId);
       if (seq !== requestSeq.current) return;
       if (response.items.length === 0 && page > 0 && response.total > 0) {
         setPage(value => value - 1);
@@ -217,7 +227,7 @@ export function useQuestionBank(
         setRefreshing(false);
       }
     }
-  }, [courseId, scope, reviewFilters, search, sort, mistakesOnly, page]);
+  }, [courseId, workspaceId, scope, reviewFilters, search, sort, mistakesOnly, page]);
 
   const loadMeta = useCallback(async () => {
     const [nextCategories, nextStats, nextMaterials] = await Promise.allSettled([
@@ -322,12 +332,10 @@ export function useQuestionBank(
 
   const toggleResolved = useCallback(
     async (entry: NotebookEntry) => {
-      const next = !entry.resolved;
+      const paused = !!entry.practice?.paused || entry.resolved;
       return withPending([entry.id], async () => {
-        await updateNotebookEntry(entry.id, { resolved: next });
-        setItems(prev =>
-          prev.map(item => (item.id === entry.id ? { ...item, resolved: next } : item)),
-        );
+        const version = entry.practice?.version ?? (await getPracticeQuestion(entry.id, entry.content_workspace_id)).state.version;
+        await updatePracticeLearning(entry.id, version, !paused, entry.content_workspace_id);
         await refresh();
       });
     },

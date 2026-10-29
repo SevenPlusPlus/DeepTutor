@@ -5,156 +5,151 @@ import { PracticeImport } from "@/components/learning/practice/PracticeImport";
 import { initI18n } from "@/i18n/init";
 import * as api from "@/lib/practice-api";
 
-vi.mock("next/dynamic", () => ({
-  default:
-    () =>
-    ({ content }: { content: string }) => <div>{content}</div>,
-}));
+vi.mock("next/link", () => ({ default: ({ href, children }: { href: string; children: import("react").ReactNode }) => <a href={href}>{children}</a> }));
+vi.mock("next/dynamic", () => ({ default: () => ({ content }: { content: string }) => <div>{content}</div> }));
 vi.mock("@/lib/practice-api", async importOriginal => ({
-  ...(await importOriginal<typeof api>()),
-  getPracticeQuestion: vi.fn(),
-  checkPracticeAnswer: vi.fn(),
-  savePracticeReview: vi.fn(),
-  previewPracticeImport: vi.fn(),
-  startPracticeRecognition: vi.fn(),
-  getCurrentPracticeRecognition: vi.fn(),
-  getPracticeRecognition: vi.fn(),
-  stagePracticeRecognition: vi.fn(),
-  commitPracticeImport: vi.fn(),
-  downloadPracticeTemplate: vi.fn(),
+  ...(await importOriginal<typeof api>()), getPracticeQuestion: vi.fn(), savePracticeReview: vi.fn(),
+  recordPracticeExposure: vi.fn(), previewPracticeImport: vi.fn(), startPracticeRecognition: vi.fn(),
+  getCurrentPracticeRecognition: vi.fn(), getPracticeRecognition: vi.fn(), stagePracticeRecognition: vi.fn(),
+  commitPracticeImport: vi.fn(), downloadPracticeTemplate: vi.fn(),
 }));
 initI18n("en");
 beforeEach(() => {
   vi.clearAllMocks();
   vi.mocked(api.getCurrentPracticeRecognition).mockResolvedValue(null);
+  vi.mocked(api.recordPracticeExposure).mockResolvedValue({ recorded: true });
   vi.mocked(api.getPracticeQuestion).mockResolvedValue({
     entry: {
-      id: 8,
-      session_id: "lesson",
-      session_title: "Lesson",
-      turn_id: "",
-      question_id: "q1",
-      difficulty: "",
-      user_answer: "",
-      source: "deep_question",
-      material_id: "",
-      material_title: "",
-      section_id: "",
-      section_title: "",
-      score_trend: "new",
-      is_correct: false,
-      resolved: false,
-      bookmarked: false,
-      followup_session_id: "",
-      created_at: 100,
-      updated_at: 100,
-      question: "Which ocean?",
-      options: { A: "Pacific", B: "Atlantic" },
-      correct_answer: "B",
-      explanation: "Reference explanation",
-      question_type: "single_choice",
+      id: 8, session_id: "lesson", session_title: "Lesson", turn_id: "", question_id: "q1",
+      difficulty: "", user_answer: "", source: "deep_question", material_id: "", material_title: "",
+      section_id: "", section_title: "", score_trend: "new", is_correct: false, resolved: false,
+      bookmarked: false, followup_session_id: "", created_at: 100, updated_at: 100,
+      question: "Which ocean?", options: { A: "Pacific", B: "Atlantic" }, correct_answer: "B",
+      explanation: "Reference explanation", question_type: "single_choice",
     },
-    state: { version: 2, review_count: 1, is_mistake: true, due_at: 100 },
+    state: { version: 2, review_count: 1, is_mistake: true, due_at: 100, learning_status: "open" },
   });
-  vi.mocked(api.checkPracticeAnswer).mockResolvedValue({ correct: true });
-  vi.mocked(api.savePracticeReview).mockResolvedValue({
-    due_at: 200000,
-    is_mistake: true,
-    correct: true,
-    rating: "good",
-  });
+  vi.mocked(api.savePracticeReview).mockResolvedValue({ due_at: 200000, is_mistake: true, correct: true, rating: "good", learning_status: "verify", closed: false });
 });
 
-it("hides reference answers, waits for the server, and only counts saved reviews", async () => {
-  let finish!: (value: Awaited<ReturnType<typeof api.savePracticeReview>>) => void;
-  vi.mocked(api.savePracticeReview).mockImplementation(
-    () =>
-      new Promise(resolve => {
-        finish = resolve;
-      }),
-  );
+it("persists the attempt before showing feedback and distinguishes correct from mastery", async () => {
+  let finish!: (value: api.PracticeReviewResult) => void;
+  vi.mocked(api.savePracticeReview).mockImplementation(() => new Promise(resolve => { finish = resolve; }));
   render(<PracticeSession ids={[8]} onClose={vi.fn()} />);
-  await screen.findByText("Which ocean?");
+  fireEvent.click(await screen.findByRole("radio", { name: "B Atlantic" }));
   expect(screen.queryByText("Reference explanation")).not.toBeInTheDocument();
-  fireEvent.click(screen.getByRole("radio", { name: "B Atlantic" }));
-  fireEvent.click(screen.getByRole("button", { name: "Check and reveal answer" }));
-  await screen.findByText("Reference explanation");
-  expect(api.checkPracticeAnswer).toHaveBeenCalledWith(8, "B", undefined);
-  fireEvent.click(screen.getByRole("button", { name: "Mastered · Next question" }));
-  expect(screen.queryByText("Practice complete")).not.toBeInTheDocument();
-  expect(screen.getByRole("button", { name: "Mastered · Next question" })).toBeDisabled();
-  await act(async () =>
-    finish({ due_at: 200000, is_mistake: true, correct: true, rating: "good" }),
-  );
+  expect(screen.queryByRole("button", { name: "I have mastered this" })).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Submit and save answer" }));
+  expect(screen.queryByText("Reference explanation")).not.toBeInTheDocument();
+  await act(async () => finish({ due_at: 200000, is_mistake: true, correct: true, rating: "good", learning_status: "verify", closed: false }));
+  expect(await screen.findByText("Correct attempt saved")).toBeInTheDocument();
+  expect(screen.getByText("Reference explanation")).toBeInTheDocument();
+  expect(screen.queryByText("This question reached verified mastery")).not.toBeInTheDocument();
+  expect(api.savePracticeReview).toHaveBeenCalledWith(8, expect.objectContaining({ version: 2, answer: "B", rating: "good", auto_grade: true, answer_revealed: false }), undefined);
+  fireEvent.click(screen.getByRole("button", { name: "Next question" }));
   expect(await screen.findByText("Practice complete")).toBeInTheDocument();
-  expect(api.savePracticeReview).toHaveBeenCalledWith(
-    8,
-    expect.objectContaining({ version: 2, answer: "B", rating: "good" }),
-    undefined,
-  );
+  expect(screen.getByText("0 questions reached verified mastery.")).toBeInTheDocument();
 });
 
-it("keeps a failed save retryable with the same submission ID", async () => {
+it("keeps saved original photos in their owning workspace", async () => {
+  const question = await api.getPracticeQuestion(8);
+  vi.mocked(api.getPracticeQuestion).mockResolvedValue({ ...question, content_workspace_id: "geometry-source", entry: { ...question.entry, question_images: [{ id: "diagram", url: "/files/attachments/photo/diagram/geometry.png", filename: "geometry.png", mime_type: "image/png" }] } });
+  render(<PracticeSession questions={[{ id: 8, content_workspace_id: "geometry-source" }]} onClose={vi.fn()} />);
+  const original = await screen.findByAltText("Saved original photo 1");
+  expect(original).toHaveAttribute("src", "/files/attachments/photo/diagram/geometry.png?dt_workspace=geometry-source");
+  expect(original.closest("a")).toHaveAttribute("href", "/files/attachments/photo/diagram/geometry.png?dt_workspace=geometry-source");
+  expect(screen.queryByText("Reference explanation")).not.toBeInTheDocument();
+});
+
+it("waits for durable exposure recording before showing reference answers", async () => {
+  let finish!: (value: { recorded: boolean }) => void;
+  vi.mocked(api.recordPracticeExposure).mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+  render(<PracticeSession questions={[{ id: 8, content_workspace_id: "source-a" }]} onClose={vi.fn()} />);
+  fireEvent.click(await screen.findByRole("button", { name: "Show reference answer" }));
+  expect(screen.queryByText("Reference explanation")).not.toBeInTheDocument();
+  await act(async () => finish({ recorded: true }));
+  expect(await screen.findByText("Reference explanation")).toBeInTheDocument();
+  expect(api.recordPracticeExposure).toHaveBeenCalledWith(8, expect.any(String), "answer", "source-a");
+  fireEvent.click(screen.getByRole("radio", { name: "B Atlantic" }));
+  fireEvent.click(screen.getByRole("button", { name: "Record corrected answer" }));
+  await screen.findByRole("heading", { name: "Assisted or unverified review" });
+  expect(api.savePracticeReview).toHaveBeenCalledWith(8, expect.objectContaining({ answer_revealed: true }), "source-a");
+});
+
+it("does not reveal answers when exposure recording fails", async () => {
+  vi.mocked(api.recordPracticeExposure).mockRejectedValueOnce(new Error("Exposure unavailable"));
+  render(<PracticeSession ids={[8]} onClose={vi.fn()} />);
+  fireEvent.click(await screen.findByRole("button", { name: "Show reference answer" }));
+  await screen.findByText("Exposure unavailable");
+  expect(screen.queryByText("Reference explanation")).not.toBeInTheDocument();
+});
+
+it("retries a lost submission using the same payload and request ID", async () => {
   vi.mocked(api.savePracticeReview).mockRejectedValueOnce(new Error("Network interrupted"));
   render(<PracticeSession ids={[8]} onClose={vi.fn()} />);
   fireEvent.click(await screen.findByRole("radio", { name: "B Atlantic" }));
-  fireEvent.click(screen.getByRole("button", { name: "Check and reveal answer" }));
-  fireEvent.click(await screen.findByRole("button", { name: "Mastered · Next question" }));
+  fireEvent.click(screen.getByRole("button", { name: "Submit and save answer" }));
   await screen.findByText("Network interrupted");
-  expect(screen.queryByText("Practice complete")).not.toBeInTheDocument();
-  fireEvent.click(screen.getByRole("button", { name: "Mastered · Next question" }));
-  await screen.findByText("Practice complete");
-  expect(vi.mocked(api.savePracticeReview).mock.calls[0]).toEqual(
-    vi.mocked(api.savePracticeReview).mock.calls[1],
-  );
+  expect(screen.queryByText("Reference explanation")).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Retry submission" }));
+  await screen.findByText("Correct attempt saved");
+  expect(vi.mocked(api.savePracticeReview).mock.calls[0]).toEqual(vi.mocked(api.savePracticeReview).mock.calls[1]);
 });
 
-it("does not allow a success rating when the server marked the answer wrong", async () => {
-  vi.mocked(api.checkPracticeAnswer).mockResolvedValue({ correct: false });
+it("saves failure without an unbounded same-round retry loop", async () => {
+  vi.mocked(api.savePracticeReview).mockResolvedValue({ due_at: 200, is_mistake: true, correct: false, rating: "again", learning_status: "open" });
   render(<PracticeSession ids={[8]} onClose={vi.fn()} />);
   fireEvent.click(await screen.findByRole("radio", { name: "A Pacific" }));
-  fireEvent.click(screen.getByRole("button", { name: "Check and reveal answer" }));
-  await screen.findByText("Needs another try");
-  expect(screen.queryByRole("button", { name: "Mastered · Next question" })).not.toBeInTheDocument();
-  expect(screen.getByRole("button", { name: "Practice again" })).not.toBeDisabled();
+  fireEvent.click(screen.getByRole("button", { name: "Submit and save answer" }));
+  expect(await screen.findByRole("heading", { name: "Needs another try" })).toBeVisible();
+  fireEvent.click(screen.getByRole("button", { name: "Next question" }));
+  expect(await screen.findByText("Practice complete")).toBeInTheDocument();
+  expect(api.getPracticeQuestion).toHaveBeenCalledTimes(1);
 });
 
-it("requires reloading a stale question instead of retrying its old version", async () => {
-  vi.mocked(api.savePracticeReview).mockRejectedValueOnce(
-    new api.PracticeRequestError("Question changed", 409),
-  );
+it("reloads conflicts instead of retrying the stale version", async () => {
+  vi.mocked(api.savePracticeReview).mockRejectedValueOnce(new api.PracticeRequestError("Question changed", 409));
   render(<PracticeSession ids={[8]} onClose={vi.fn()} />);
   fireEvent.click(await screen.findByRole("radio", { name: "B Atlantic" }));
-  fireEvent.click(screen.getByRole("button", { name: "Check and reveal answer" }));
-  fireEvent.click(await screen.findByRole("button", { name: "Mastered · Next question" }));
+  fireEvent.click(screen.getByRole("button", { name: "Submit and save answer" }));
   fireEvent.click(await screen.findByRole("button", { name: "Reload question" }));
   await waitFor(() => expect(api.getPracticeQuestion).toHaveBeenCalledTimes(2));
   expect(screen.queryByText("Reference explanation")).not.toBeInTheDocument();
 });
 
-it("keeps forgotten questions in the round and removes only mastered questions", async () => {
-  vi.mocked(api.checkPracticeAnswer).mockResolvedValueOnce({ correct: false });
-  vi.mocked(api.savePracticeReview).mockResolvedValueOnce({ due_at: 200, is_mistake: true, correct: false, rating: "again" });
-  render(<PracticeSession questions={[{ id: 8, content_workspace_id: "source-a" }]} onClose={vi.fn()} />);
-  fireEvent.click(await screen.findByRole("radio", { name: "A Pacific" }));
-  fireEvent.click(screen.getByRole("button", { name: "Check and reveal answer" }));
-  fireEvent.click(await screen.findByRole("button", { name: "Practice again" }));
-  await waitFor(() => expect(api.getPracticeQuestion).toHaveBeenCalledTimes(2));
-  expect(screen.getByText("1 remaining")).toBeInTheDocument();
-  expect(screen.queryByText("Practice complete")).not.toBeInTheDocument();
-  fireEvent.click(await screen.findByRole("button", { name: "I have mastered this" }));
-  expect(await screen.findByText("Practice complete")).toBeInTheDocument();
-  expect(api.savePracticeReview).toHaveBeenLastCalledWith(8, expect.objectContaining({ self_report: true, rating: "good" }), "source-a");
-  expect(screen.getByText("0 remaining")).toBeInTheDocument();
-});
-
-it("loads and saves equal question IDs in their own workspaces", async () => {
-  render(<PracticeSession questions={[{ id: 8, content_workspace_id: "" }, { id: 8, content_workspace_id: "other" }]} onClose={vi.fn()} />);
-  fireEvent.click(await screen.findByRole("button", { name: "I have mastered this" }));
-  await waitFor(() => expect(api.getPracticeQuestion).toHaveBeenLastCalledWith(8, "other"));
-  fireEvent.click(await screen.findByRole("button", { name: "I have mastered this" }));
+it("preserves workspace ownership for equal IDs in separate workspaces", async () => {
+  render(<PracticeSession questions={[{ id: 8, content_workspace_id: "" }, { id: 8, content_workspace_id: "other", attempt_kind: "spotcheck" }]} onClose={vi.fn()} />);
+  for (const workspace of ["", "other"]) {
+    fireEvent.click(await screen.findByRole("radio", { name: "B Atlantic" }));
+    fireEvent.click(screen.getByRole("button", { name: "Submit and save answer" }));
+    await screen.findByText("Correct attempt saved");
+    fireEvent.click(screen.getByRole("button", { name: "Next question" }));
+    if (workspace === "") await waitFor(() => expect(api.getPracticeQuestion).toHaveBeenLastCalledWith(8, "other"));
+  }
   await screen.findByText("Practice complete");
   expect(vi.mocked(api.savePracticeReview).mock.calls.map(call => call[2])).toEqual(["", "other"]);
+  expect(api.savePracticeReview).toHaveBeenLastCalledWith(8, expect.objectContaining({ attempt_kind: "spotcheck" }), "other");
+});
+
+it("lets the server grade numeric fill blanks without forcing self-report", async () => {
+  const question = await api.getPracticeQuestion(8);
+  vi.mocked(api.getPracticeQuestion).mockResolvedValue({ ...question, entry: { ...question.entry, options: {}, question_type: "fill_blank", question: "Half plus a quarter?", correct_answer: "3/4" } });
+  render(<PracticeSession ids={[8]} onClose={vi.fn()} />);
+  fireEvent.change(await screen.findByRole("textbox", { name: "Your answer" }), { target: { value: "3/4" } });
+  fireEvent.click(screen.getByRole("button", { name: "Submit and save answer" }));
+  await screen.findByText("Correct attempt saved");
+  expect(api.savePracticeReview).toHaveBeenCalledWith(8, expect.objectContaining({ self_report: false, auto_grade: true, answer: "3/4" }), undefined);
+});
+
+it("counts verified mastery only when the server returns a closure decision", async () => {
+  vi.mocked(api.savePracticeReview).mockResolvedValue({ due_at: 200000, is_mistake: true, correct: true, rating: "good", learning_status: "closed", closed: true, evidence: { spaced: true, transfer: true, delayed: true } });
+  render(<PracticeSession ids={[8]} onClose={vi.fn()} />);
+  fireEvent.click(await screen.findByRole("radio", { name: "B Atlantic" }));
+  fireEvent.click(screen.getByRole("button", { name: "Submit and save answer" }));
+  await screen.findByText("This question reached verified mastery");
+  fireEvent.click(screen.getByRole("button", { name: "Next question" }));
+  await screen.findByText("Practice complete");
+  expect(screen.getByText("1 questions reached verified mastery.")).toBeInTheDocument();
 });
 
 it("previews import errors without committing any rows", async () => {

@@ -4,6 +4,7 @@ Question Notebook API — persists quiz questions, bookmarks, and categories.
 
 from __future__ import annotations
 
+import asyncio
 import base64 as _b64
 from hashlib import sha256 as _sha256
 import logging
@@ -373,6 +374,9 @@ async def list_entries(
     mastery_path_id: str = Query(default="", max_length=500),
     knowledge_point_id: str = Query(default="", max_length=500),
     resolved: bool | None = Query(default=None),
+    learning_status: Literal["", "active", "open", "verify", "closed", "paused"] = "",
+    subject: str = Query(default="", max_length=100),
+    grade: str = Query(default="", max_length=100),
     score_trend: str = Query(default="", pattern="^(new|improved|declined|unchanged)?$"),
     search: str = Query(default="", max_length=200),
     sort: str = Query(default="recent", pattern="^(recent|oldest)$"),
@@ -397,6 +401,9 @@ async def list_entries(
         mastery_path_id=mastery_path_id,
         knowledge_point_id=knowledge_point_id,
         resolved=resolved,
+        learning_status=learning_status,
+        subject=subject,
+        grade=grade,
         score_trend=score_trend,
         search=search,
         sort=sort,
@@ -448,6 +455,10 @@ async def lookup_entry(
 @router.get("/entries/{entry_id}", response_model=NotebookEntryItem)
 async def get_entry(entry_id: int) -> NotebookEntryItem:
     store = get_sqlite_session_store()
+    from deeptutor.services.practice.storage import PracticeStore
+
+    if not await asyncio.to_thread(PracticeStore(store.db_path).is_visible, entry_id):
+        raise HTTPException(status_code=404, detail="Entry not found")
     entry = await store.get_notebook_entry(entry_id)
     if entry is None:
         raise HTTPException(status_code=404, detail="Entry not found")

@@ -6,6 +6,7 @@ import { initI18n } from "@/i18n/init";
 import * as api from "@/lib/practice-api";
 
 const replace = vi.fn();
+vi.mock("next/link", () => ({ default: ({ href, children }: { href: string; children: import("react").ReactNode }) => <a href={href}>{children}</a> }));
 vi.mock("next/navigation", () => ({
   useSearchParams: () => new URLSearchParams("course=course-a&workspace=work-a&view=mistakes"),
   useRouter: () => ({ replace }),
@@ -28,6 +29,7 @@ vi.mock("@/lib/practice-api", async original => ({
   ...(await original<typeof api>()),
   getPracticeSummary: vi.fn(),
   getPracticeAnalytics: vi.fn(),
+  getPracticeRecommendations: vi.fn(),
 }));
 initI18n("en");
 beforeEach(() => {
@@ -49,6 +51,7 @@ beforeEach(() => {
     day_end: 100,
     timezone: "UTC",
   });
+  vi.mocked(api.getPracticeRecommendations).mockResolvedValue({ items: [{ entry: { id: 1, question: "Review one", categories: [] }, state: { version: 0, review_count: 0, is_mistake: true, due_at: 100 } } as unknown as api.PracticeQuestion], estimated_minutes: 3, budget_minutes: 15 });
   vi.mocked(api.getPracticeAnalytics).mockResolvedValue({
     timezone: "UTC",
     days: 30,
@@ -92,7 +95,7 @@ it("retains analytics, daily review and collections in Personalized Learning", a
   expect(screen.getByRole("heading", { level: 1 })).toHaveTextContent("Practice");
   expect(await screen.findByRole("button", { name: /New questions\s*2/ })).toBeVisible();
   expect(screen.getByRole("region", { name: "Today's review" })).toBeVisible();
-  expect(screen.getByRole("button", { name: "Start today's review" })).toBeEnabled();
+  await vi.waitFor(() => expect(screen.getByRole("button", { name: "Start today's review" })).toBeEnabled());
   expect(screen.getByRole("button", { name: "Practice this page" })).toBeVisible();
   fireEvent.click(screen.getByRole("tab", { name: "Question Bank67" }));
   expect(replace).toHaveBeenLastCalledWith(

@@ -42,6 +42,7 @@ __pycache__/
 build/
 develop-eggs/
 dist/
+/deploy/ecs.local.json
 downloads/
 eggs/
 .eggs/

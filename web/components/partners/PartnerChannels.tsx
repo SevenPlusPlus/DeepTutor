@@ -24,6 +24,7 @@ import WeixinQrLogin from "@/components/partners/WeixinQrLogin";
 import ChannelIcon from "@/components/partners/ChannelIcon";
 import ChannelOnboardingPanel from "@/components/partners/ChannelOnboardingPanel";
 import ChannelRuntimeStatus from "@/components/partners/ChannelRuntimeStatus";
+import { WeixinPhotoCollectionSettings } from "@/components/partners/WeixinPhotoCollectionSettings";
 
 const LEGACY_GLOBAL_DELIVERY_KEYS = new Set([
   "send_progress",
@@ -364,9 +365,10 @@ export default function PartnerChannels({
                       onConfirmed={onWeixinConnected}
                     />
                   )}
+                  {activeChannel === "weixin" && <WeixinPhotoCollectionSettings partnerId={partnerId} value={activeValue} onChange={setActiveChannelConfig} />}
                   {Object.entries(
                     (activeEntry.json_schema as JsonSchema).properties ?? {},
-                  ).map(([k, child]) => (
+                  ).filter(([key]) => activeChannel !== "weixin" || !["photo_collection_enabled", "photo_workspace_id", "bot_id"].includes(key)).map(([k, child]) => (
                     <SchemaField
                       key={k}
                       fieldKey={k}

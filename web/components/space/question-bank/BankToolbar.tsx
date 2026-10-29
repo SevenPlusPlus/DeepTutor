@@ -15,6 +15,7 @@ import type {
 } from "@/lib/notebook-api";
 import type { BankSort, ReviewFilters } from "./useQuestionBank";
 import Tooltip from "@/shared/ui/Tooltip";
+import { PHOTO_SUBJECTS } from "@/lib/photo-inbox-api";
 
 interface BankToolbarProps {
   search: string;
@@ -90,6 +91,36 @@ export default function BankToolbar({
         </button>
       </Tooltip>
 
+      <select
+        value={filters.learningStatus ?? ""}
+        onChange={event => onFiltersChange({ ...filters, learningStatus: event.target.value as ReviewFilters["learningStatus"] })}
+        aria-label={t("Learning status")}
+        className="h-[34px] rounded-lg border border-border bg-card px-2 text-xs"
+      >
+        <option value="">{t("All learning states")}</option>
+        <option value="active">{t("Not yet mastered")}</option>
+        <option value="open">{t("Still learning")}</option>
+        <option value="verify">{t("Awaiting verification")}</option>
+        <option value="closed">{t("Verified mastery")}</option>
+        <option value="paused">{t("Paused")}</option>
+      </select>
+      <select
+        value={filters.subject ?? ""}
+        onChange={event => onFiltersChange({ ...filters, subject: event.target.value })}
+        aria-label={t("Subject")}
+        className="h-[34px] rounded-lg border border-border bg-card px-2 text-xs"
+      >
+        <option value="">{t("All subjects")}</option>
+        {Object.entries(PHOTO_SUBJECTS).filter(([value]) => value !== "unclassified").map(([value, label]) => <option key={value} value={value}>{t(label)}</option>)}
+      </select>
+      <input
+        value={filters.grade ?? ""}
+        onChange={event => onFiltersChange({ ...filters, grade: event.target.value })}
+        aria-label={t("Grade filter")}
+        placeholder={t("Grade (optional)")}
+        maxLength={100}
+        className="h-[34px] w-32 rounded-lg border border-border bg-card px-2 text-xs"
+      />
       <select
         value={filters.source}
         onChange={(event) =>

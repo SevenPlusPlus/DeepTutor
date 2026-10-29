@@ -28,11 +28,17 @@ Each question object must contain:
 - explanation: source explanation only, otherwise empty string
 - difficulty: easy, medium, hard, or empty string
 - tags: array of strings explicitly supported by the source, otherwise []
+- subject: best supported subject from chinese, math, english, physics,
+  chemistry, biology, history, geography, politics, other, unclassified;
+  choose unclassified when uncertain. Each question may have a different subject.
 - answer_origin: document or missing
 - source_locator: {page_numbers: [1], bounding_boxes: []}
 - warnings: array of short extraction warnings
 
-Preserve the original language and wording. Extract at most 100 questions."""
+Preserve the original language and wording, including legible handwriting.
+Do not guess obscured or illegible text: include an extraction warning instead.
+Return an empty questions array when the image contains no assessment question.
+Extract at most 100 questions."""
 
 
 class LLMImageQuestionExtractor:

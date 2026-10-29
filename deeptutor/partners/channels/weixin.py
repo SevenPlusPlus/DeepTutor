@@ -11,18 +11,18 @@ from __future__ import annotations
 
 import asyncio
 import base64
-from collections import OrderedDict
-from contextlib import suppress
 import hashlib
 import json
 import os
-from pathlib import Path
 import random
 import re
 import time
+import uuid
+from collections import OrderedDict
+from contextlib import suppress
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote
-import uuid
 
 import httpx
 from loguru import logger
@@ -351,6 +351,15 @@ class WeixinConfig(DeliveryOverrides):
     token: str = ""  # Manually set token, or obtained via QR login
     state_dir: str = ""  # Default: data/partners/{partner_id}/channels/weixin/
     poll_timeout: int = DEFAULT_LONG_POLL_TIMEOUT_S  # seconds for long-poll
+    bot_id: str = Field(default="", description="WeChat account identity, saved during QR login.")
+    photo_collection_enabled: bool = Field(
+        default=False,
+        description="Automatically archive private-chat photos to the linked sender's mistake inbox.",
+    )
+    photo_workspace_id: str = Field(
+        default="",
+        description="Target workspace in the linked sender's account; empty uses their default space.",
+    )
 
 
 class WeixinChannel(BaseChannel):
@@ -390,6 +399,8 @@ class WeixinChannel(BaseChannel):
         self._typing_tickets: dict[str, dict[str, Any]] = {}
         self._context_token_at: dict[str, float] = {}
         self._pending_tool_hints: dict[str, list[str]] = {}
+        self._account_id: str = ""
+        self._inbox = None
 
     # ------------------------------------------------------------------
     # State persistence
@@ -405,6 +416,26 @@ class WeixinChannel(BaseChannel):
         d.mkdir(parents=True, exist_ok=True)
         self._state_dir = d
         return d
+
+    def _durable_inbox(self):
+        from deeptutor.partners.channels.weixin_inbox import WeixinInbox
+
+        if self._inbox is None:
+            self._inbox = WeixinInbox(self._get_state_dir())
+        return self._inbox
+
+    def _channel_account_id(self) -> str:
+        if self.config.bot_id:
+            return self.config.bot_id
+        if not self._account_id:
+            identity_file = self._get_state_dir() / "channel-identity"
+            try:
+                self._account_id = identity_file.read_text().strip()
+            except FileNotFoundError:
+                self._account_id = uuid.uuid4().hex
+                identity_file.write_text(self._account_id)
+                identity_file.chmod(0o600)
+        return self._account_id
 
     def _load_state(self) -> bool:
         """Restore this partner's saved session. Returns True if a token was found.
@@ -423,6 +454,15 @@ class WeixinChannel(BaseChannel):
             return False
         try:
             data = json.loads(state_file.read_text(encoding="utf-8"))
+            previous_bot = str(data.get("bot_id") or "")
+            if self.config.bot_id and previous_bot and self.config.bot_id != previous_bot:
+                # A different QR account must not inherit this account's cursor
+                # or private conversation tokens. Old inbox photos still retain
+                # their frozen owner and can finish archival independently.
+                self._get_updates_buf = ""
+                self._context_tokens = {}
+                self._typing_tickets = {}
+                return bool(self._token or self.config.token)
             if not self.config.token:
                 self._token = data.get("token", "")
             self._get_updates_buf = data.get("get_updates_buf", "")
@@ -461,6 +501,7 @@ class WeixinChannel(BaseChannel):
                 "context_tokens": self._context_tokens,
                 "typing_tickets": self._typing_tickets,
                 "base_url": self.config.base_url,
+                "bot_id": self.config.bot_id,
             }
             state_file.write_text(json.dumps(data, ensure_ascii=False))
 
@@ -652,6 +693,9 @@ class WeixinChannel(BaseChannel):
             await asyncio.sleep(remaining)
             return
 
+        # Recover the previous batch before issuing another long poll. A failed
+        # photo stays in the durable inbox even after its server cursor advances.
+        await self._drain_inbox()
         body: dict[str, Any] = {
             "get_updates_buf": self._get_updates_buf,
             "base_info": BASE_INFO,
@@ -688,19 +732,122 @@ class WeixinChannel(BaseChannel):
         if server_timeout_ms and server_timeout_ms > 0:
             self._next_poll_timeout_s = max(server_timeout_ms // 1000, 5)
 
-        # Update cursor
+        # The cursor acknowledges the entire batch, so every event and its
+        # original owner must be durable before it is advanced.
+        from deeptutor.services.partners.photo_collection import freeze_photo_target
+
+        msgs: list[dict] = data.get("msgs", []) or []
+        self._durable_inbox().capture_batch(
+            msgs,
+            partner_id=self.partner_id,
+            account_id=self._channel_account_id(),
+            freeze_target=lambda message: freeze_photo_target(
+                self.partner_id, self.config, message
+            ),
+        )
         new_buf = data.get("get_updates_buf", "")
         if new_buf:
             self._get_updates_buf = new_buf
             self._save_state()
 
-        # Process messages (WeixinMessage[] from types.ts)
-        msgs: list[dict] = data.get("msgs", []) or []
-        for msg in msgs:
+        await self._drain_inbox()
+
+    async def _drain_inbox(self) -> None:
+        from deeptutor.services.partners.photo_collection import _image_items, ingest_photo
+
+        inbox = self._durable_inbox()
+        account_id = self._channel_account_id()
+        for event in inbox.pending(account_id=account_id):
+            message = event["payload"]
+            sender = str(message.get("from_user_id") or "")
+            if (
+                message.get("message_type") == MESSAGE_TYPE_BOT
+                or not sender
+                or not self.is_allowed(sender)
+            ):
+                inbox.complete(event["event_key"])
+                continue
+            target = event["target"]
+            context_token = str(message.get("context_token") or "")
+            if context_token and target.get("channel_account_id") == account_id:
+                self._context_tokens[sender] = context_token
+                self._context_token_at[sender] = time.time()
+                self._save_state()
+            if not target.get("collect"):
+                try:
+                    await self._process_message(message)
+                    inbox.complete(event["event_key"])
+                except Exception:
+                    inbox.fail(event["event_key"])
+                continue
+            if target.get("error"):
+                error = target["error"]
+                reply = (
+                    "请先在网页伙伴页面获取绑定码，并在微信发送 /link 绑定码，再重新发送题目图片。"
+                    if error == "unlinked"
+                    else "暂时无法访问你的错题库，请检查账号和收题目标空间后重新发送图片。"
+                )
+                inbox.complete(event["event_key"], chat_id=sender, reply=reply)
+                continue
             try:
-                await self._process_message(msg)
+                images = _image_items(message)
+                for media_index, image in images:
+                    path = await self._download_media_item(image, "image")
+                    if not path:
+                        raise OSError("Photo download failed")
+                    try:
+                        sent_at = float(message.get("create_time_ms") or 0) / 1000 or None
+                    except (TypeError, ValueError):
+                        sent_at = None
+                    await ingest_photo(
+                        target=target,
+                        path=path,
+                        received_at=event["received_at"],
+                        source_sent_at=sent_at,
+                        source={
+                            "event_key": f"{event['event_key']}:{media_index}",
+                            "partner_id": self.partner_id,
+                            "channel": "weixin",
+                            "channel_account_id": target["channel_account_id"],
+                            "sender_id": sender,
+                            "message_id": str(
+                                message.get("message_id")
+                                or message.get("seq")
+                                or event["event_key"]
+                            ),
+                            "media_index": media_index,
+                        },
+                    )
+                inbox.complete(
+                    event["event_key"],
+                    chat_id=sender,
+                    reply=f"已保存{len(images)}张题目原图，正在按科目整理。你可以在网页错题库的“微信收题”中查看，核对题干后加入复习。",
+                )
             except Exception:
-                self.logger.exception("Failed to process WeChat message")
+                terminal = inbox.fail(event["event_key"])
+                if terminal:
+                    inbox.enqueue_notification(
+                        event["event_key"],
+                        sender,
+                        "这次图片未完成全部归档，请到网页错题库查看已保存的图片，检查收题空间后重新发送 JPG、PNG、WebP 图片（不超过20MB）。",
+                    )
+                    self.logger.warning("Photo archival stopped after repeated failures")
+                else:
+                    self.logger.warning("Photo archival will retry for a pending WeChat event")
+        for notification in inbox.notifications(account_id):
+            try:
+                await self.send(
+                    OutboundMessage(
+                        channel="weixin",
+                        chat_id=notification["chat_id"],
+                        content=notification["content"],
+                        metadata={"origin_message_id": notification["event_key"]},
+                    )
+                )
+            except Exception:
+                inbox.notification_result(notification["event_key"], False)
+            else:
+                inbox.notification_result(notification["event_key"], True)
 
     # ------------------------------------------------------------------
     # Inbound message processing  (matches inbound.ts + process-message.ts)
@@ -969,9 +1116,8 @@ class WeixinChannel(BaseChannel):
                     )
                     if should_fallback:
                         self.logger.warning(
-                            "media download failed via full_url, falling back to encrypt_query_param: type={} err={}",
+                            "media download failed via full_url, falling back to encrypt_query_param: type={}",
                             media_type,
-                            e,
                         )
                         continue
                     raise
@@ -997,7 +1143,8 @@ class WeixinChannel(BaseChannel):
             return str(file_path)
 
         except Exception:
-            self.logger.exception("Error downloading media")
+            # Transport errors can embed signed URLs and AES credentials.
+            self.logger.warning("Media download failed: type={}", media_type)
             return None
 
     # ------------------------------------------------------------------
@@ -1250,9 +1397,11 @@ class WeixinChannel(BaseChannel):
                         self.logger.exception(
                             "Server error ({} {}) sending media {}",
                             status_code,
-                            http_err.response.reason_phrase
-                            if http_err.response is not None
-                            else "",
+                            (
+                                http_err.response.reason_phrase
+                                if http_err.response is not None
+                                else ""
+                            ),
                             media_path,
                         )
                         raise

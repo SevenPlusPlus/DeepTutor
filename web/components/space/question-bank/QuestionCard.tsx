@@ -1,15 +1,16 @@
 "use client";
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 import MarkdownRenderer from "@/components/common/MarkdownRenderer";
 import Link from "next/link";
 import { useTranslation } from "react-i18next";
 import {
   Bookmark,
-  CheckCheck,
   ExternalLink,
   MessageSquare,
+  Pause,
   RotateCcw,
+  ShieldCheck,
   Trash2,
   X,
 } from "lucide-react";
@@ -19,6 +20,10 @@ import { bookRoute, masterySessionRoute } from "@/lib/learning-routes";
 import CategoryMenu from "./CategoryMenu";
 import { practiceMarkdown } from "@/lib/practice-content";
 import Tooltip from "@/shared/ui/Tooltip";
+import { recordPracticeExposure } from "@/lib/practice-api";
+import { randomUuid } from "@/lib/random-uuid";
+import { activeWorkspaceId } from "@/lib/workspace-scope";
+import { PHOTO_SUBJECTS, type PhotoSubject } from "@/lib/photo-inbox-api";
 
 const SOURCE_LABELS: Record<NotebookEntry["source"], string> = {
   deep_question: "Deep Question",
@@ -106,6 +111,7 @@ interface QuestionCardProps {
   onToggleSelected: () => void;
   onToggleBookmark: () => void;
   onToggleResolved: () => void;
+  onInspect?: () => void;
   onDelete: () => void;
   onFile: (categoryId: number) => Promise<boolean>;
   onUnfile: (categoryId: number) => Promise<boolean>;
@@ -169,20 +175,42 @@ function AnswerBlock({
 export default function QuestionCard({
   entry,
   mistakesOnly = false,
-  collapseAnswers = false,
   categories,
   selected,
   disabled,
   onToggleSelected,
   onToggleBookmark,
   onToggleResolved,
+  onInspect,
   onDelete,
   onFile,
   onUnfile,
   onCreateAndFile,
 }: QuestionCardProps) {
   const { t } = useTranslation();
-  const [answersVisible, setAnswersVisible] = useState(!collapseAnswers);
+  const [answersVisible, setAnswersVisible] = useState(false);
+  const [revealing, setRevealing] = useState(false);
+  const [revealError, setRevealError] = useState("");
+  const revealPending = useRef(false);
+  const exposureId = useRef<string | null>(null);
+  const workspace = useRef(entry.content_workspace_id ?? activeWorkspaceId());
+  const paused = !!entry.practice?.paused || (entry.resolved && entry.practice?.learning_status !== "closed");
+  const verified = entry.practice?.learning_status === "closed";
+  const reviewLabel = verified ? "Verified mastery" : paused ? "Paused" : entry.practice?.learning_status === "verify" ? "Awaiting verification" : "Still learning";
+  async function reveal() {
+    if (answersVisible) { setAnswersVisible(false); return; }
+    if (revealPending.current) return;
+    revealPending.current = true;
+    setRevealing(true);
+    setRevealError("");
+    exposureId.current ??= randomUuid();
+    try {
+      await recordPracticeExposure(entry.id, exposureId.current, "answer", workspace.current);
+      setAnswersVisible(true);
+      exposureId.current = null;
+    } catch (err) { setRevealError(err instanceof Error ? err.message : String(err)); }
+    finally { revealPending.current = false; setRevealing(false); }
+  }
   const options = entry.options || {};
   const hasOptions = Object.keys(options).length > 0;
   const isCode = entry.question_type === "coding";
@@ -268,12 +296,12 @@ export default function QuestionCard({
             {showReviewState && (
               <span
                 className={`rounded-md px-1.5 py-0.5 text-[10px] font-semibold ${
-                  entry.resolved
+                  verified
                     ? "bg-green-100 text-green-700 dark:bg-green-950/30 dark:text-green-400"
                     : "bg-amber-100 text-amber-700 dark:bg-amber-950/30 dark:text-amber-400"
                 }`}
               >
-                {entry.resolved ? t("Resolved") : t("Needs Review")}
+                {t(reviewLabel)}
               </span>
             )}
           </div>
@@ -303,23 +331,24 @@ export default function QuestionCard({
               <Bookmark className="h-3.5 w-3.5" fill={entry.bookmarked ? "currentColor" : "none"} />
             </button>
           </Tooltip>
-          {showReviewState && (
-            <Tooltip label={entry.resolved ? t("Reopen Review") : t("Mark Resolved")}>
+          {onInspect && <Tooltip label={t("Learning history and mastery")}><button type="button" onClick={onInspect} disabled={disabled} aria-label={t("Learning history and mastery")} className="rounded-lg p-1.5 text-muted-foreground hover:bg-muted disabled:opacity-40"><ShieldCheck size={14} /></button></Tooltip>}
+          {showReviewState && !verified && (
+            <Tooltip label={t(paused ? "Resume review" : "Pause review")}>
               <button
                 type="button"
                 onClick={onToggleResolved}
                 disabled={disabled}
-                aria-label={entry.resolved ? t("Reopen Review") : t("Mark Resolved")}
+                aria-label={t(paused ? "Resume review" : "Pause review")}
                 className={`rounded-lg p-1.5 transition-colors disabled:opacity-40 ${
-                  entry.resolved
+                  paused
                     ? "text-green-600 dark:text-green-400"
                     : "text-[var(--muted-foreground)] hover:bg-[var(--muted)]/60 hover:text-[var(--foreground)]"
                 }`}
               >
-                {entry.resolved ? (
+                {paused ? (
                   <RotateCcw className="h-3.5 w-3.5" />
                 ) : (
-                  <CheckCheck className="h-3.5 w-3.5" />
+                  <Pause className="h-3.5 w-3.5" />
                 )}
               </button>
             </Tooltip>
@@ -445,13 +474,14 @@ export default function QuestionCard({
             })}
           </div>
         )}
+        {entry.recognition_meta?.photo_receipt_id && <p className="rounded-lg bg-muted/40 px-3 py-2 text-xs leading-6 text-muted-foreground">{t(entry.recognition_meta.photo_source_channel === "weixin" ? "WeChat question photo" : "Saved question photo")}{entry.recognition_meta.subject && <> · {t(PHOTO_SUBJECTS[entry.recognition_meta.subject as PhotoSubject] ?? entry.recognition_meta.subject)}</>}{entry.recognition_meta.grade && <> · {entry.recognition_meta.grade}</>}{entry.recognition_meta.first_uploaded_at && <> · {t("First received: {{date}}", { date: new Date(entry.recognition_meta.first_uploaded_at * 1000).toLocaleString() })}</>}</p>}
+        {revealError && <p role="alert" className="text-xs text-destructive">{revealError}</p>}
         <details
-          open={collapseAnswers ? undefined : true}
-          onToggle={event => setAnswersVisible(event.currentTarget.open)}
+          open={answersVisible}
           className="space-y-2"
         >
-          <summary className="cursor-pointer py-1 text-xs font-medium text-[var(--muted-foreground)] hover:text-[var(--foreground)]">
-            {t("Answer and explanation")}
+          <summary onClick={event => { event.preventDefault(); void reveal(); }} aria-disabled={revealing} className="cursor-pointer py-1 text-xs font-medium text-[var(--muted-foreground)] hover:text-[var(--foreground)]">
+            {t(revealing ? "Saving answer exposure…" : "Answer and explanation")}
           </summary>
 
           {!hasOptions && (
@@ -573,7 +603,7 @@ export default function QuestionCard({
               </Link>
             )}
           </div>
-          {!!entry.practice?.is_mistake && !entry.resolved && (
+          {!!entry.practice?.is_mistake && !paused && !verified && (
             <span className="text-[var(--muted-foreground)]">
               {t("Next review: {{date}}", {
                 date: new Date(entry.practice.due_at * 1000).toLocaleDateString(),

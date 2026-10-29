@@ -37,20 +37,27 @@ def actor_for_account(user_id: str) -> CurrentUser | None:
 
     Channel traffic carries no session, so an identity established earlier (by
     linking a chat account) has to be reconstituted from the account store on
-    every turn.  Single-user mode has one synthetic ``local-admin`` identity
+    every turn, including the in-memory bootstrap admin accepted by login.
+    Single-user mode has one synthetic ``local-admin`` identity
     that is deliberately absent from that store; restore it only while auth is
     disabled.  A stored user who has since been deleted must still resolve to
     nobody rather than to a scope that no longer belongs to anyone.
     """
-    from deeptutor.multi_user.identity import get_user_by_id
     from deeptutor.multi_user.models import LOCAL_ADMIN_ID
     from deeptutor.multi_user.paths import local_admin_user, scope_for_user
-    from deeptutor.services.auth import AUTH_ENABLED
+    from deeptutor.services.auth import AUTH_ENABLED, _load_users
 
     if user_id == LOCAL_ADMIN_ID and not AUTH_ENABLED:
         return local_admin_user()
 
-    found = get_user_by_id(user_id)
+    found = next(
+        (
+            (username, record)
+            for username, record in _load_users().items()
+            if str(record.get("id") or "") == user_id
+        ),
+        None,
+    )
     if found is None:
         return None
     username, record = found

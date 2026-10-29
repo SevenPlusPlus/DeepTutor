@@ -28,8 +28,10 @@ from deeptutor.services.session import get_sqlite_session_store
 from deeptutor.services.workspace.context import current_workspace_id
 
 from .question_notebook import NotebookEntryItem, _course_session_ids
+from .photo_inbox import router as photo_inbox_router
 
 router = APIRouter()
+router.include_router(photo_inbox_router, prefix="/photo-inbox")
 
 
 class PracticeSummary(BaseModel):
@@ -41,7 +43,17 @@ class PracticeSummary(BaseModel):
     next_due_at: float | None
     day_end: float
     timezone: str
+    open: int = 0
+    verify: int = 0
+    closed: int = 0
+    paused: int = 0
     unavailable_workspaces: list[str] = Field(default_factory=list)
+
+
+class RecommendationMetadata(BaseModel):
+    reasons: list[str] = Field(default_factory=list)
+    score: float = 0
+    estimated_minutes: int = 1
 
 
 class PracticeQuestion(BaseModel):
@@ -49,6 +61,21 @@ class PracticeQuestion(BaseModel):
     state: dict
     content_workspace_id: str = ""
     content_workspace_name: str = ""
+    recommendation: RecommendationMetadata | None = None
+
+
+class PracticeRecommendations(BaseModel):
+    items: list[PracticeQuestion]
+    estimated_minutes: int
+    budget_minutes: int
+    unavailable_workspaces: list[str] = Field(default_factory=list)
+
+
+class MasteryDetails(BaseModel):
+    state: dict[str, Any]
+    evidence: dict[str, Any]
+    history: list[dict[str, Any]] = Field(default_factory=list)
+    decisions: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class PracticeCounts(BaseModel):
@@ -85,6 +112,57 @@ class ReviewRequest(AnswerRequest):
     request_id: str = Field(min_length=16, max_length=100, pattern=r"^[a-zA-Z0-9_-]+$")
     version: int = Field(ge=0)
     rating: Rating
+    auto_grade: bool = False
+    hint_used: bool = False
+    answer_revealed: bool = False
+    attempt_kind: Literal["original", "spotcheck"] = "original"
+    timezone: str = Field(default="UTC", max_length=100)
+
+
+class ExposureRequest(BaseModel):
+    request_id: str = Field(min_length=16, max_length=100, pattern=r"^[a-zA-Z0-9_-]+$")
+    kind: Literal["hint", "answer"]
+
+
+class ExposureResult(BaseModel):
+    entry_id: int
+    kind: Literal["hint", "answer"]
+    exposed_at: float
+
+
+class LearningUpdateRequest(BaseModel):
+    version: int = Field(ge=0)
+    paused: bool
+
+
+class VariantGenerateRequest(BaseModel):
+    request_id: str = Field(min_length=16, max_length=100, pattern=r"^[a-zA-Z0-9_-]+$")
+    kind: Literal["similar", "advanced"]
+
+
+class VariantDraft(BaseModel):
+    draft_id: str
+    version: int
+    parent_entry_id: int
+    kind: Literal["similar", "advanced"]
+    status: Literal["ready", "confirmed"]
+    question: str
+    question_type: str
+    options: dict[str, str]
+    correct_answer: str
+    explanation: str
+    difficulty: str
+    knowledge_point: str
+    target_skill: str
+    introduces_new_skill: bool
+    entry_id: int | None = None
+
+
+class VariantConfirmRequest(BaseModel):
+    draft_id: str = Field(min_length=1, max_length=100)
+    expected_version: int = Field(ge=1)
+    confirmed: bool = False
+    question: dict[str, Any]
 
 
 class CommitRequest(BaseModel):
@@ -149,8 +227,11 @@ async def summary(timezone: str = "UTC", course_id: str = "", all_workspaces: bo
         rows, unavailable = await read_workspace_indexes(read)
         return {
             **{
-                key: sum(row[key] for row in rows)
-                for key in ("total", "mistakes", "due", "overdue", "reviewed_today")
+                key: sum(row.get(key, 0) for row in rows)
+                for key in (
+                    "total", "mistakes", "due", "overdue", "reviewed_today",
+                    "open", "verify", "closed", "paused",
+                )
             },
             "next_due_at": min(
                 (row["next_due_at"] for row in rows if row["next_due_at"]), default=None
@@ -229,6 +310,93 @@ async def queue(
     return questions
 
 
+@router.get("/recommendations", response_model=PracticeRecommendations)
+async def recommendations(
+    timezone: str = "UTC",
+    course_id: str = "",
+    category_id: int | None = None,
+    budget_minutes: int = Query(default=15, ge=5, le=60),
+    subject: str = Query(default="", max_length=100),
+    query: str = Query(default="", max_length=200),
+    include_early: bool = False,
+    limit: int = Query(default=20, ge=1, le=100),
+    all_workspaces: bool = False,
+    grade: str = Query(default="", max_length=100),
+):
+    _validate_timezone(timezone)
+    unavailable = []
+    if all_workspaces and not course_id:
+        from deeptutor.services.workspace.navigation import read_workspace_indexes
+
+        async def read():
+            # Gather candidates before applying the account-wide time budget.
+            result = await recommendations(
+                timezone=timezone, course_id=course_id, category_id=category_id,
+                budget_minutes=60, subject=subject, query=query,
+                include_early=include_early, limit=100, grade=grade,
+            )
+            return result["items"]
+
+        rows, unavailable = await read_workspace_indexes(read)
+    else:
+        store = get_sqlite_session_store()
+        practice = PracticeStore(store.db_path)
+        sessions = await _course_session_ids(store, course_id)
+        ranked = await asyncio.to_thread(
+            practice.recommendations,
+            timezone,
+            sessions,
+            course_id=course_id,
+            category_id=category_id,
+            budget_minutes=budget_minutes,
+            subject=subject,
+            grade=grade,
+            query=query,
+            include_early=include_early,
+            limit=limit,
+        )
+        rows = []
+        for recommendation in ranked:
+            entry_id = recommendation["entry_id"]
+            entry = await store.get_notebook_entry(entry_id)
+            if entry:
+                rows.append({
+                    "entry": entry,
+                    "state": await asyncio.to_thread(practice.state, entry_id),
+                    "content_workspace_id": current_workspace_id(),
+                    "recommendation": {
+                        key: recommendation[key]
+                        for key in ("score", "reasons", "estimated_minutes")
+                    },
+                })
+    chosen, minutes, topics = [], 0, {}
+    while rows and len(chosen) < limit:
+        if all_workspaces and not course_id:
+            # Apply diversity once across the account, rather than sorting
+            # away the per-workspace ranker's topic penalty.
+            def priority(row):
+                entry = row["entry"]
+                topic = entry.get("knowledge_point_id") or entry.get("section_title") or ""
+                return (
+                    -(row["recommendation"]["score"] - 12 * topics.get(topic, 0)),
+                    row.get("content_workspace_id", ""), entry["id"],
+                )
+            rows.sort(key=priority)
+        row = rows.pop(0)
+        duration = row["recommendation"]["estimated_minutes"]
+        if minutes + duration <= budget_minutes:
+            chosen.append(row)
+            minutes += duration
+            topic = row["entry"].get("knowledge_point_id") or row["entry"].get("section_title") or ""
+            topics[topic] = topics.get(topic, 0) + 1
+    return {
+        "items": chosen,
+        "estimated_minutes": minutes,
+        "budget_minutes": budget_minutes,
+        "unavailable_workspaces": unavailable,
+    }
+
+
 @router.get("/analytics", response_model=PracticeAnalytics)
 async def practice_analytics(
     timezone: str = "UTC", days: int = 30, course_id: str = "", all_workspaces: bool = False
@@ -283,7 +451,47 @@ async def practice_question(entry_id: int):
     state = await asyncio.to_thread(
         PracticeStore(get_sqlite_session_store().db_path).state, entry_id
     )
-    return {"entry": entry, "state": state}
+    return {"entry": entry, "state": state, "content_workspace_id": current_workspace_id()}
+
+
+@router.get("/questions/{entry_id}/mastery", response_model=MasteryDetails)
+async def mastery_details(entry_id: int):
+    await _entry(entry_id)
+    return await asyncio.to_thread(
+        PracticeStore(get_sqlite_session_store().db_path).mastery_details, entry_id
+    )
+
+
+@router.post("/questions/{entry_id}/exposure", response_model=ExposureResult)
+async def record_exposure(entry_id: int, payload: ExposureRequest):
+    await _entry(entry_id)
+    try:
+        return await asyncio.to_thread(
+            PracticeStore(get_sqlite_session_store().db_path).expose,
+            entry_id, payload.request_id, payload.kind,
+        )
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ReviewConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@router.post("/questions/{entry_id}/learning")
+async def update_learning(entry_id: int, payload: LearningUpdateRequest):
+    await _entry(entry_id)
+    try:
+        return await asyncio.to_thread(
+            PracticeStore(get_sqlite_session_store().db_path).update_learning,
+            entry_id, payload.version, payload.paused,
+        )
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ReviewConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
 
 
 @router.post("/questions/{entry_id}/check")
@@ -294,6 +502,7 @@ async def check(entry_id: int, payload: AnswerRequest):
 
 @router.post("/questions/{entry_id}/review")
 async def review(entry_id: int, payload: ReviewRequest):
+    _validate_timezone(payload.timezone)
     try:
         return await asyncio.to_thread(
             PracticeStore(get_sqlite_session_store().db_path).review,
@@ -303,7 +512,51 @@ async def review(entry_id: int, payload: ReviewRequest):
             payload.rating,
             payload.answer,
             self_report=payload.self_report,
+            auto_grade=payload.auto_grade,
+            hint_used=payload.hint_used,
+            answer_revealed=payload.answer_revealed,
+            attempt_kind=payload.attempt_kind,
+            timezone=payload.timezone,
         )
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ReviewConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+def _variant_service():
+    from deeptutor.services.practice.variants import VariantService
+
+    return VariantService(get_sqlite_session_store().db_path)
+
+
+@router.post("/questions/{entry_id}/variants/generate", response_model=VariantDraft)
+async def generate_variant(entry_id: int, payload: VariantGenerateRequest):
+    await _entry(entry_id)
+    try:
+        return await _variant_service().generate(entry_id, payload.request_id, payload.kind)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ReviewConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(503, str(exc)) from exc
+
+
+@router.post("/questions/{entry_id}/variants/confirm", response_model=PracticeQuestion)
+async def confirm_variant(entry_id: int, payload: VariantConfirmRequest):
+    await _entry(entry_id)
+    try:
+        child_id = await asyncio.to_thread(
+            _variant_service().confirm,
+            entry_id, payload.draft_id, payload.expected_version, payload.question,
+            confirmed=payload.confirmed,
+        )
+        return await practice_question(child_id)
     except LookupError as exc:
         raise HTTPException(404, str(exc)) from exc
     except ReviewConflict as exc:

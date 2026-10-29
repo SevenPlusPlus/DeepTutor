@@ -13,6 +13,11 @@ import BankToolbar from "./BankToolbar";
 import CategoryManager from "./CategoryManager";
 import QuestionCard from "./QuestionCard";
 import { useQuestionBank } from "./useQuestionBank";
+import { activeWorkspaceId } from "@/lib/workspace-scope";
+import type { PracticeRef } from "@/lib/practice-api";
+import { MasteryDetails } from "@/components/learning/practice/MasteryDetails";
+import { PracticeSession } from "@/components/learning/practice/PracticeSession";
+import { VariantPractice } from "@/components/learning/practice/VariantPractice";
 
 function EmptyState({
   icon: Icon,
@@ -88,12 +93,18 @@ export default function QuestionBankSection({
     };
   }, [courseId]);
   const [managerOpen, setManagerOpen] = useState(false);
+  const [mastery, setMastery] = useState<PracticeRef | null>(null);
+  const [variant, setVariant] = useState<PracticeRef | null>(null);
+  const [practice, setPractice] = useState<PracticeRef | null>(null);
 
   const selectedIds = Array.from(bank.selectedIds);
   const searching = bank.searchInput.trim().length > 0;
+  if (practice) return <PracticeSession questions={[practice]} onClose={() => { setPractice(null); void bank.refresh(); }} />;
+  if (variant) return <VariantPractice reference={variant} onClose={() => setVariant(null)} onPractice={reference => { setVariant(null); setPractice(reference); }} />;
 
   return (
     <div className="space-y-3">
+      {mastery && <MasteryDetails reference={mastery} questionText={bank.items.find(entry => entry.id === mastery.id)?.question} onClose={() => setMastery(null)} onChanged={() => void bank.refresh()} onPractice={reference => { setMastery(null); setPractice(reference); }} onVariant={reference => { setMastery(null); setVariant(reference); }} />}
       {!embedded && (
         <SpaceSectionHeader
           icon={ClipboardList}
@@ -135,7 +146,7 @@ export default function QuestionBankSection({
           <p className="text-sm text-[var(--muted-foreground)]">
             {mistakesOnly
               ? t(
-                  "Mistakes stay here after review. Mark a question resolved to pause its daily reviews.",
+                  "Review evidence decides mastery. Pausing only stops daily recommendations.",
                 )
               : t("Questions from every source, together with your own imports.")}
           </p>
@@ -248,7 +259,7 @@ export default function QuestionBankSection({
           >
             {bank.items.map(entry => (
               <QuestionCard
-                key={entry.id}
+                key={`${entry.content_workspace_id}:${entry.id}`}
                 entry={entry}
                 mistakesOnly={mistakesOnly}
                 collapseAnswers={embedded}
@@ -258,6 +269,7 @@ export default function QuestionBankSection({
                 onToggleSelected={() => bank.toggleSelected(entry.id)}
                 onToggleBookmark={() => void bank.toggleBookmark(entry)}
                 onToggleResolved={() => void bank.toggleResolved(entry)}
+                onInspect={() => setMastery({ id: entry.id, content_workspace_id: entry.content_workspace_id ?? activeWorkspaceId() })}
                 onDelete={() => {
                   if (window.confirm(t("Delete this entry?"))) void bank.removeEntry(entry);
                 }}

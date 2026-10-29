@@ -3,7 +3,7 @@ import test from "node:test";
 
 import { buildQuestionBankFilter } from "@/components/space/question-bank/useQuestionBank";
 
-test("the unresolved view combines wrong answers with review state", () => {
+test("the unresolved view selects active mistakes including reviewed photo imports", () => {
   const filter = buildQuestionBankFilter(
     { kind: "unresolved" },
     { source: "mastery_path", materialId: "path-1", scoreTrend: "declined" },
@@ -15,10 +15,12 @@ test("the unresolved view combines wrong answers with review state", () => {
     category_id: undefined,
     uncategorized: undefined,
     bookmarked: undefined,
-    is_correct: false,
+    is_correct: undefined,
     source: "mastery_path",
     material_id: "path-1",
-    resolved: false,
+    learning_status: "active",
+    subject: undefined,
+    grade: undefined,
     score_trend: "declined",
     search: "equation",
     sort: "oldest",

@@ -4,6 +4,17 @@ from __future__ import annotations
 
 import json
 import re
+from fractions import Fraction
+
+
+def _number(value: str) -> Fraction | None:
+    value = value.strip().replace("−", "-")
+    if not re.fullmatch(r"[+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:/\d+)?", value):
+        return None
+    try:
+        return Fraction(value)
+    except (ValueError, ZeroDivisionError):
+        return None
 
 
 def check_answer(entry: dict, answer: str) -> bool | None:
@@ -11,10 +22,21 @@ def check_answer(entry: dict, answer: str) -> bool | None:
     options = entry.get("options") or json.loads(entry.get("options_json") or "{}")
     expected = str(entry.get("correct_answer") or "").strip()
     if (
-        not options
-        or not expected
+        not expected
         or kind in {"qualitative", "short_answer", "essay", "free_response"}
     ):
+        return None
+
+    if not options:
+        if kind in {"fill_blank", "fill_in_blank"}:
+            number = _number(expected)
+            return None if number is None else _number(answer) == number
+        if kind == "true_false":
+            booleans = {"true": True, "false": False, "正确": True, "错误": False}
+            key = expected.casefold()
+            if key in booleans:
+                actual = answer.strip().casefold()
+                return actual in booleans and booleans[actual] == booleans[key]
         return None
 
     def folded(text: str) -> str:

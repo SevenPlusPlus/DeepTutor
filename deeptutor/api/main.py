@@ -226,6 +226,11 @@ async def lifespan(app: FastAPI):
 
         await stop_web_source_sync_scheduler()
 
+    from deeptutor.services.practice.photo_worker import PhotoIngestionWorker
+
+    photo_worker = PhotoIngestionWorker(application_container._local_users)
+    app.state.photo_ingestion_worker = photo_worker
+
     from deeptutor.runtime.coordination import BackgroundCommandKind
 
     async def _handle_background_command(command) -> None:
@@ -296,12 +301,14 @@ async def lifespan(app: FastAPI):
             _start_cron,
             _start_github_sync,
             _start_web_source_sync,
+            photo_worker.start,
         ],
         stop_callbacks=[
             _stop_partners,
             _stop_cron,
             _stop_github_sync,
             _stop_web_source_sync,
+            photo_worker.stop,
         ],
         recovery_callback=application_container.recover_once,
         control_callback=_handle_background_command,
