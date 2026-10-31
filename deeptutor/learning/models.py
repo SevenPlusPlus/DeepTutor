@@ -4,7 +4,7 @@ from enum import Enum
 import time
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 _KNOWLEDGE_TYPE_LEGACY: dict[str, str] = {
     "记忆型": "memory",
@@ -89,6 +89,9 @@ class KnowledgePoint(BaseModel):
     # Selected non-goal sources that justify this objective. They are curriculum
     # provenance, not proof of factual correctness or retrieval permission.
     topic_source_ids: list[str] = Field(default_factory=list)
+    required_visual_tasks: list[
+        Literal["identification", "relationship", "table_graph", "comparison"]
+    ] = Field(default_factory=list)
 
 
 class LearningModule(BaseModel):
@@ -123,6 +126,7 @@ class QuizAttempt(BaseModel):
     knowledge_point_id: str
     module_id: str = ""
     is_correct: bool
+    result: Literal["correct", "partial", "incorrect"] | None = None
     user_answer: Any = None
     error_type: ErrorType | None = None
     self_attribution: str = ""
@@ -132,6 +136,14 @@ class QuizAttempt(BaseModel):
     # attempts are excluded from mastery, errors, and spaced repetition.
     voided: bool = False
     void_reason: str = ""
+    independent: bool = True
+    visual_context: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _legacy_result(self):
+        if self.result is None:
+            self.result = "correct" if self.is_correct else "incorrect"
+        return self
 
 
 class RetryAttempt(BaseModel):
@@ -178,9 +190,12 @@ class LearningEvidence(BaseModel):
     hints_used: int = 0
     attempt_count: int = 1
     confidence: float | None = None
+    learner_answer: str = ""
+    feedback: str = ""
     response_time: float | None = None
     session_id: str = ""
     turn_id: str = ""
+    visual_context: dict[str, Any] = Field(default_factory=dict)
 
 
 class RepetitionState(BaseModel):
@@ -266,7 +281,49 @@ class PendingQuestion(BaseModel):
     # later instead of a bare right/wrong.
     explanation: str = ""
     difficulty: str = ""
+    # Server-side provenance snapshot; never projected onto an answer card.
+    source_evidence: dict[str, Any] = Field(default_factory=dict)
+    # Server-owned exposure evidence, independent of visual-task metadata.
+    # Never included in the learner's question/answer-key projection.
+    assistance_used: bool = False
+    # Native registration identity; later teaching must not contaminate an
+    # unrelated question merely because it cites the same physical page.
+    assistance_context: dict[str, str] = Field(default_factory=dict)
     created_at: float = Field(default_factory=time.time)
+    visual_context: dict[str, Any] = Field(default_factory=dict)
+    accepted_answers: list[str] = Field(default_factory=list)
+    # One active interaction can present multiple independent questions. The
+    # parent owns lifecycle only; answer keys and credit remain on its leaves.
+    questions: list[PendingQuestion] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _validate_group(self) -> PendingQuestion:
+        if self.question_type != "group":
+            if self.questions:
+                raise ValueError("Only a group may contain questions")
+            return self
+        if not 2 <= len(self.questions) <= 4:
+            raise ValueError("A question group needs two to four questions")
+        ids = [q.question_id for q in self.questions]
+        if len(set(ids)) != len(ids) or self.question_id in ids or not all(ids):
+            raise ValueError("Group question ids must be distinct and nonempty")
+        question_keys = {(q.knowledge_point_id, q.prompt.strip()) for q in self.questions}
+        if len(question_keys) != len(self.questions):
+            raise ValueError(
+                "A group needs distinct questions, not copies of the same objective prompt"
+            )
+        if any(
+            q.question_type not in {"choice", "short", "open"}
+            or q.questions
+            or not q.expected_answer.strip()
+            or not q.prompt.strip()
+            or not q.knowledge_point_id.strip()
+            for q in self.questions
+        ):
+            raise ValueError("Group leaves need independent, non-nested answer contracts")
+        if self.expected_answer or self.options or self.visual_context:
+            raise ValueError("A group parent cannot carry an answer key or visual task")
+        return self
 
     @field_validator("options", mode="before")
     @classmethod
@@ -319,6 +376,7 @@ class MasteryInteraction(BaseModel):
     session_id: str = ""
     turn_id: str = ""
     user_answer: str = ""
+    answers: dict[str, str] = Field(default_factory=dict)
     result: dict[str, Any] = Field(default_factory=dict)
     created_at: float = Field(default_factory=time.time)
     updated_at: float = Field(default_factory=time.time)
@@ -436,6 +494,32 @@ class DeferredObjective(BaseModel):
     created_at: float = Field(default_factory=time.time)
 
 
+class TeachingPreference(BaseModel):
+    """An explicit path-local request, independent of other preferences."""
+
+    model_config = ConfigDict(extra="forbid")
+    text: str = Field(min_length=1, max_length=400)
+    evidence: str = Field(min_length=1, max_length=300)
+    session_id: str = ""
+    turn_id: str = ""
+    updated_at: float = Field(default_factory=time.time)
+
+
+class TeachingObservation(BaseModel):
+    """A teaching attempt or difficulty; never an assessment of mastery."""
+
+    model_config = ConfigDict(extra="forbid")
+    knowledge_point_id: str = Field(min_length=1, max_length=200)
+    text: str = Field(min_length=1, max_length=400)
+    basis: Literal["learner_report", "tentative"] = "tentative"
+    strategy: str = Field(default="", max_length=300)
+    outcome: Literal["unknown", "helped", "not_helped"] = "unknown"
+    evidence: str = Field(default="", max_length=300)
+    session_id: str = ""
+    turn_id: str = ""
+    updated_at: float = Field(default_factory=time.time)
+
+
 class LearnerProfile(BaseModel):
     """Who is learning this goal — collected once, honoured every turn.
 
@@ -469,6 +553,8 @@ class LearnerProfile(BaseModel):
     teaching_strategy: Literal["probe_first", "teach_first"] = "probe_first"
     #: Anything else worth carrying that the four fields above do not hold.
     notes: str = ""
+    teaching_preferences: dict[str, TeachingPreference] = Field(default_factory=dict)
+    teaching_observations: dict[str, TeachingObservation] = Field(default_factory=dict)
     updated_at: float = Field(default_factory=time.time)
 
     def is_empty(self) -> bool:
@@ -481,6 +567,7 @@ class LearnerProfile(BaseModel):
                 self.preferences.strip(),
                 self.teaching_strategy != "probe_first",
                 self.notes.strip(),
+                self.teaching_preferences,
             )
         )
 
@@ -553,6 +640,11 @@ class LearningProgress(BaseModel):
     # The quantitative ``mastery_levels`` gate covers MEMORY / PROCEDURE.
     qualitative_mastery: dict[str, bool] = Field(default_factory=dict)
     knowledge_types: dict[str, KnowledgeType] = Field(default_factory=dict)
+    lesson_evidence: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    source_grounded: bool = False
+    # Exact pages authorized for learner display, kept with the native path.
+    # A private retrieval or lesson packet is not a public exposure receipt.
+    source_exposures: list[dict[str, Any]] = Field(default_factory=list)
     quiz_attempts: list[QuizAttempt] = Field(default_factory=list)
     error_records: list[ErrorRecord] = Field(default_factory=list)
     # Durable review history used to recompute retention. Distinct from
@@ -570,6 +662,7 @@ class LearningProgress(BaseModel):
     # Temporarily skipped objectives. These never count as mastered; routing
     # just prefers any other eligible waypoint until only deferred ones remain.
     deferred_objectives: dict[str, DeferredObjective] = Field(default_factory=dict)
+    explained_objectives: dict[str, dict[str, Any]] = Field(default_factory=dict)
     # A single outstanding question; grading reads its expected answer so the
     # model never has to recall it across turns.
     pending_question: PendingQuestion | None = None

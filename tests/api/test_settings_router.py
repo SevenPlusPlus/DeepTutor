@@ -76,7 +76,7 @@ async def test_ui_languages_are_persisted_independently(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("language", ["fr", "uk"])
+@pytest.mark.parametrize("language", ["fr", "uk", "pl"])
 async def test_ui_settings_persist_supported_languages_independently(
     monkeypatch: pytest.MonkeyPatch, tmp_path, language: str
 ) -> None:
@@ -656,7 +656,8 @@ def test_media_and_voice_provider_choices_include_dashscope() -> None:
         item["base_url"] == "https://dashscope.aliyuncs.com/api/v1" for item in dashscope.values()
     )
     assert dashscope["tts"]["default_model"] == "qwen3-tts-flash"
-    assert dashscope["tts"]["default_voice"] == "Cherry"
+    # Voice IDs are selected explicitly from provider discovery or entered by the user.
+    assert dashscope["tts"]["default_voice"] == ""
     assert dashscope["stt"]["default_model"] == "paraformer-realtime-v2"
     assert dashscope["imagegen"]["default_model"] == "wanx2.1-t2i-turbo"
     assert dashscope["videogen"]["default_model"] == "wanx2.1-t2v-turbo"
@@ -683,6 +684,41 @@ def test_llm_provider_choices_include_cheaperinference() -> None:
     assert llm["cheaperinference"]["base_url"] == "https://api.cheaperinference.com/v1"
 
 
+def test_llm_provider_choices_include_api_route() -> None:
+    llm = {item["value"]: item for item in settings_router._provider_choices()["llm"]}
+
+    assert llm["api_route"]["label"] == "API Route"
+    assert llm["api_route"]["base_url"] == "https://global.api-route.com/v1"
+
+
+def test_llm_provider_choices_include_requesty() -> None:
+    llm = {item["value"]: item for item in settings_router._provider_choices()["llm"]}
+
+    assert llm["requesty"]["label"] == "Requesty"
+    assert llm["requesty"]["base_url"] == "https://router.requesty.ai/v1"
+
+
+def test_llm_provider_choices_include_futureinfra() -> None:
+    llm = {item["value"]: item for item in settings_router._provider_choices()["llm"]}
+
+    assert llm["futureinfra"]["label"] == "FutureInfra"
+    assert llm["futureinfra"]["base_url"] == "https://futureinfra.ai/v1/ai"
+
+
+def test_llm_provider_choices_include_y_api() -> None:
+    llm = {item["value"]: item for item in settings_router._provider_choices()["llm"]}
+
+    assert llm["y_api"]["label"] == "Y-API"
+    assert llm["y_api"]["base_url"] == "https://api.y-api.bestvirtualgoods.com/v1"
+
+
+def test_llm_provider_choices_include_onomeo() -> None:
+    llm = {item["value"]: item for item in settings_router._provider_choices()["llm"]}
+
+    assert llm["onomeo"]["label"] == "onomeo"
+    assert llm["onomeo"]["base_url"] == "https://onomeo.com/v1"
+
+
 def test_llm_provider_choices_include_novita() -> None:
     llm = {item["value"]: item for item in settings_router._provider_choices()["llm"]}
 
@@ -707,6 +743,9 @@ async def test_get_llm_options_returns_redacted_catalog(monkeypatch: pytest.Monk
         embedding_base_url="https://emb.example/v1/embeddings",
         embedding_api_key="emb-key",
     )
+    # A catalog declaration must win over the provider table: gpt-4o-mini is
+    # vision-capable by default, so only a declared False can reach the API.
+    catalog["services"]["llm"]["profiles"][0]["models"][0]["capabilities"] = {"vision": False}
     service = _FakeCatalogService(catalog)
     monkeypatch.setattr(settings_router, "get_model_catalog_service", lambda: service)
 
@@ -717,6 +756,8 @@ async def test_get_llm_options_returns_redacted_catalog(monkeypatch: pytest.Monk
         "model_id": "llm-model-default",
     }
     assert response["options"][0]["model"] == "gpt-4o-mini"
+    # The Document Parsing model dropdown filters on this field (#2037).
+    assert response["options"][0]["supports_vision"] is False
     assert "api_key" not in response["options"][0]
     assert "base_url" not in response["options"][0]
 
@@ -844,6 +885,75 @@ async def test_apply_catalog_invalidates_runtime_caches(monkeypatch: pytest.Monk
     assert new_llm_client.config.base_url == "https://after-apply-llm.example/v1"
     assert new_embedding_client is not old_embedding_client
     assert new_embedding_client.config.model == "text-embedding-after-apply"
+
+
+@pytest.mark.parametrize("endpoint", ["apply", "catalog"])
+def test_denied_catalog_replace_retains_settings_draft_and_runtime(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, endpoint: str
+) -> None:
+    """#1984: a denied atomic save returns useful HTTP feedback without losing edits."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from deeptutor.services.config import model_catalog
+    from deeptutor.services.config.settings_draft import SettingsDraftService
+
+    service = model_catalog.ModelCatalogService(tmp_path / "model_catalog.json")
+    current = service.save(
+        _build_catalog(
+            llm_model="gpt-test",
+            llm_base_url="https://llm.example/v1",
+            llm_api_key="test-key",
+            embedding_model="embedding-test",
+            embedding_base_url="https://embedding.example/v1",
+            embedding_api_key="test-key",
+        )
+    )
+    proposed = deepcopy(current)
+    proposed["services"]["llm"]["profiles"][0]["name"] = "Unapplied change"
+    draft = SettingsDraftService(tmp_path / "settings_draft.json")
+    draft.save({"catalog": proposed})
+    saved_bytes = service.path.read_bytes()
+    saved_draft = draft.load()
+    monkeypatch.setattr(settings_router, "get_model_catalog_service", lambda: service)
+    monkeypatch.setattr(settings_router, "get_settings_draft_service", lambda: draft)
+    monkeypatch.setattr(settings_router, "_require_settings_admin", lambda: None)
+    resets = []
+    monkeypatch.setattr(llm_client_module, "reset_llm_client", lambda: resets.append("llm"))
+    monkeypatch.setattr(
+        embedding_client_module, "reset_embedding_client", lambda: resets.append("embedding")
+    )
+    original_replace = model_catalog.os.replace
+
+    def denied_replace(source, target):
+        if target == service.path:
+            raise PermissionError(13, "Access denied: private diagnostic", str(target))
+        return original_replace(source, target)
+
+    monkeypatch.setattr(model_catalog.os, "replace", denied_replace)
+    app = FastAPI()
+    app.include_router(settings_router.router, prefix="/api/settings")
+    client = TestClient(app, raise_server_exceptions=False)
+    response = (
+        client.post("/api/settings/apply")
+        if endpoint == "apply"
+        else client.put("/api/settings/catalog", json={"catalog": proposed})
+    )
+
+    assert response.status_code == 503
+    assert "service account" in response.json()["detail"]
+    assert "private diagnostic" not in response.text
+    assert str(tmp_path) not in response.text
+    assert service.path.read_bytes() == saved_bytes
+    assert draft.load() == saved_draft
+    assert resets == []
+    assert not list(tmp_path.glob(".model_catalog.json.*.tmp"))
+
+    # The retained draft remains applicable after the external denial is removed.
+    monkeypatch.setattr(model_catalog.os, "replace", original_replace)
+    assert client.post("/api/settings/apply").status_code == 200
+    assert service.load()["services"]["llm"]["profiles"][0]["name"] == "Unapplied change"
+    assert resets == ["llm", "embedding"]
 
 
 @pytest.mark.asyncio
@@ -1877,3 +1987,10 @@ async def test_voice_math_speak_persists_without_freezing_defaults(
     loaded = settings_router.load_ui_settings()
     assert loaded["voice_math_speak"] is False
     assert loaded["voice_autoplay"] is False
+
+
+def test_llm_provider_choices_include_opper() -> None:
+    llm = {item["value"]: item for item in settings_router._provider_choices()["llm"]}
+
+    assert llm["opper"]["label"] == "Opper"
+    assert llm["opper"]["base_url"] == "https://api.opper.ai/v3/compat"

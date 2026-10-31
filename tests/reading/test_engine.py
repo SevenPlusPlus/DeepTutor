@@ -37,6 +37,7 @@ from deeptutor.reading.extract import (
 )
 from deeptutor.reading.models import parse_text_selectors
 from deeptutor.reading.search import normalise, search_units, terms_of
+from deeptutor.utils.document_images import MAX_INLINE_IMAGE_EDGE
 
 pymupdf = pytest.importorskip("pymupdf")
 
@@ -71,15 +72,37 @@ def _write_epub(path: Path) -> Path:
         )
         archive.writestr(
             "OEBPS/nav.xhtml",
-            """<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops"><body><nav epub:type="toc"><ol><li><a href="chapters/one.xhtml">Part One</a><ol><li><a href="chapters/two.xhtml">Second Chapter</a></li></ol></li></ol></nav></body></html>""",
+            """<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops"><body><nav epub:type="toc"><ol><li><a href="chapters/one.xhtml">Part One</a><ol><li><a href="chapters/one.xhtml#a1">First Topic</a></li><li><a href="chapters/one.xhtml#a2">Second Topic</a></li><li><a href="chapters/two.xhtml">Second Chapter</a></li></ol></li></ol></nav></body></html>""",
         )
         archive.writestr(
             "OEBPS/chapters/one.xhtml",
-            "<html xmlns='http://www.w3.org/1999/xhtml'><head><title>One</title></head><body><h1>First Chapter</h1><p>Alpha source text.</p><script>ignore me</script></body></html>",
+            "<html xmlns='http://www.w3.org/1999/xhtml'><head><title>One</title></head><body><h1>First Chapter</h1><h2 id='a1'>First Topic</h2><p>Alpha source text.</p><h2 id='a2'>Second Topic</h2><script>ignore me</script></body></html>",
         )
         archive.writestr(
             "OEBPS/chapters/two.xhtml",
             "<html xmlns='http://www.w3.org/1999/xhtml'><body><h1>Second Chapter</h1><p>Beta source text.</p></body></html>",
+        )
+    return path
+
+
+def _write_epub2(path: Path) -> Path:
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("mimetype", "application/epub+zip")
+        archive.writestr(
+            "META-INF/container.xml",
+            """<?xml version="1.0"?><container xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>""",
+        )
+        archive.writestr(
+            "content.opf",
+            """<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="book"><manifest><item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/><item id="chapter" href="chapter.xhtml" media-type="application/xhtml+xml"/></manifest><spine toc="ncx"><itemref idref="chapter"/></spine></package>""",
+        )
+        archive.writestr(
+            "toc.ncx",
+            """<?xml version="1.0"?><ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1"><navMap><navPoint id="chapter"><navLabel><text>Legacy Chapter</text></navLabel><content src="chapter.xhtml"/><navPoint id="section"><navLabel><text>Legacy Section</text></navLabel><content src="chapter.xhtml#legacy-section"/></navPoint></navPoint></navMap></ncx>""",
+        )
+        archive.writestr(
+            "chapter.xhtml",
+            "<html xmlns='http://www.w3.org/1999/xhtml'><body><h1>Legacy Chapter</h1><h2 id='legacy-section'>Legacy Section</h2><p>NCX text.</p></body></html>",
         )
     return path
 
@@ -235,17 +258,64 @@ def test_epub_preserves_spine_units_source_hrefs_and_nested_outline(tmp_path: Pa
     assert extraction.has_raw_view is False
     assert extraction.unit == "chapter"
     assert extraction.units == (
-        "First Chapter\nAlpha source text.",
+        "First Chapter\nFirst Topic\nAlpha source text.\nSecond Topic",
         "Second Chapter\nBeta source text.",
     )
     assert [ref.source_href for ref in extraction.unit_refs] == [
         "OEBPS/chapters/one.xhtml",
         "OEBPS/chapters/two.xhtml",
     ]
-    assert [(row.locator, row.title, row.level) for row in extraction.outline] == [
-        (1, "Part One", 1),
-        (2, "Second Chapter", 2),
+    assert [
+        (
+            row.locator,
+            row.title,
+            row.level,
+            row.source_href,
+            row.source_anchor,
+        )
+        for row in extraction.outline
+    ] == [
+        (1, "Part One", 1, "OEBPS/chapters/one.xhtml", ""),
+        (1, "First Topic", 2, "OEBPS/chapters/one.xhtml", "a1"),
+        (1, "Second Topic", 2, "OEBPS/chapters/one.xhtml", "a2"),
+        (2, "Second Chapter", 2, "OEBPS/chapters/two.xhtml", ""),
     ]
+
+
+def test_epub2_ncx_preserves_heading_anchors(tmp_path: Path) -> None:
+    extraction = extract_material(_write_epub2(tmp_path / "legacy.epub"))
+
+    assert [
+        (row.locator, row.title, row.level, row.source_href, row.source_anchor)
+        for row in extraction.outline
+    ] == [
+        (1, "Legacy Chapter", 1, "chapter.xhtml", ""),
+        (1, "Legacy Section", 2, "chapter.xhtml", "legacy-section"),
+    ]
+
+
+def test_existing_epub_outline_is_upgraded_with_source_anchors(
+    store: ReadingStore, tmp_path: Path
+) -> None:
+    manifest = store.ingest(_write_epub(tmp_path / "book.epub"))
+    outline_path = store.root / manifest.source_hash / "outline.json"
+    legacy_rows = [
+        {
+            "locator": row.locator,
+            "title": row.title,
+            "level": row.level,
+            "synthesised": row.synthesised,
+        }
+        for row in store.outline(manifest.material_id)
+    ]
+    outline_path.write_text(json.dumps(legacy_rows), encoding="utf-8")
+
+    upgraded = store.outline(manifest.material_id)
+
+    assert upgraded[1].source_href == "OEBPS/chapters/one.xhtml"
+    assert upgraded[1].source_anchor == "a1"
+    assert upgraded[2].source_anchor == "a2"
+    assert all("source_anchor" in row for row in json.loads(outline_path.read_text()))
 
 
 def test_pptx_slides_become_units_when_the_extractor_marks_them(tmp_path: Path) -> None:
@@ -266,6 +336,55 @@ def test_pptx_slides_become_units_when_the_extractor_marks_them(tmp_path: Path) 
     assert extraction.unit == "slide"
     assert len(extraction.units) == 2
     assert "First slide body" in extraction.units[0]
+
+
+def _large_noise_jpeg(size: tuple[int, int] = (2000, 1200)) -> bytes:
+    """A noisy JPEG past the inline long-edge bound, well inside byte budgets."""
+    import random
+
+    from PIL import Image as PILImage
+
+    raw = random.Random(9).randbytes(size[0] * size[1] * 3)
+    buf = io.BytesIO()
+    PILImage.frombytes("RGB", size, raw).save(buf, format="JPEG", quality=95)
+    return buf.getvalue()
+
+
+@pytest.mark.parametrize("suffix", ["docx", "pptx"])
+def test_office_reading_media_keeps_source_resolution(tmp_path: Path, suffix: str) -> None:
+    """Reader-pane media is stored whole; the inline transport bound is for chat.
+
+    Both Office ingests used the chat-attachment budget by default, so a bound
+    meant for images that are base64-inlined into one request would have shrunk
+    what the reader pane displays.
+    """
+    from PIL import Image as PILImage
+
+    image = _large_noise_jpeg()
+    path = tmp_path / f"material.{suffix}"
+    if suffix == "docx":
+        from docx import Document as DocxDocument
+
+        doc = DocxDocument()
+        doc.add_paragraph("A picture follows.")
+        doc.add_picture(io.BytesIO(image))
+        doc.save(str(path))
+    else:
+        from pptx import Presentation
+        from pptx.util import Inches
+
+        prs = Presentation()
+        slide = prs.slides.add_slide(prs.slide_layouts[5])
+        slide.shapes.add_picture(io.BytesIO(image), Inches(1), Inches(1), Inches(4), Inches(3))
+        prs.save(str(path))
+
+    extraction = extract_material(path)
+
+    assert extraction.media, "the embedded picture should become locator media"
+    stored = extraction.media[0].data
+    assert stored == image, "reading media is kept byte-for-byte"
+    with PILImage.open(io.BytesIO(stored)) as whole:
+        assert max(whole.size) > MAX_INLINE_IMAGE_EDGE
 
 
 def test_empty_and_unreadable_sources_raise_reading_error(tmp_path: Path) -> None:

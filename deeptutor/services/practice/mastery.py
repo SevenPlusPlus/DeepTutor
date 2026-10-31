@@ -166,6 +166,7 @@ def apply_mastery(
     independent: bool,
     now: float,
     contributes: bool = True,
+    failure_due_at: float | None = None,
 ) -> dict:
     state = dict(
         conn.execute("SELECT * FROM practice_review_state WHERE entry_id=?", (entry_id,)).fetchone()
@@ -176,9 +177,10 @@ def apply_mastery(
     reason = ""
     if contributes and correct is False:
         after, reason = "open", "confirmed_same_skill_failure"
+        # Daily mistakes wait a day; general practice retains its SRS retry interval.
         conn.execute(
             "UPDATE practice_review_state SET is_mistake=1,due_at=?,closed_at=NULL WHERE entry_id=?",
-            (now + DAY, entry_id),
+            (now + DAY if failure_due_at is None else failure_due_at, entry_id),
         )
         conn.execute("UPDATE notebook_entries SET resolved=0 WHERE id=?", (entry_id,))
         evidence = mastery_evidence(conn, entry_id, frozen=False)

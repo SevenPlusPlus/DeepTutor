@@ -22,7 +22,7 @@ import {
   type PracticeRef,
   type PracticeState,
 } from '@/lib/practice-api'
-import { WorkspaceLabel } from '../LibraryWorkspace'
+import { WorkspaceLabel } from '@/components/workspaces/WorkspaceLabel'
 
 export function LearningStatus({ state }: { state: PracticeState }) {
   const { t } = useTranslation()

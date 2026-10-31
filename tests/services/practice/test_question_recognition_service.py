@@ -100,11 +100,14 @@ async def test_recognition_stages_and_commits_into_explicit_course(tmp_path):
             "mime_type": "image/png",
         }
     ]
-    assert attachments.resolve_path(
-        session_id=f"practice-recognition-{ref.job_id}",
-        attachment_id="source",
-        filename="page.png",
-    ).read_bytes() == b"\x89PNG\r\n\x1a\nimage-bytes"
+    assert (
+        attachments.resolve_path(
+            session_id=f"practice-recognition-{ref.job_id}",
+            attachment_id="source",
+            filename="page.png",
+        ).read_bytes()
+        == b"\x89PNG\r\n\x1a\nimage-bytes"
+    )
     preview = service.stage(
         ref.job_id,
         "workspace-a",
@@ -368,9 +371,7 @@ def test_recognition_schema_migration_is_idempotent(tmp_path):
     store = SQLiteSessionStore(tmp_path / "migration.db")
     SQLiteSessionStore(store.db_path)
     with PracticeStore(store.db_path).connect() as conn:
-        columns = {
-            row[1] for row in conn.execute("PRAGMA table_info(notebook_entries)").fetchall()
-        }
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(notebook_entries)").fetchall()}
         assert {
             "course_id",
             "question_images_json",

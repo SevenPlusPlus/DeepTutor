@@ -104,6 +104,15 @@ function tableReasoningEffortOptions(
   const provider = PROVIDER_ALIASES[canonical] ?? canonical;
   const modelName = (model ?? "").trim().toLowerCase();
 
+  if (["minimax", "minimax_anthropic"].includes(provider)) {
+    if (modelName === "minimax-m3.1-flash") {
+      return options(["low", "medium", "high", "xhigh", "max"], current);
+    }
+    if (modelName === "minimax-m3") {
+      return options(["none", "adaptive"], current);
+    }
+  }
+
   if (provider === "gemini" || modelName.includes("gemini")) {
     if (
       modelName.includes("gemini-3") ||
@@ -148,6 +157,15 @@ function tableReasoningEffortOptions(
     return supportsThinking
       ? options(["none", "low", "medium", "high"], current)
       : options([], current);
+  }
+
+  if (
+    (OPENAI_PROVIDERS.has(provider) || provider === "custom" || provider === "zhipu") &&
+    (modelName === "glm-5.3" || modelName.endsWith("/glm-5.3"))
+  ) {
+    // GLM-5.3 always thinks; older GLM families have different controls.
+    // https://docs.bigmodel.cn/cn/guide/models/text/glm-5.3
+    return options(["low", "high", "max"], current);
   }
 
   if (provider === "custom") {

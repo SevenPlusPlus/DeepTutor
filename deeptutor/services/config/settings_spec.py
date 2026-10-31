@@ -131,6 +131,7 @@ _LANGUAGE_CHOICES: tuple[tuple[str, str, str], ...] = (
     ("fr", "Français", "Interface and replies in French."),
     ("de", "Deutsch", "Interface and replies in German."),
     ("uk", "Українська", "Interface and replies in Ukrainian."),
+    ("pl", "Polski", "Interface and replies in Polish."),
 )
 
 _RESPONSE_LANGUAGE_CHOICES: tuple[tuple[str, str, str], ...] = (
@@ -262,6 +263,10 @@ def _parsing_engine_choices() -> tuple[SettingChoice, ...]:
     turns an unavailable choice into an install offer instead of pretending the
     engine does not exist.
     """
+    from deeptutor.modules.catalog import module_enabled
+
+    if not module_enabled("parsing"):
+        return ()
     from deeptutor.services.parsing.engines._install import installable_engines
     from deeptutor.services.parsing.engines.factory import list_engines
 
@@ -292,6 +297,10 @@ def _parsing_engine_choices() -> tuple[SettingChoice, ...]:
 
 
 def _validate_parsing_engine(value: str) -> str | None:
+    from deeptutor.modules.catalog import module_enabled
+
+    if not module_enabled("parsing"):
+        return "Install the parsing module first: deeptutor module install parsing"
     from deeptutor.services.parsing.engines.factory import is_engine_available
 
     if is_engine_available(value):

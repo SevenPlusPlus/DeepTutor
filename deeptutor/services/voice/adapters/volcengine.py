@@ -64,9 +64,7 @@ def _is_agent_plan_tts_url(url: str) -> bool:
         path = urlsplit(url).path.rstrip("/")
     except ValueError:
         return False
-    return path.endswith("/api/v3/plan") or path.endswith(
-        "/api/v3/plan/tts/unidirectional"
-    )
+    return path.endswith("/api/v3/plan") or path.endswith("/api/v3/plan/tts/unidirectional")
 
 
 class VolcengineTTSAdapter(BaseTTSAdapter):
@@ -97,10 +95,14 @@ class VolcengineTTSAdapter(BaseTTSAdapter):
         url = join_audio_path(config.base_url, suffix)
         if agent_plan:
             headers["X-Control-Require-Usage-Tokens-Return"] = "*"
-        payload = {"req_params": req} if agent_plan else {
-            "user": {"uid": "deeptutor"},
-            "req_params": req,
-        }
+        payload = (
+            {"req_params": req}
+            if agent_plan
+            else {
+                "user": {"uid": "deeptutor"},
+                "req_params": req,
+            }
+        )
         chunks: list[bytes] = []
         complete = False
         try:

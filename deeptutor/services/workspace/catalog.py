@@ -10,6 +10,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -20,8 +21,14 @@ from typing import TYPE_CHECKING, Any
 import uuid
 
 from deeptutor.multi_user.context import get_current_user
-from deeptutor.services.workspace.models import WorkspaceBinding, WorkspaceError
+from deeptutor.services.workspace.models import (
+    MAX_WORKSPACE_INSTRUCTIONS_CHARS,
+    WorkspaceBinding,
+    WorkspaceError,
+)
 from deeptutor.utils.secret_files import ensure_private_directory
+
+logger = logging.getLogger(__name__)
 
 _INTERNAL_DIR = ".deeptutor"
 
@@ -133,6 +140,28 @@ class WorkspaceCatalogMixin:
         root = Path(row["path"]).expanduser().resolve()
         self._assert_allowed_root(root)
         return WorkspaceBinding(row["workspace_id"], root, row["display_name"])
+
+    def registered_bindings(self) -> list[WorkspaceBinding]:
+        """All non-default workspaces registered for the current owner.
+
+        Read-only enumeration for account-level aggregation (e.g. Memory L1
+        snapshots, #1799). Bindings whose storage moved or grew symlinks are
+        skipped rather than raised: one broken registration must not blank an
+        account-wide scan.
+        """
+        out: list[WorkspaceBinding] = []
+        for row in self._catalog():
+            try:
+                binding = self._registered_binding(row)
+            except WorkspaceError:
+                logger.warning(
+                    "workspace %s skipped during enumeration: storage unavailable",
+                    row.get("workspace_id"),
+                )
+                continue
+            if not binding.is_default:
+                out.append(binding)
+        return out
 
     def _catalog_metadata(self, key: str) -> Any:
         if not self._catalog_file().exists():
@@ -264,6 +293,7 @@ class WorkspaceCatalogMixin:
                     "created_at": row["created_at"],
                     "status": status["status"],
                     "error": status.get("error", ""),
+                    "instructions": row.get("instructions") or "",
                     "resources": row.get("resources")
                     or {"skills": None, "mcp": None, "knowledge_bases": None},
                 }
@@ -271,12 +301,19 @@ class WorkspaceCatalogMixin:
         return sorted(result, key=lambda row: {"system": 0, "general": 1}.get(row["kind"], 2))
 
     def create_workspace(
-        self, name: str, path: str | None = None, *, resources: dict | None = None
+        self,
+        name: str,
+        path: str | None = None,
+        *,
+        resources: dict | None = None,
+        instructions: str | None = None,
     ) -> dict[str, Any]:
         self.assert_available()
         name = name.strip()
         if not name or len(name) > 100:
             raise WorkspaceError("A workspace name must contain 1 to 100 characters.")
+        if instructions is not None:
+            instructions = self._validate_instructions(instructions)
         if resources is not None:
             from deeptutor.services.workspace.resources import validate_resources
 
@@ -293,7 +330,11 @@ class WorkspaceCatalogMixin:
         for row in self.list_workspaces():
             if Path(row["path"]).resolve() == root:
                 return self.update_workspace(
-                    row["workspace_id"], name=name, archived=False, resources=resources
+                    row["workspace_id"],
+                    name=name,
+                    archived=False,
+                    resources=resources,
+                    instructions=instructions,
                 )
         binding = WorkspaceBinding(workspace_id, root, name)
         self._ensure_ready(binding)
@@ -308,6 +349,7 @@ class WorkspaceCatalogMixin:
                 "archived": False,
                 "created_at": _utc_now(),
                 "resources": resources or {},
+                "instructions": instructions or "",
             }
         )
         if saved["kind"] != "workspace":
@@ -323,10 +365,13 @@ class WorkspaceCatalogMixin:
         name: str | None = None,
         archived: bool | None = None,
         resources: dict | None = None,
+        instructions: str | None = None,
     ) -> dict[str, Any]:
         self.assert_available()
         if name is not None and (not name.strip() or len(name.strip()) > 100):
             raise WorkspaceError("A workspace name must contain 1 to 100 characters.")
+        if instructions is not None:
+            instructions = self._validate_instructions(instructions)
         if resources is not None:
             from deeptutor.services.workspace.resources import validate_resources
 
@@ -350,6 +395,8 @@ class WorkspaceCatalogMixin:
                 raise WorkspaceError("The default workspace cannot be renamed or archived.")
             if resources is not None:
                 row["resources"] = resources
+            if instructions is not None:
+                row["instructions"] = instructions
             if name is not None:
                 row["display_name"] = name.strip()
             if archived is not None:
@@ -359,6 +406,28 @@ class WorkspaceCatalogMixin:
                 (json.dumps(row, ensure_ascii=False), workspace_id),
             )
         return next(row for row in self.list_workspaces() if row["workspace_id"] == workspace_id)
+
+    @staticmethod
+    def _validate_instructions(instructions: str) -> str:
+        if (
+            not isinstance(instructions, str)
+            or len(instructions) > MAX_WORKSPACE_INSTRUCTIONS_CHARS
+        ):
+            raise WorkspaceError(
+                f"Workspace instructions must be text of at most {MAX_WORKSPACE_INSTRUCTIONS_CHARS} characters."
+            )
+        return instructions.strip()
+
+    def workspace_instructions(self, workspace_id: str | None = None) -> str:
+        """Read owner-scoped preferences; legacy and private bindings default to empty."""
+        if workspace_id is None:
+            workspace_id = self.current_binding().workspace_id
+        elif not workspace_id:
+            workspace_id = self._builtin_id("general")
+        row = next((r for r in self._catalog() if r["workspace_id"] == workspace_id), None)
+        if row is None or row.get("kind") not in {"workspace", "general"}:
+            return ""
+        return str(row.get("instructions") or "")
 
     def validate_chat_binding(
         self, workspace_id: str, *, existing: bool = False

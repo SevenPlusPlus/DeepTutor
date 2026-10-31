@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-import re
 from contextlib import contextmanager
 from pathlib import Path
+import re
 
+from deeptutor.modules import catalog as module_catalog
 from deeptutor.multi_user.paths import user_context
 from deeptutor.services.partners.interaction import actor_for_account
 from deeptutor.services.partners.links import linked_user_id
@@ -31,6 +32,8 @@ def _image_items(message: dict) -> list[tuple[int, dict]]:
 
 def freeze_photo_target(partner_id: str, config, message: dict) -> dict:
     """Called once on first durable receipt, before downloads or cursor advance."""
+    if not module_catalog.module_enabled("questions"):
+        return {"collect": False}
     if message.get("message_type") == 2 or message.get("is_group") or not _image_items(message):
         return {"collect": False}
     texts = [
@@ -91,6 +94,7 @@ async def ingest_photo(
     received_at: float,
     source_sent_at: float | None,
 ) -> dict:
+    module_catalog.require_module("questions")
     from deeptutor.services.practice.photo_ingestion import get_photo_ingestion_service
     from deeptutor.services.practice.recognition.service import MAX_SOURCE_BYTES
 

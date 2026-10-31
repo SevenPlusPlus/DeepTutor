@@ -1,8 +1,8 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
-import { useParams, useRouter } from "next/navigation";
+import { useParams, useRouter, useSearchParams } from "next/navigation";
 import {
   ArrowLeft,
   Download,
@@ -23,20 +23,25 @@ import DiscussionModePicker, {
 import {
   deletePartnerGroup,
   getPartnerGroup,
+  listPartnerGroupSessions,
   updatePartnerGroup,
   createPartnerGroupSessionKey,
   partnerGroupSessionKey,
   setPartnerGroupSessionKey,
   type PartnerGroup,
+  type PartnerGroupMessage,
 } from "@/lib/partner-groups-api";
 import { listPartners, type PartnerInfo } from "@/lib/partners-api";
-import { downloadChatMarkdown, type ExportableMessage } from "@/lib/chat-export";
+import { downloadChatMarkdown } from "@/lib/chat-export";
+import { toPartnerGroupExportMessages } from "@/lib/partner-group-export";
 
 export default function PartnerGroupPage() {
   const { t } = useTranslation();
   const params = useParams<{ groupId: string }>();
   const router = useRouter();
   const groupId = decodeURIComponent(params.groupId);
+  const requestedSession = useSearchParams().get("session") || "";
+  const [selectionError, setSelectionError] = useState("");
   const modeLabel = useDiscussionModeLabel();
 
   const [group, setGroup] = useState<PartnerGroup | null>(null);
@@ -44,7 +49,21 @@ export default function PartnerGroupPage() {
   const [editing, setEditing] = useState(false);
   const [panelOpen, setPanelOpen] = useState(false);
   const [sessionKey, setSessionKey] = useState("");
-  const [exportMessages, setExportMessages] = useState<ExportableMessage[]>([]);
+  const [sessionTitle, setSessionTitle] = useState("");
+  const [groupMessages, setGroupMessages] = useState<PartnerGroupMessage[]>([]);
+
+  const exportMessages = useMemo(
+    () => toPartnerGroupExportMessages(groupMessages),
+    [groupMessages],
+  );
+  const exportTitle = group
+    ? `${group.name} — ${sessionTitle || t("New discussion")}`
+    : sessionTitle;
+
+  const handleDownload = useCallback(() => {
+    if (!exportMessages.length) return;
+    downloadChatMarkdown(exportMessages, { title: exportTitle });
+  }, [exportMessages, exportTitle]);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -64,6 +83,22 @@ export default function PartnerGroupPage() {
   useEffect(() => {
     void load();
   }, [load]);
+
+  useEffect(() => {
+    if (loading || !group || !requestedSession) return;
+    let alive = true;
+    void listPartnerGroupSessions(groupId).then(rows => {
+      if (!alive) return;
+      const selected = rows.find(row => row.session_key === requestedSession);
+      if (!selected) { setSelectionError(t("navigation.sessionUnavailable")); return; }
+      setSelectionError("");
+      setGroupMessages([]);
+      setPartnerGroupSessionKey(groupId, selected.session_key);
+      setSessionKey(selected.session_key);
+      setSessionTitle(selected.title);
+    }).catch(() => { if (alive) setSelectionError(t("navigation.loadError")); });
+    return () => { alive = false; };
+  }, [groupId, group, loading, requestedSession, t]);
 
   if (loading) {
     return (
@@ -88,6 +123,7 @@ export default function PartnerGroupPage() {
 
   return (
     <div className="flex h-full min-h-0 flex-col">
+      {selectionError && <div role="alert" className="border-b border-border px-6 py-2 text-xs text-destructive">{selectionError}</div>}
       <header className="flex shrink-0 items-center justify-between gap-4 border-b border-[var(--border)] px-4 py-3 sm:px-6">
         <div className="flex min-w-0 items-center gap-3">
           <Link
@@ -136,20 +172,23 @@ export default function PartnerGroupPage() {
               groupId={groupId}
               sessionKey={sessionKey}
               onSelect={(key) => {
-                setExportMessages([]);
+                setGroupMessages([]);
                 setPartnerGroupSessionKey(groupId, key);
                 setSessionKey(key);
+                router.replace(`/partners/groups/${encodeURIComponent(groupId)}?${new URLSearchParams({ session: key })}`, { scroll: false });
               }}
               onCreate={() => {
-                setExportMessages([]);
+                setGroupMessages([]);
                 setSessionKey(createPartnerGroupSessionKey(groupId));
+                router.replace(`/partners/groups/${encodeURIComponent(groupId)}`, { scroll: false });
               }}
+              onTitleChange={setSessionTitle}
             />
           ) : null}
           <button
             type="button"
-            onClick={() => downloadChatMarkdown(exportMessages, { title: group.name })}
-            disabled={exportMessages.length === 0}
+            onClick={handleDownload}
+            disabled={!groupMessages.length}
             aria-label={t("Download")}
             className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-[var(--border)] px-2.5 text-[11px] text-[var(--muted-foreground)] transition-colors hover:text-[var(--foreground)] disabled:cursor-not-allowed disabled:opacity-40"
           >
@@ -185,7 +224,7 @@ export default function PartnerGroupPage() {
         panelOpen={panelOpen}
         onOpenPanel={() => setPanelOpen(true)}
         onClosePanel={() => setPanelOpen(false)}
-        onExportMessagesChange={setExportMessages}
+        onMessagesChange={setGroupMessages}
       />
 
       {editing ? (

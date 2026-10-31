@@ -39,7 +39,14 @@ def repo(tmp_path: Path) -> Path:
     (root / "web/public/logo.png").write_bytes(b"image")
     (root / "web/tsconfig.json").write_text('{"original":true}')
     (root / "pyproject.toml").write_text('[project]\nname="test"\n')
-    for name in ("requirements.txt", "README.md", "LICENSE"):
+    for name in (
+        "requirements.txt",
+        "README.md",
+        "LICENSE",
+        "setup.py",
+        "build_metadata.py",
+        "build_support.py",
+    ):
         (root / name).write_text(name)
     (root / "web/package-lock.json").write_text(
         json.dumps(
@@ -118,6 +125,8 @@ def test_build_isolates_worktree_and_excludes_runtime_secrets(module, repo, tmp_
     assert (repo / "web/tsconfig.json").read_text() == '{"original":true}'
     assert (repo / "web/node_modules/marker.txt").read_text() == "original dependency"
     assert (staging / "deeptutor/new_untracked.py").exists()
+    for name in ("setup.py", "build_metadata.py", "build_support.py"):
+        assert (staging / name).read_text() == name
     assert (staging / "web-runtime/.next/static/chunk.js").exists()
     assert (staging / "web-runtime/public/logo.png").exists()
     for name in (

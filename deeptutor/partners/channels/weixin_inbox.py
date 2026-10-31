@@ -7,13 +7,13 @@ server to replay a cursor. Media credentials remain in this private channel DB.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import hashlib
 import json
 import os
+from pathlib import Path
 import sqlite3
 import time
-from contextlib import contextmanager
-from pathlib import Path
 from typing import Callable
 
 

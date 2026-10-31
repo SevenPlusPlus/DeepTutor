@@ -25,6 +25,7 @@ from dataclasses import dataclass
 import json
 from typing import Any
 
+from deeptutor.modules.catalog import module_enabled
 from deeptutor.tools.builtin import (
     BUILTIN_TOOL_NAMES,
     CONFIGURABLE_BUILTIN_TOOL_NAMES,
@@ -45,6 +46,9 @@ AUTO_MOUNTED_TOOLS: frozenset[str] = frozenset(CONFIGURABLE_BUILTIN_TOOL_NAMES)
 # declared built-in is dropped when its gate is unmet — e.g. ``rag`` without a KB).
 # Insertion order fixes the default surface's conditional-tool order.
 _CONDITIONAL_MOUNT_FLAGS: dict[str, str] = {
+    "preprint": "has_scientific_research",
+    "research_audit": "has_scientific_research",
+    "research_lit": "has_scientific_research",
     "rag": "has_kb",
     "wiki_search": "has_weknora_kb",
     "wiki_read_page": "has_weknora_kb",
@@ -52,8 +56,8 @@ _CONDITIONAL_MOUNT_FLAGS: dict[str, str] = {
     "knowledge_frontier": "has_kb",
     "read_source": "has_sources",
     "read_memory": "has_memory",
-    "list_notebook": "has_notebooks",
-    "write_note": "has_notebooks",
+    "list_favorites": "has_notebooks",
+    "save_favorite": "has_notebooks",
     "question_bank": "has_question_bank",
     "read_skill": "has_skills",
     "load_tools": "has_deferred_tools",
@@ -83,6 +87,8 @@ WORKSPACE_BASELINE_TOOLS: tuple[str, ...] = (
     "workspace_read",
     "workspace_search",
     "workspace_present",
+    "write_note",
+    "search_notes",
 )
 
 
@@ -164,6 +170,7 @@ class ToolMountFlags:
     has_question_bank: bool = False
     has_skills: bool = False
     has_deferred_tools: bool = False
+    has_scientific_research: bool = False
     has_exec: bool = False
     #: The learner has at least one mastery topic to be sent back to.
     has_mastery_nav: bool = False
@@ -199,8 +206,9 @@ def compose_enabled_tools(
        KB is attached, ``read_source`` if a source index exists, …).
     3. Active loop capabilities' *owned* tools (``capability_owned``) — the
        capability's own tools, added on top.
-    4. Always-on auto-mounts (``write_memory`` / ``web_fetch`` / ``github`` /
-       ``ask_user`` / ``cron`` / ``task_board``).
+    4. Always-on auto-mounts (``write_memory`` / ``learning_status`` /
+       ``learning_update`` / ``web_fetch`` / ``github`` / ``ask_user`` /
+       ``cron`` / ``task_board``).
 
     A loop capability (solve, mastery) reuses the *full* chat surface and only
     *adds* its owned tools — it never curates or suppresses the reused
@@ -267,6 +275,8 @@ def compose_enabled_tools(
     composed.extend(str(name) for name in capability_owned if str(name).strip())
     for always_on in (
         "write_memory",
+        "learning_status",
+        "learning_update",
         "web_fetch",
         "github",
         "ask_user",
@@ -306,6 +316,8 @@ def user_has_memory() -> bool:
     a tool with no payload to read.
     """
     try:
+        if not module_enabled("memory"):
+            return False
         from deeptutor.services.memory import get_memory_store
 
         store = get_memory_store()
@@ -320,10 +332,12 @@ def user_has_memory() -> bool:
 def user_has_notebooks() -> bool:
     """Whether the active user has at least one notebook.
 
-    Auto-mount gate for ``list_notebook`` + ``write_note``. Same
+    Auto-mount gate for ``list_favorites`` + ``save_favorite``. Same
     fail-closed posture as :func:`user_has_memory`.
     """
     try:
+        if not module_enabled("notebook"):
+            return False
         from deeptutor.services.notebook import get_notebook_manager
 
         notebooks = get_notebook_manager().list_notebooks()
@@ -343,6 +357,8 @@ def user_has_mastery_topics() -> bool:
     ``LearningStore.default_db_path``).
     """
     try:
+        if not module_enabled("mastery"):
+            return False
         from deeptutor.learning.navigation import learner_has_topics
 
         return learner_has_topics()
@@ -393,6 +409,8 @@ def selected_kbs_have_weknora(kb_refs: Iterable[str]) -> bool:
     """
 
     try:
+        if not module_enabled("knowledge"):
+            return False
         from deeptutor.knowledge.kb_types import WEKNORA_KB_TYPE
         from deeptutor.multi_user.knowledge_access import resolve_kb_metadata
 

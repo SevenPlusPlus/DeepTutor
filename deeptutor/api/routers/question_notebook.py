@@ -328,23 +328,16 @@ async def upsert_single_entry(payload: UpsertEntryRequest):
 
 
 async def _course_session_ids(store: Any, course_id: str) -> list[str] | None:
-    """Resolve a course to the sessions whose questions belong to it.
+    """Resolve legacy course filters from persisted conversation metadata.
 
-    Course membership remains conversation-derived until Question Bank entries
-    gain an explicit course association. Independent origins are intentionally
-    excluded. Returns ``None`` for no course (do not scope) and ``[]`` for a
-    course with no conversations yet — which must scope to nothing rather than
-    quietly fall back to the whole library.
+    Course Study no longer owns an active service. Old links and imported
+    questions still carry course identifiers, so preserve their scope without
+    requiring the removed course registry. An unknown identifier resolves to
+    an empty session set; explicit entry ownership is filtered by the store.
     """
     if not course_id:
         return None
-    from deeptutor.services.courses import CourseNotFoundError, get_course_service
     from deeptutor.services.session.organization import list_all_sessions_snapshot
-
-    try:
-        get_course_service().get(course_id)
-    except CourseNotFoundError as exc:
-        raise HTTPException(status_code=404, detail="Course not found") from exc
 
     sessions = await list_all_sessions_snapshot(store)
     return [

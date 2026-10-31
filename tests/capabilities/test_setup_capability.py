@@ -157,14 +157,24 @@ async def test_setup_can_select_malay_reply_language(isolated_settings: Path) ->
 
 @pytest.mark.asyncio
 async def test_apply_reports_a_coupled_setting(isolated_settings: Path) -> None:
+    from deeptutor.services.settings.interface_settings import get_path_service, get_ui_settings
+
+    settings_file = get_path_service().get_settings_file("interface")
+    settings_file.parent.mkdir(parents=True, exist_ok=True)
+    settings_file.write_text(json.dumps({"language": "en"}), encoding="utf-8")
+
     outcome = await apply_setting("interface.language", "zh")
 
     assert outcome.ok
-    coupled = {effect.key for effect in outcome.side_effects}
+    assert outcome.previous == "en"
+    coupled = {effect.key: effect for effect in outcome.side_effects}
     assert "interface.response_language" in coupled, (
         "changing the interface language also switches replies on a file that "
         "predates the split; the user has to be told"
     )
+    assert coupled["interface.response_language"].previous == "en"
+    assert coupled["interface.response_language"].value == "zh"
+    assert get_ui_settings()["response_language"] == "zh"
 
 
 @pytest.mark.asyncio
@@ -186,11 +196,12 @@ async def test_apply_rejects_a_value_outside_the_offered_choices(
 ) -> None:
     from deeptutor.services.settings.interface_settings import get_ui_settings
 
+    before = get_ui_settings()
     outcome = await apply_setting("interface.language", "klingon")
 
     assert not outcome.ok
     assert "not one of the available options" in outcome.error
-    assert get_ui_settings()["language"] == "en"
+    assert get_ui_settings() == before
 
 
 @pytest.mark.asyncio
@@ -623,8 +634,8 @@ def test_concurrent_preference_writes_do_not_lose_updates(isolated_settings: Pat
     Unlocked, twelve concurrent writers left two of their fields on disk — the
     rest were overwritten by whichever writer had read an older snapshot.
     """
+    from concurrent.futures import ThreadPoolExecutor
     import json as json_module
-    import threading
 
     from deeptutor.services.settings.interface_settings import (
         _interface_settings_file,
@@ -635,11 +646,8 @@ def test_concurrent_preference_writes_do_not_lose_updates(isolated_settings: Pat
         for _ in range(20):
             set_ui_setting(f"probe_{index}", index)
 
-    threads = [threading.Thread(target=writer, args=(i,)) for i in range(12)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
+    with ThreadPoolExecutor(max_workers=12) as executor:
+        list(executor.map(writer, range(12)))
 
     stored = json_module.loads(_interface_settings_file().read_text(encoding="utf-8"))
     assert {f"probe_{i}" for i in range(12)} <= set(stored)

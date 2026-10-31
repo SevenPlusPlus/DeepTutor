@@ -108,12 +108,15 @@ export interface PracticeAnalytics {
   sources: (PracticeCounts & { source: string })[]
   totals: PracticeCounts
 }
-export const getPracticeAnalytics = (courseId = '', days = 30, workspaceId?: string) =>
-  request<PracticeAnalytics>(
-    `/analytics?${params(courseId)}&days=${days}&all_workspaces=${workspaceId === '*'}`,
+export const getPracticeAnalytics = (courseOrDays: string | number = '', days = 30, workspaceId?: string) => {
+  const courseId = typeof courseOrDays === 'string' ? courseOrDays : ''
+  const windowDays = typeof courseOrDays === 'number' ? courseOrDays : days
+  return request<PracticeAnalytics>(
+    `/analytics?${params(courseId)}&days=${windowDays}&all_workspaces=${workspaceId === '*'}`,
     undefined,
     workspaceId === '*' ? '' : workspaceId
   )
+}
 export interface ImportPreview {
   token: string | null
   total: number

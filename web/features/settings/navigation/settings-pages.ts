@@ -13,12 +13,12 @@ import type { SettingsAccess } from './settings-access'
 export const SETTINGS_PAGE_GROUPS: { label: Lang; keys: string[] }[] = [
   { label: { en: 'Personal', zh: '个人' }, keys: ['general', 'workspace', 'data-migration', 'appearance', 'usage'] },
   {
-    label: { en: 'Learning & conversation', zh: '学习与对话' },
-    keys: ['starters', 'attachments', 'video-learning', 'learner-profile', 'progress', 'guardian', 'memory'],
-  },
-  {
     label: { en: 'Models & services', zh: '模型与服务' },
     keys: ['connections', 'llm', 'task-models', 'embedding', 'search', 'voice', 'multimodal'],
+  },
+  {
+    label: { en: 'Learning & conversation', zh: '学习与对话' },
+    keys: ['starters', 'attachments', 'video-learning', 'learner-profile', 'progress', 'guardian', 'memory'],
   },
   {
     label: { en: 'Features & integrations', zh: '功能与集成' },
@@ -99,8 +99,8 @@ const extraPages: SettingsLeaf[] = [
     key: 'general',
     label: { en: 'General', zh: '常规' },
     blurb: {
-      en: 'Interface language, response language, and setup help',
-      zh: '界面语言、回复语言与配置帮助',
+      en: 'Interface language, layout, response language, and setup help',
+      zh: '界面语言、布局、回复语言与配置帮助',
     },
     icon: Settings2,
     href: '/settings/general',

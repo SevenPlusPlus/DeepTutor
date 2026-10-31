@@ -213,8 +213,7 @@ class QuestionRecognitionService:
         signatures = {
             "image/jpeg": request.data.startswith(b"\xff\xd8\xff"),
             "image/png": request.data.startswith(b"\x89PNG\r\n\x1a\n"),
-            "image/webp": request.data.startswith(b"RIFF")
-            and request.data[8:12] == b"WEBP",
+            "image/webp": request.data.startswith(b"RIFF") and request.data[8:12] == b"WEBP",
             "application/pdf": request.data.startswith(b"%PDF-"),
         }
         if not signatures[request.mime_type]:
@@ -393,15 +392,18 @@ class QuestionRecognitionService:
         return {
             "draft_id": str(raw.get("draft_id") or f"q_{ordinal:03d}"),
             "ordinal": ordinal,
-            **{key: normalized[key] for key in (
-                "question",
-                "question_type",
-                "options",
-                "correct_answer",
-                "explanation",
-                "difficulty",
-                "tags",
-            )},
+            **{
+                key: normalized[key]
+                for key in (
+                    "question",
+                    "question_type",
+                    "options",
+                    "correct_answer",
+                    "explanation",
+                    "difficulty",
+                    "tags",
+                )
+            },
             "question_images": question_images,
             "source_locator": raw.get("source_locator", {}),
             "answer_origin": origin,

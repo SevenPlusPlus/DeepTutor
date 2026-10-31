@@ -7,17 +7,18 @@ import json
 from pathlib import Path
 import sqlite3
 import time
+from typing import Literal
 import uuid
 
-from .scheduler import DAY, Rating, day_bounds, schedule
 from .mastery import (
     apply_mastery,
     initialize_mastery,
     mastery_evidence,
-    record_exposure,
     recently_exposed,
+    record_exposure,
     target_for_entry,
 )
+from .scheduler import DAY, Rating, day_bounds, schedule
 
 # Legacy correct or manually mastered questions start with a three-day interval.
 # Once reviewed, the saved adaptive schedule is authoritative.
@@ -32,6 +33,22 @@ _ACTIVE_SQL = (
     "AND NOT EXISTS(SELECT 1 FROM practice_variants av WHERE av.entry_id=n.id "
     "AND av.validation_status!='approved')"
 )
+_ALL_REVIEWABLE_SQL = (
+    "COALESCE(r.learning_status,'open') IN ('open','verify') "
+    "AND COALESCE(r.paused,0)=0 AND n.resolved=0 "
+    "AND NOT EXISTS(SELECT 1 FROM practice_variants av WHERE av.entry_id=n.id "
+    "AND av.validation_status!='approved')"
+)
+ReviewScope = Literal["mistakes", "all"]
+
+
+def _reviewable_sql(review_scope: ReviewScope) -> str:
+    """Keep daily mistake review distinct from general question practice."""
+    if review_scope == "mistakes":
+        return _ACTIVE_SQL
+    if review_scope == "all":
+        return _ALL_REVIEWABLE_SQL
+    raise ValueError("Unknown review scope")
 
 
 class ReviewConflict(ValueError):
@@ -52,13 +69,12 @@ def reconcile_photo_links(conn: sqlite3.Connection, row: sqlite3.Row) -> sqlite3
     live = {link["draft_id"]: link["entry_id"] for link in links}
     entry_ids = list(dict.fromkeys(live.values()))
     drafts = json.loads(row["drafts_json"])
-    missing = any(
-        draft["draft_id"] not in live for draft in drafts if draft.get("selected", True)
-    )
+    missing = any(draft["draft_id"] not in live for draft in drafts if draft.get("selected", True))
     status = row["status"]
     if status == "confirmed" and missing:
         status = (
-            "needs_subject" if any(draft.get("subject") == "unclassified" for draft in drafts)
+            "needs_subject"
+            if any(draft.get("subject") == "unclassified" for draft in drafts)
             else "ready"
         )
     if entry_ids != json.loads(row["entry_ids_json"]) or status != row["status"]:
@@ -255,9 +271,7 @@ class PracticeStore:
                     WHERE v.entry_id=n.id AND v.validation_status='approved'
                     AND (parent.session_id IS NULL OR ps.deleted_at IS NULL)
                     AND (parent.course_id=? OR parent.session_id IN ({placeholders}))))"""
-            params.extend(
-                [course_id, *(session_ids or ()), course_id, *(session_ids or ())]
-            )
+            params.extend([course_id, *(session_ids or ()), course_id, *(session_ids or ())])
         elif session_ids is not None:
             placeholders = ",".join("?" for _ in session_ids) or "NULL"
             sql += f""" AND (n.session_id IN ({placeholders}) OR EXISTS(
@@ -275,17 +289,20 @@ class PracticeStore:
         session_ids: list[str] | None = None,
         now: float | None = None,
         course_id: str = "",
+        *,
+        review_scope: ReviewScope = "mistakes",
     ) -> dict:
         now = time.time() if now is None else now
         start, end = day_bounds(timezone, now)
         scope, params = self._scope(session_ids, course_id)
+        active = _reviewable_sql(review_scope)
         with self.connect() as conn:
             row = conn.execute(
                 f"""SELECT COUNT(*) AS total,
                     COALESCE(SUM(r.is_mistake=1),0) AS mistakes,
-                    COALESCE(SUM(CASE WHEN {_ACTIVE_SQL} AND {_DUE_AT_SQL}<=? THEN 1 ELSE 0 END),0) AS due,
-                    COALESCE(SUM(CASE WHEN {_ACTIVE_SQL} AND {_DUE_AT_SQL}<? THEN 1 ELSE 0 END),0) AS overdue,
-                    MIN(CASE WHEN {_ACTIVE_SQL} THEN {_DUE_AT_SQL} END) AS next_due_at,
+                    COALESCE(SUM(CASE WHEN {active} AND {_DUE_AT_SQL}<=? THEN 1 ELSE 0 END),0) AS due,
+                    COALESCE(SUM(CASE WHEN {active} AND {_DUE_AT_SQL}<? THEN 1 ELSE 0 END),0) AS overdue,
+                    MIN(CASE WHEN {active} THEN {_DUE_AT_SQL} END) AS next_due_at,
                     COALESCE(SUM(CASE WHEN {_ACTIVE_SQL} AND r.learning_status='open' THEN 1 ELSE 0 END),0) AS open,
                     COALESCE(SUM(CASE WHEN {_ACTIVE_SQL} AND r.learning_status='verify' THEN 1 ELSE 0 END),0) AS verify,
                     COALESCE(SUM(r.is_mistake=1 AND r.learning_status='closed'),0) AS closed,
@@ -331,10 +348,13 @@ class PracticeStore:
         limit: int = 20,
         now: float | None = None,
         course_id: str = "",
+        *,
+        review_scope: ReviewScope = "mistakes",
     ) -> list[int]:
         now = time.time() if now is None else now
         day_bounds(timezone, now)
         scope, params = self._scope(session_ids, course_id)
+        active = _reviewable_sql(review_scope)
         if category_id is not None:
             scope += " AND EXISTS(SELECT 1 FROM notebook_entry_categories c WHERE c.entry_id=n.id AND c.category_id=?)"
             params.append(category_id)
@@ -343,7 +363,7 @@ class PracticeStore:
                 f"""
                 SELECT n.id FROM notebook_entries n LEFT JOIN sessions s ON s.id=n.session_id
                 LEFT JOIN practice_review_state r ON r.entry_id=n.id
-                WHERE {_DUE_AT_SQL} <= ? AND {_ACTIVE_SQL} AND {scope}
+                WHERE {_DUE_AT_SQL} <= ? AND {active} AND {scope}
                 ORDER BY {_DUE_AT_SQL}, n.id LIMIT ?
             """,  # nosec B608 - fixed scope SQL; values bound
                 [now, *params, limit],
@@ -431,9 +451,7 @@ class PracticeStore:
             grade=grade,
         )
 
-    def expose(
-        self, entry_id: int, request_id: str, kind: str, now: float | None = None
-    ) -> dict:
+    def expose(self, entry_id: int, request_id: str, kind: str, now: float | None = None) -> dict:
         if kind not in {"hint", "answer"}:
             raise ValueError("Unknown exposure kind")
         now = time.time() if now is None else now
@@ -466,9 +484,7 @@ class PracticeStore:
                 (int(paused), entry_id),
             )
             if not paused:
-                conn.execute(
-                    "UPDATE notebook_entries SET resolved=0 WHERE id=?", (entry_id,)
-                )
+                conn.execute("UPDATE notebook_entries SET resolved=0 WHERE id=?", (entry_id,))
         return self.state(entry_id)
 
     def mastery_details(self, entry_id: int) -> dict:
@@ -528,9 +544,11 @@ class PracticeStore:
         attempt_kind: str = "original",
         timezone: str = "UTC",
         auto_grade: bool = False,
+        review_scope: ReviewScope = "mistakes",
     ) -> dict:
         now = time.time() if now is None else now
         day_bounds(timezone, now)
+        _reviewable_sql(review_scope)
         if attempt_kind not in {"original", "spotcheck"}:
             raise ValueError("Unknown review attempt kind")
         requested_rating = rating
@@ -548,6 +566,7 @@ class PracticeStore:
                     "attempt_kind": attempt_kind,
                     "timezone": timezone,
                     "auto_grade": auto_grade,
+                    "review_scope": review_scope,
                 }
                 defaults = {
                     "self_report": False,
@@ -556,14 +575,15 @@ class PracticeStore:
                     "attempt_kind": "original",
                     "timezone": "UTC",
                     "auto_grade": False,
+                    # Legacy events predate the explicit scheduling scope.
+                    "review_scope": review_scope,
                 }
                 if (
                     previous["entry_id"] != entry_id
                     or previous["answer"] != answer
                     or saved.get("requested_rating", previous["rating"]) != requested_rating
                     or any(
-                        saved.get(key, defaults[key]) != value
-                        for key, value in fingerprint.items()
+                        saved.get(key, defaults[key]) != value for key, value in fingerprint.items()
                     )
                 ):
                     raise ReviewConflict(
@@ -597,9 +617,7 @@ class PracticeStore:
                     rating = "again"
                 elif rating != "again":
                     raise ValueError("An incorrect answer must be reviewed again")
-            exposed = recently_exposed(
-                conn, entry_id, target_id if same_skill else entry_id, now
-            )
+            exposed = recently_exposed(conn, entry_id, target_id if same_skill else entry_id, now)
             independent = (
                 correct is True
                 and rating != "again"
@@ -609,7 +627,10 @@ class PracticeStore:
             )
             schedule_rating = (
                 "hard"
-                if correct is True and not independent and rating != "again"
+                if review_scope == "mistakes"
+                and correct is True
+                and not independent
+                and rating != "again"
                 else rating
             )
             next_state = schedule(state, schedule_rating, now)
@@ -645,9 +666,7 @@ class PracticeStore:
                 ),
             )
             if rating == "again":
-                conn.execute(
-                    "UPDATE notebook_entries SET resolved=0 WHERE id=?", (entry_id,)
-                )
+                conn.execute("UPDATE notebook_entries SET resolved=0 WHERE id=?", (entry_id,))
             if target_id != entry_id and same_skill:
                 conn.execute(
                     "INSERT OR IGNORE INTO practice_review_state(entry_id,is_mistake,first_wrong_at,due_at) VALUES(?,0,?,?)",
@@ -662,6 +681,7 @@ class PracticeStore:
                 "introduces_new_skill": not same_skill,
                 "variant_kind": variant_kind,
                 "timezone": timezone,
+                "review_scope": review_scope,
             }
             outcome = {
                 **next_state,
@@ -676,6 +696,7 @@ class PracticeStore:
                 "attempt_kind": attempt_kind,
                 "timezone": timezone,
                 "auto_grade": auto_grade,
+                "review_scope": review_scope,
                 "independent": independent,
                 "mastered": rating in {"good", "easy"},
             }
@@ -699,11 +720,21 @@ class PracticeStore:
             )
             if target_id == entry_id:
                 decision = apply_mastery(
-                    conn, entry_id, correct=correct, independent=independent, now=now
+                    conn,
+                    entry_id,
+                    correct=correct,
+                    independent=independent,
+                    now=now,
+                    failure_due_at=next_state["due_at"] if review_scope == "all" else None,
                 )
             else:
                 decision = apply_mastery(
-                    conn, target_id, correct=correct, independent=independent, now=now
+                    conn,
+                    target_id,
+                    correct=correct,
+                    independent=independent,
+                    now=now,
+                    failure_due_at=next_state["due_at"] if review_scope == "all" else None,
                 )
                 conn.execute(
                     "UPDATE practice_review_state SET version=version+1,last_review_at=?,"
@@ -906,9 +937,11 @@ class PracticeStore:
             result = {"created": created, "duplicates": skipped, "total": created + skipped}
             if photo:
                 entry_ids = [
-                    row["entry_id"] for row in conn.execute(
+                    row["entry_id"]
+                    for row in conn.execute(
                         "SELECT l.entry_id FROM photo_question_links l JOIN notebook_entries n "
-                        "ON n.id=l.entry_id WHERE l.item_id=? ORDER BY l.draft_id", (photo["item_id"],),
+                        "ON n.id=l.entry_id WHERE l.item_id=? ORDER BY l.draft_id",
+                        (photo["item_id"],),
                     )
                 ]
                 # Keep the archive card consistent when the caller edits subjects

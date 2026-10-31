@@ -81,7 +81,7 @@ export function buildQuestionBankFilter(
     search: search || undefined,
     sort,
     limit: PAGE_SIZE,
-    course_id: courseId || undefined,
+    ...(courseId ? { course_id: courseId } : {}),
   };
 }
 

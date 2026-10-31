@@ -11,23 +11,24 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from collections import OrderedDict
+from contextlib import suppress
 import hashlib
 import json
 import os
+from pathlib import Path
 import random
 import re
 import time
-import uuid
-from collections import OrderedDict
-from contextlib import suppress
-from pathlib import Path
 from typing import Any
 from urllib.parse import quote
+import uuid
 
 import httpx
 from loguru import logger
 from pydantic import Field
 
+from deeptutor.modules.catalog import ModuleUnavailable, require_module
 from deeptutor.partners.bus.events import OutboundMessage
 from deeptutor.partners.bus.queue import MessageBus
 from deeptutor.partners.channels.base import BaseChannel
@@ -790,6 +791,7 @@ class WeixinChannel(BaseChannel):
                 inbox.complete(event["event_key"], chat_id=sender, reply=reply)
                 continue
             try:
+                require_module("questions")
                 images = _image_items(message)
                 for media_index, image in images:
                     path = await self._download_media_item(image, "image")
@@ -823,6 +825,10 @@ class WeixinChannel(BaseChannel):
                     chat_id=sender,
                     reply=f"已保存{len(images)}张题目原图，正在按科目整理。你可以在网页错题库的“微信收题”中查看，核对题干后加入复习。",
                 )
+            except ModuleUnavailable:
+                # Keep the original owner and pending receipt across module
+                # restarts without consuming transport-failure retry attempts.
+                continue
             except Exception:
                 terminal = inbox.fail(event["event_key"])
                 if terminal:

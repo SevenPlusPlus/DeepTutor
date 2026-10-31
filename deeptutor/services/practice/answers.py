@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+from fractions import Fraction
 import json
 import re
-from fractions import Fraction
 
 
 def _number(value: str) -> Fraction | None:
@@ -21,10 +21,7 @@ def check_answer(entry: dict, answer: str) -> bool | None:
     kind = entry.get("question_type", "")
     options = entry.get("options") or json.loads(entry.get("options_json") or "{}")
     expected = str(entry.get("correct_answer") or "").strip()
-    if (
-        not expected
-        or kind in {"qualitative", "short_answer", "essay", "free_response"}
-    ):
+    if not expected or kind in {"qualitative", "short_answer", "essay", "free_response"}:
         return None
 
     if not options:

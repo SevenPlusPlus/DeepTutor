@@ -11,7 +11,7 @@ import {
   type PracticeSummary,
 } from '@/lib/practice-api'
 import { PHOTO_SUBJECTS } from '@/lib/photo-inbox-api'
-import { WorkspaceLabel } from '../LibraryWorkspace'
+import { WorkspaceLabel } from '@/components/workspaces/WorkspaceLabel'
 import { LearningStatus, MasteryDetails } from './MasteryDetails'
 import { VariantPractice } from './VariantPractice'
 

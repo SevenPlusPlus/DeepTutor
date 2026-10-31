@@ -26,7 +26,7 @@ vi.mock("@/lib/api", () => ({
   apiFetch: (...args: unknown[]) => mocks.fetch(...args),
 }));
 vi.mock("next/navigation", () => ({ useRouter: () => ({ push: vi.fn() }) }));
-const t = (key: string) => key;
+const t = (key: string, values?: Record<string, unknown>) => key.replace(/{{(.*?)}}/g, (_, name) => String(values?.[name] ?? name));
 vi.mock("react-i18next", () => ({
   useTranslation: () => ({ t, i18n: { language: "en" } }),
 }));
@@ -40,7 +40,10 @@ vi.mock("@/context/AppShellContext", () => ({
     codeBlockWrapLongLines: false,
   }),
 }));
-vi.mock("@/lib/llm-options", () => ({ invalidateLLMOptionsCache: vi.fn() }));
+vi.mock("@/lib/llm-options", () => ({
+  invalidateLLMOptionsCache: vi.fn(),
+  listLLMOptions: vi.fn(async () => ({ active: null, options: [] })),
+}));
 let settings: ReturnType<typeof useSettings>;
 let live: ReturnType<typeof defaultCatalog>;
 let stored: any;
@@ -89,13 +92,16 @@ function Capture() {
 function Editor({ name }: { name: string }) {
   const [liveValue, setLiveValue] = useState(resources[name]);
   const [draft, edit] = useStagedSettings(name, liveValue, setLiveValue);
+  const isSubagent = name.startsWith("subagent:");
   return (
     <input
       aria-label={name}
-      value={draft.path ?? draft.provider}
+      value={isSubagent ? draft.model ?? "" : draft.path ?? draft.provider}
       onChange={(e) =>
         edit(
-          name === "workspace"
+          isSubagent
+            ? { model: e.target.value }
+            : name === "workspace"
             ? { path: e.target.value }
             : { provider: e.target.value },
         )
@@ -193,6 +199,27 @@ it("keeps failed changes pending and allows retry", async () => {
   expect(settings.draftState).toBe("clean");
 });
 
+it.each(["/api/settings/draft", "/api/settings/apply"])("shows a denied %s write without losing the editable draft", async endpoint => {
+  live.services.llm.profiles.push({ id: "saved", name: "Saved profile", binding: "custom", base_url: "", api_key: "", api_version: "", models: [] });
+  render(<App page="" />);
+  await ready();
+  await act(async () => settings.mutateCatalog(next => {
+    next.services.llm.profiles[0].name = "Retained draft";
+  }));
+  const original = mocks.fetch.getMockImplementation()!;
+  mocks.fetch.mockImplementation((url, init) => url === endpoint && init?.method !== "GET"
+    ? { ...reply({ detail: "Check the service account write permissions; your draft was retained." }, false), status: 503 }
+    : original(url, init));
+  await act(() => settings.applyCatalog());
+  expect(settings.toast).toContain("service account write permissions");
+  expect(settings.draft.services.llm.profiles[0].name).toBe("Retained draft");
+  expect(live.services.llm.profiles[0].name).not.toBe("Retained draft");
+  mocks.fetch.mockImplementation(original);
+  await act(() => settings.applyCatalog());
+  expect(settings.draftState).toBe("clean");
+  expect(live.services.llm.profiles[0].name).toBe("Retained draft");
+});
+
 it("stages language and appearance without changing browser preferences until Apply", async () => {
   render(<App page="appearance" />);
   await ready();
@@ -277,6 +304,37 @@ it("applies a restored draft while its editor is mounted without reverting the d
   expect(screen.getByLabelText("workspace")).toHaveValue("/restored");
 });
 
+it("persists a restored subagent draft before clearing it", async () => {
+  const subagent = { enabled: true, model: "restored-model", effort: "high" };
+  resources["subagent:opencode"] = {};
+  stored = {
+    catalog: live,
+    extensions: { "subagent:opencode": subagent },
+  };
+  render(<App page="subagent:opencode" />);
+  await ready();
+
+  await waitFor(() =>
+    expect(screen.getByLabelText("subagent:opencode")).toHaveValue(
+      "restored-model",
+    ),
+  );
+  await act(() => settings.applyCatalog());
+
+  const subagentWriteIndex = mocks.fetch.mock.calls.findIndex(
+    ([url, init]) =>
+      url === "/api/subagents/settings" && init?.method === "PUT",
+  );
+  const catalogApplyIndex = mocks.fetch.mock.calls.findIndex(
+    ([url, init]) => url === "/api/settings/apply" && init?.method === "POST",
+  );
+  expect(JSON.parse(String(mocks.fetch.mock.calls[subagentWriteIndex][1]?.body)))
+    .toEqual({ backends: { opencode: subagent } });
+  expect(subagentWriteIndex).toBeLessThan(catalogApplyIndex);
+  expect(settings.draftState).toBe("clean");
+  expect(stored).toBeNull();
+});
+
 it("keeps the toolbar available when reverting an already saved draft", async () => {
   render(<App />);
   await ready();
@@ -330,6 +388,7 @@ it("stages parser URL edits immediately and keeps them when changing parser pane
 it("hydrates document parsing metadata around a restored writable-only draft", async () => {
   resources["document-parsing"] = {
     engine: "text_only",
+    image_description_model: { profile_id: "vision-profile", model_id: "vision-model" },
     engines: {
       docling: { mode: "local", api_base_url: "" },
       mineru: { mode: "local" },
@@ -392,9 +451,14 @@ it("hydrates document parsing metadata around a restored writable-only draft", a
   expect(
     await screen.findByDisplayValue("http://draft-parser"),
   ).toBeInTheDocument();
+  const imageModel = screen.getByLabelText("Image description model");
+  expect(imageModel).toHaveValue(JSON.stringify(["vision-profile", "vision-model"]));
+  fireEvent.change(imageModel, { target: { value: "" } });
   await act(() => settings.applyCatalog());
   expect(settings.draftState).toBe("clean");
   expect(screen.getByText("Docling")).toBeInTheDocument();
+  expect(resources["document-parsing"].image_description_model).toBeNull();
+  expect(imageModel).toHaveValue("");
 });
 
 it("stages MinerU credentials and restores them when revisiting the page", async () => {
@@ -416,6 +480,54 @@ it("stages MinerU credentials and restores them when revisiting the page", async
   );
   await act(() => settings.discardDraft());
   expect(screen.getByPlaceholderText("Paste API token")).toHaveValue("");
+});
+
+it("applies MinerU credentials and clears dirty state cleanly", async () => {
+  resources.mineru = {
+    settings: { mode: "cloud", api_base_url: "http://mineru" },
+    api_token_set: false,
+  };
+  render(<App page="mineru" />);
+  await ready();
+  fireEvent.change(await screen.findByPlaceholderText("Paste API token"), {
+    target: { value: "applied-token" },
+  });
+  expect(settings.draftState).toBe("unsaved");
+  await act(() => settings.applyCatalog());
+  expect(writes("/api/settings/mineru")).toHaveLength(1);
+  expect(resources.mineru.api_token).toBe("applied-token");
+  expect(settings.draftState).toBe("clean");
+  expect(settings.hasUnsavedChanges).toBe(false);
+});
+
+it("applies MinerU credentials from within document-parsing page without leaving unsaved state", async () => {
+  resources["document-parsing"] = {
+    engine: "mineru",
+    engines: {
+      mineru: { mode: "local", api_base_url: "https://mineru.net" },
+    },
+    available_engines: [
+      { id: "mineru", name: "MinerU", available: true },
+    ],
+    readiness: { mineru: { ready: true } },
+    installable: [],
+    mineru: { api_token_set: false },
+  };
+  resources.mineru = {
+    settings: { mode: "local", api_base_url: "https://mineru.net" },
+    api_token_set: false,
+  };
+  render(<App page="document-parsing" />);
+  await ready();
+  fireEvent.click(await screen.findByRole("button", { name: "Cloud API" }));
+  fireEvent.change(await screen.findByPlaceholderText("Paste API token"), {
+    target: { value: "cloud-token-123" },
+  });
+  expect(settings.draftState).toBe("unsaved");
+  await act(() => settings.applyCatalog());
+  expect(writes("/api/settings/mineru")).toHaveLength(1);
+  expect(settings.draftState).toBe("clean");
+  expect(settings.hasUnsavedChanges).toBe(false);
 });
 
 it("allows incomplete model drafts but blocks Apply before writing any live settings", async () => {
@@ -443,4 +555,46 @@ it("allows incomplete model drafts but blocks Apply before writing any live sett
   expect(settings.draftState).toBe("saved");
   expect(writes("/api/settings/workspace")).toHaveLength(0);
   expect(live.services.llm.profiles).toHaveLength(0);
+});
+
+it("preserves the distinction between untouched and explicitly cleared MinerU tokens", async () => {
+  resources.mineru = {
+    settings: { mode: "cloud", api_base_url: "http://mineru" },
+    api_token_set: true,
+  };
+  render(<App page="mineru" />);
+  await ready();
+  const token = await screen.findByPlaceholderText("••••••••••••");
+  fireEvent.click(screen.getByRole("button", { name: "Show API token" }));
+  expect(token).toHaveAttribute("type", "text");
+  expect(settings.hasUnsavedChanges).toBe(false);
+  fireEvent.change(token, { target: { value: "replacement" } });
+  fireEvent.change(token, { target: { value: "" } });
+  expect(settings.hasUnsavedChanges).toBe(true);
+  await act(() => settings.applyCatalog());
+  expect(JSON.parse(String(writes("/api/settings/mineru")[0][1].body))).toHaveProperty("api_token", "");
+});
+
+it("keeps edits made while Apply is pending for the next Apply", async () => {
+  render(<App />);
+  await ready();
+  fireEvent.change(screen.getByLabelText("workspace"), { target: { value: "/first" } });
+  const implementation = mocks.fetch.getMockImplementation()!;
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  mocks.fetch.mockImplementation(async (url, init) => {
+    if (url === "/api/settings/workspace" && init?.method === "PUT") await gate;
+    return implementation(url, init);
+  });
+  let applying!: Promise<void>;
+  act(() => { applying = settings.applyCatalog(); });
+  await waitFor(() => expect(writes("/api/settings/workspace")).toHaveLength(1));
+  fireEvent.change(screen.getByLabelText("workspace"), { target: { value: "/second" } });
+  await act(async () => { release(); await applying; });
+  expect(resources.workspace.path).toBe("/first");
+  expect(screen.getByLabelText("workspace")).toHaveValue("/second");
+  expect(settings.draftState).toBe("unsaved");
+  await act(() => settings.applyCatalog());
+  expect(resources.workspace.path).toBe("/second");
+  expect(settings.draftState).toBe("clean");
 });

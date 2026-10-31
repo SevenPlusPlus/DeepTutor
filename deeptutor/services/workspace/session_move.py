@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import closing
 import json
 import sqlite3
 
@@ -67,7 +68,7 @@ def migrate_legacy_bindings() -> int:
     with data_activity(exclusive=True), workspace_context():
         from deeptutor.services.workspace.data_migration import assert_no_pending_recovery
 
-        assert_no_pending_recovery()
+        assert_no_pending_recovery(reject_unreadable=True)
         if marker.exists():
             return 0
         paths = get_path_service()
@@ -113,7 +114,7 @@ def migrate_legacy_bindings() -> int:
         else:
             db = paths.get_chat_history_db()
             if db.exists():
-                with sqlite3.connect(db) as conn:
+                with closing(sqlite3.connect(db)) as conn, conn:
                     for sid, raw in conn.execute("SELECT id,preferences_json FROM sessions"):
                         prefs = json.loads(raw or "{}")
                         if prefs.get("workspace_id"):

@@ -38,6 +38,7 @@ from deeptutor.services.config import (
     redact_catalog_secrets,
     restore_catalog_secrets,
 )
+from deeptutor.services.config.image_description import ImageDescriptionModelSelection
 from deeptutor.services.config.origins import normalize_origins
 from deeptutor.services.config.runtime_settings import (
     CHAT_ATTACHMENT_CHARS_RANGE,
@@ -76,6 +77,11 @@ from deeptutor.services.settings.interface_settings import (
 )
 from deeptutor.services.settings.interface_settings import (
     get_enabled_optional_tools as _get_enabled_optional_tools,
+)
+from deeptutor.services.settings.page_customization import (
+    ChatPageCustomization,
+    LearningPageCustomization,
+    PageCustomization,
 )
 from deeptutor.services.settings.starter_settings import (
     TRACE_COUNT_RANGE as STARTER_TRACE_COUNT_RANGE,
@@ -243,6 +249,21 @@ class VoicePreviewPayload(BaseModel):
     text: str = Field(min_length=1, max_length=500)
 
 
+class VoiceDiscoveryPayload(BaseModel):
+    catalog: dict[str, Any]
+    profile_id: str
+    model_id: str
+
+
+class ServicePreviewPayload(BaseModel):
+    catalog: dict[str, Any]
+    profile_id: str
+    model_id: str | None = None
+    text: str = Field(default="", max_length=2000)
+    audio: str = Field(default="", max_length=11184812)
+    content_type: str = ""
+
+
 class CatalogPayload(BaseModel):
     catalog: dict[str, Any]
 
@@ -333,6 +354,7 @@ class ProviderProbePayload(BaseModel):
     api_format: str = "auto"
     api_version: str = ""
     extra_headers: dict[str, str] | str | None = None
+    proxy: str = ""
     service: Literal["llm", "task", "embedding", "search", "tts", "stt", "imagegen", "videogen"] = (
         "llm"
     )
@@ -428,6 +450,8 @@ class DocumentParsingUpdate(BaseModel):
     engines: Optional[dict[str, dict]] = None
     # Toggle for vision-model captions of embedded images (None = keep stored).
     image_caption: Optional[bool] = None
+    # Omit to keep the selection; null restores the main LLM.
+    image_description_model: Optional[ImageDescriptionModelSelection] = None
 
 
 class DocumentParsingTest(BaseModel):
@@ -484,7 +508,22 @@ def _runtime_catalog_write() -> Iterator[None]:
     """
     service = get_model_catalog_service()
     before = service.load()
-    yield
+    try:
+        yield
+    except PermissionError as exc:
+        # #1984: filesystem denial is not an authentication failure. Preserve
+        # the atomic writer's failure boundary and the unapplied draft; do not
+        # blindly retry a stale catalog over another writer's newer settings.
+        logger.exception("Filesystem access denied while saving the model catalog")
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "The server could not save model settings because filesystem access was denied. "
+                "Check the server service account's permissions on the settings folder and "
+                "whether another process or security software is holding model_catalog.json, "
+                "then retry."
+            ),
+        ) from exc
     if service.load() == before:
         return
     logger.warning(
@@ -566,7 +605,7 @@ def _require_codex_oauth_actor() -> None:
     including signing them out. Partners inherit the owner's login at call
     time and need no lifecycle of their own.
     """
-    from deeptutor.services.partners.scope import is_partner_user_id
+    from deeptutor.core.identities import is_partner_user_id
 
     if is_partner_user_id(get_current_user().id):
         raise HTTPException(
@@ -1192,6 +1231,7 @@ def _document_parsing_payload() -> dict[str, Any]:
     return {
         "engine": full.get("engine"),
         "image_caption": bool(full.get("image_caption", False)),
+        "image_description_model": full.get("image_description_model"),
         "engines": redacted,
         "available_engines": available,
         "readiness": readiness,
@@ -1242,6 +1282,8 @@ async def update_mineru_settings(payload: MinerUSettingsUpdate):
             "enable_formula": payload.enable_formula,
             "enable_table": payload.enable_table,
             "is_ocr": payload.is_ocr,
+            "max_pages_per_part": current.get("max_pages_per_part", 180),
+            "normalize_tiny_scans": current.get("normalize_tiny_scans", False),
             "allow_local_model_download": payload.allow_local_model_download,
         }
     )
@@ -1360,6 +1402,20 @@ async def update_document_parsing_settings(payload: DocumentParsingUpdate):
         engines[name].update(merged)
 
     new_engine = payload.engine or full.get("engine")
+    image_model = full.get("image_description_model")
+    if "image_description_model" in payload.model_fields_set:
+        image_model = (
+            payload.image_description_model.model_dump()
+            if payload.image_description_model is not None
+            else None
+        )
+        if image_model is not None:
+            from deeptutor.services.llm.image_description import resolve_image_description_config
+
+            try:
+                resolve_image_description_config(image_model)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
     image_caption = (
         payload.image_caption
         if payload.image_caption is not None
@@ -1369,6 +1425,7 @@ async def update_document_parsing_settings(payload: DocumentParsingUpdate):
         {
             "engine": new_engine,
             "image_caption": image_caption,
+            "image_description_model": image_model,
             "engines": engines,
         }
     )
@@ -1940,7 +1997,9 @@ async def test_provider_connection(payload: ProviderProbePayload):
             status_code=400, detail="Saved credentials were not found. Enter the key again."
         )
     if payload.service == "search":
-        return await probe_search_provider(payload.binding, payload.base_url, key)
+        return await probe_search_provider(
+            payload.binding, payload.base_url, key, proxy=payload.proxy
+        )
     return await probe_provider(
         payload.binding, payload.base_url, key, payload.api_format, headers, payload.api_version
     )
@@ -1948,18 +2007,20 @@ async def test_provider_connection(payload: ProviderProbePayload):
 
 @router.post("/fetch-models")
 async def fetch_models_from_provider(payload: FetchModelsPayload):
-    """List the model IDs an OpenAI-compatible provider exposes.
+    """List selectable model IDs using the provider's own authentication.
 
     Thin HTTP surface over ``factory.fetch_models`` so the settings UI can
-    populate a model picker from ``base_url`` + ``api_key`` instead of making
-    the user type model IDs by hand.
+    populate a model picker. Copilot uses the caller's owner-private CLI login,
+    not the profile's API key or base URL.
     """
     _require_settings_admin()
     from deeptutor.services.llm.factory import fetch_models as fetch_llm_models
+    from deeptutor.services.provider_registry import canonical_provider_name
 
     base_url = (payload.base_url or "").strip()
     binding = (payload.binding or "").strip().lower() or "openai"
-    if not base_url and binding != "codebuddy":
+    is_copilot = canonical_provider_name(binding) == "github_copilot"
+    if not base_url and binding != "codebuddy" and not is_copilot:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="base_url is required for this provider.",
@@ -1967,7 +2028,9 @@ async def fetch_models_from_provider(payload: FetchModelsPayload):
 
     api_key = payload.api_key
     api_format = (payload.api_format or "").strip().lower()
-    if payload.profile_id and (api_key == CATALOG_SECRET_MASK or not api_format):
+    if is_copilot:
+        base_url, api_key, api_format = "", None, "auto"
+    elif payload.profile_id and (api_key == CATALOG_SECRET_MASK or not api_format):
         service = get_model_catalog_service().load().get("services", {}).get(payload.service, {})
         profile = next(
             (item for item in service.get("profiles", []) if item.get("id") == payload.profile_id),
@@ -1981,6 +2044,18 @@ async def fetch_models_from_provider(payload: FetchModelsPayload):
     try:
         model_ids = await fetch_llm_models(binding, base_url, api_key, api_format or "auto")
     except Exception as exc:  # noqa: BLE001 — surface any provider error as 502
+        if is_copilot:
+            # OAuth exceptions can contain credential-bearing URLs or responses.
+            # Never echo or log their raw text at this public HTTP boundary.
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=(
+                    "Could not list GitHub Copilot models. "
+                    "Run: deeptutor provider login github-copilot "
+                    "for this account in the server's DeepTutor home, "
+                    "then retry. If already logged in, check Copilot access and connectivity."
+                ),
+            ) from None
         logger.exception("Failed to fetch models from %s", base_url)
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
@@ -2080,6 +2155,36 @@ async def get_ui_settings():
     return {field: settings.get(field) for field in PRESESSION_UI_FIELDS}
 
 
+# Private: user-authored starting prompts must never enter the public /ui payload.
+def _page_customization() -> PageCustomization:
+    return PageCustomization.model_validate(load_ui_settings().get("page_customization") or {})
+
+
+@router.get("/page-customization")
+async def get_page_customization():
+    return _page_customization().model_dump()
+
+
+def _save_page_section(section: str, value: BaseModel) -> dict[str, Any]:
+    def update(stored):
+        current = PageCustomization.model_validate(stored.get("page_customization") or {})
+        setattr(current, section, value)
+        return {**stored, "page_customization": current.model_dump()}
+
+    atomic_update(_settings_file(), update)
+    return _page_customization().model_dump()
+
+
+@router.put("/page-customization/chat")
+async def update_chat_page_customization(update: ChatPageCustomization):
+    return _save_page_section("chat", update)
+
+
+@router.put("/page-customization/learning")
+async def update_learning_page_customization(update: LearningPageCustomization):
+    return _save_page_section("learning", update)
+
+
 @router.put("/ui")
 async def update_ui_settings(update: UISettingsUpdate):
     """Merge frontend partial update into current UI settings.
@@ -2144,6 +2249,26 @@ async def update_enabled_tools(update: EnabledToolsUpdate):
     return {"enabled_optional_tools": sanitized}
 
 
+@router.post("/voice/voices")
+async def list_voice_choices(payload: VoiceDiscoveryPayload):
+    """Read live account voices for a draft selection, without applying it."""
+    _require_settings_admin()
+    from deeptutor.services.voice.discovery import discover_voices
+
+    service = get_model_catalog_service()
+    current = service.load()
+    saved = get_settings_draft_service().load().get("catalog")
+    source = restore_catalog_secrets(saved, current) if isinstance(saved, dict) else current
+    catalog = service.resolve_connections(restore_catalog_secrets(payload.catalog, source))
+    try:
+        result = await discover_voices(catalog, payload.profile_id, payload.model_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return Response(
+        json.dumps(result), media_type="application/json", headers={"Cache-Control": "no-store"}
+    )
+
+
 @router.post(
     "/voice/preview",
     response_class=Response,
@@ -2152,8 +2277,8 @@ async def update_enabled_tools(update: EnabledToolsUpdate):
 async def preview_voice(payload: VoicePreviewPayload) -> Response:
     """Audition the model being edited without saving or activating its catalog."""
     _require_settings_admin()
-    from deeptutor.services.voice.base import VoiceProviderError
-    from deeptutor.services.voice.preview import synthesize_preview
+    from deeptutor.services.voice.base import VoiceProviderError, VoiceProviderTimeout
+    from deeptutor.services.voice.preview import preview_failure_message, synthesize_preview
 
     service = get_model_catalog_service()
     current = service.load()
@@ -2169,16 +2294,53 @@ async def preview_voice(payload: VoicePreviewPayload) -> Response:
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except VoiceProviderTimeout as exc:
+        raise HTTPException(status_code=504, detail=str(exc)) from exc
     except VoiceProviderError as exc:
-        # Other provider adapters may include raw upstream bodies in their errors.
-        # Never send those bodies (or echoed credentials) back to the browser.
         raise HTTPException(
             status_code=502,
-            detail=(
-                "Voice preview failed. Check the provider credentials, model, voice, language and format."
-            ),
+            detail=preview_failure_message(exc),
         ) from exc
     return Response(audio, media_type=content_type, headers={"Cache-Control": "no-store"})
+
+
+@router.post("/services/{service}/preview")
+async def preview_service(service: str, payload: ServicePreviewPayload):
+    """Stream a real result from the selected draft without applying it."""
+    _require_settings_admin()
+    from deeptutor.services.settings.service_preview import preview_events, validate_input
+    from deeptutor.services.voice.discovery import selected_catalog
+
+    try:
+        audio = validate_input(service, payload.text, payload.audio, payload.content_type)
+        catalog_service = get_model_catalog_service()
+        current = catalog_service.load()
+        saved = get_settings_draft_service().load().get("catalog")
+        source = restore_catalog_secrets(saved, current) if isinstance(saved, dict) else current
+        catalog = catalog_service.resolve_connections(
+            restore_catalog_secrets(payload.catalog, source)
+        )
+        selected_catalog(catalog, service, payload.profile_id, payload.model_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    async def stream():
+        async for event in preview_events(
+            catalog,
+            service,
+            payload.profile_id,
+            payload.model_id,
+            payload.text,
+            audio,
+            payload.content_type,
+        ):
+            yield json.dumps(event, ensure_ascii=False) + "\n"
+
+    return StreamingResponse(
+        stream(),
+        media_type="application/x-ndjson",
+        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+    )
 
 
 @router.post("/tests/{service}/start")

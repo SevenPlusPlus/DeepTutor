@@ -15,7 +15,7 @@ import {
   X,
 } from "lucide-react";
 import type { NotebookCategory, NotebookEntry } from "@/lib/notebook-api";
-import { optionIsAnswer } from "@/lib/question-bank-answers";
+import { optionIsAnswer, questionResult, questionResultBadge } from "@/lib/question-bank-answers";
 import { bookRoute, masterySessionRoute } from "@/lib/learning-routes";
 import CategoryMenu from "./CategoryMenu";
 import { practiceMarkdown } from "@/lib/practice-content";
@@ -66,40 +66,6 @@ const TREND_LABELS: Record<NotebookEntry["score_trend"], string> = {
   declined: "Declined",
   unchanged: "Unchanged",
 };
-
-function entryResult(entry: NotebookEntry): string {
-  if (entry.result) return entry.result;
-  return entry.is_correct ? "correct" : "incorrect";
-}
-
-function resultBadge(entry: NotebookEntry): {
-  label: string;
-  className: string;
-} {
-  const result = entryResult(entry);
-  if (result === "partial") {
-    return {
-      label: "Partially Correct",
-      className: "bg-amber-100 text-amber-700 dark:bg-amber-950/30 dark:text-amber-400",
-    };
-  }
-  if (result === "ungraded") {
-    return {
-      label: "Not Graded",
-      className: "bg-[var(--muted)] text-[var(--muted-foreground)]",
-    };
-  }
-  if (result === "correct" || entry.is_correct) {
-    return {
-      label: "Correct",
-      className: "bg-green-100 text-green-700 dark:bg-green-950/30 dark:text-green-400",
-    };
-  }
-  return {
-    label: "Incorrect",
-    className: "bg-red-100 text-red-700 dark:bg-red-950/30 dark:text-red-400",
-  };
-}
 
 interface QuestionCardProps {
   entry: NotebookEntry;
@@ -216,8 +182,8 @@ export default function QuestionCard({
   const isCode = entry.question_type === "coding";
   const questionImages = (entry.question_images || []).filter(image => Boolean(image.url));
   const filed = entry.categories || [];
-  const result = entryResult(entry);
-  const badge = resultBadge(entry);
+  const result = questionResult(entry);
+  const badge = questionResultBadge(entry);
   const showReviewState =
     !!entry.practice?.is_mistake || mistakesOnly || result === "incorrect" || result === "partial";
   const hasConversationSession =
@@ -316,12 +282,12 @@ export default function QuestionCard({
             onUnpick={onUnfile}
             onCreate={onCreateAndFile}
           />
-          <Tooltip label={entry.bookmarked ? t("Remove Bookmark") : t("Bookmark")}>
+          <Tooltip label={entry.bookmarked ? t("Unmark question") : t("Mark question")}>
             <button
               type="button"
               onClick={onToggleBookmark}
               disabled={disabled}
-              aria-label={entry.bookmarked ? t("Remove Bookmark") : t("Bookmark")}
+              aria-label={entry.bookmarked ? t("Unmark question") : t("Mark question")}
               className={`rounded-lg p-1.5 transition-colors disabled:opacity-40 ${
                 entry.bookmarked
                   ? "text-[var(--primary)]"

@@ -375,7 +375,9 @@ class PhotoIngestionService:
                 {},
             )
             prepared["subject"] = _subject(edited.get("subject", original.get("subject")))
-            prepared["grade"] = str(edited.get("grade", original.get("grade", "")) or "").strip()[:100]
+            prepared["grade"] = str(edited.get("grade", original.get("grade", "")) or "").strip()[
+                :100
+            ]
             prepared["knowledge_point"] = str(
                 edited.get("knowledge_point", original.get("knowledge_point", "")) or ""
             ).strip()[:200]

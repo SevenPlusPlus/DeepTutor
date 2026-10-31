@@ -3,6 +3,8 @@ import { expect, it, vi } from "vitest";
 import CoWriterWorkspace from "@/features/co-writer/components/CoWriterWorkspace";
 
 vi.mock("next/navigation", () => ({ useRouter: () => ({ push: vi.fn() }) }));
+// The header's workspace chip has its own tests; it reads the workspace list.
+vi.mock("@/components/sidebar/PageBar", () => ({ ScopeChip: () => null }));
 vi.mock("react-i18next", () => ({
   useTranslation: () => ({ t: (key: string) => key, i18n: { language: "en" } }),
 }));
@@ -23,6 +25,15 @@ vi.mock("@/lib/co-writer-api", () => ({
 vi.mock("@/lib/notebook-api", () => ({
   listNotebooks: vi.fn().mockResolvedValue([{ id: "notebook-1", name: "My notebook" }]),
   createNotebook: vi.fn(),
+}));
+vi.mock("@/hooks/useLLMOptions", () => ({
+  useLLMOptions: () => ({
+    options: [],
+    activeDefault: null,
+    loading: false,
+    error: false,
+    refresh: vi.fn(),
+  }),
 }));
 
 it("opens and closes the dynamically loaded notebook picker without changing the draft", async () => {

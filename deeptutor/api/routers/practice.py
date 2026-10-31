@@ -23,12 +23,12 @@ from deeptutor.services.practice.recognition import (
 from deeptutor.services.practice.recognition.extractor import LLMImageQuestionExtractor
 from deeptutor.services.practice.recognition.service import MAX_SOURCE_BYTES
 from deeptutor.services.practice.scheduler import Rating, day_bounds
-from deeptutor.services.practice.storage import PracticeStore, ReviewConflict
+from deeptutor.services.practice.storage import PracticeStore, ReviewConflict, ReviewScope
 from deeptutor.services.session import get_sqlite_session_store
 from deeptutor.services.workspace.context import current_workspace_id
 
-from .question_notebook import NotebookEntryItem, _course_session_ids
 from .photo_inbox import router as photo_inbox_router
+from .question_notebook import NotebookEntryItem, _course_session_ids
 
 router = APIRouter()
 router.include_router(photo_inbox_router, prefix="/photo-inbox")
@@ -117,6 +117,7 @@ class ReviewRequest(AnswerRequest):
     answer_revealed: bool = False
     attempt_kind: Literal["original", "spotcheck"] = "original"
     timezone: str = Field(default="UTC", max_length=100)
+    review_scope: ReviewScope = "mistakes"
 
 
 class ExposureRequest(BaseModel):
@@ -215,22 +216,34 @@ async def _entry(entry_id: int) -> dict:
 
 
 @router.get("/summary", response_model=PracticeSummary)
-async def summary(timezone: str = "UTC", course_id: str = "", all_workspaces: bool = False):
+async def summary(
+    timezone: str = "UTC",
+    course_id: str = "",
+    all_workspaces: bool = False,
+    review_scope: ReviewScope = "mistakes",
+):
     if all_workspaces and not course_id:
         from deeptutor.services.workspace.navigation import read_workspace_indexes
 
         _, end = _validate_timezone(timezone)
 
         async def read():
-            return [await summary(timezone, course_id)]
+            return [await summary(timezone, course_id, review_scope=review_scope)]
 
         rows, unavailable = await read_workspace_indexes(read)
         return {
             **{
                 key: sum(row.get(key, 0) for row in rows)
                 for key in (
-                    "total", "mistakes", "due", "overdue", "reviewed_today",
-                    "open", "verify", "closed", "paused",
+                    "total",
+                    "mistakes",
+                    "due",
+                    "overdue",
+                    "reviewed_today",
+                    "open",
+                    "verify",
+                    "closed",
+                    "paused",
                 )
             },
             "next_due_at": min(
@@ -249,6 +262,7 @@ async def summary(timezone: str = "UTC", course_id: str = "", all_workspaces: bo
             timezone,
             sessions,
             course_id=course_id,
+            review_scope=review_scope,
         )
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
@@ -261,6 +275,7 @@ async def queue(
     category_id: int | None = None,
     limit: int = Query(default=20, ge=1, le=100),
     all_workspaces: bool = False,
+    review_scope: ReviewScope = "mistakes",
 ):
     if all_workspaces and not course_id:
         from deeptutor.services.workspace.navigation import read_workspace_indexes
@@ -268,7 +283,7 @@ async def queue(
         _validate_timezone(timezone)
 
         async def read():
-            return await queue(timezone, course_id, category_id, limit)
+            return await queue(timezone, course_id, category_id, limit, review_scope=review_scope)
 
         rows, _ = await read_workspace_indexes(read)
         rows.sort(
@@ -291,6 +306,7 @@ async def queue(
             category_id,
             limit,
             course_id=course_id,
+            review_scope=review_scope,
         )
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
@@ -331,9 +347,15 @@ async def recommendations(
         async def read():
             # Gather candidates before applying the account-wide time budget.
             result = await recommendations(
-                timezone=timezone, course_id=course_id, category_id=category_id,
-                budget_minutes=60, subject=subject, query=query,
-                include_early=include_early, limit=100, grade=grade,
+                timezone=timezone,
+                course_id=course_id,
+                category_id=category_id,
+                budget_minutes=60,
+                subject=subject,
+                query=query,
+                include_early=include_early,
+                limit=100,
+                grade=grade,
             )
             return result["items"]
 
@@ -360,15 +382,17 @@ async def recommendations(
             entry_id = recommendation["entry_id"]
             entry = await store.get_notebook_entry(entry_id)
             if entry:
-                rows.append({
-                    "entry": entry,
-                    "state": await asyncio.to_thread(practice.state, entry_id),
-                    "content_workspace_id": current_workspace_id(),
-                    "recommendation": {
-                        key: recommendation[key]
-                        for key in ("score", "reasons", "estimated_minutes")
-                    },
-                })
+                rows.append(
+                    {
+                        "entry": entry,
+                        "state": await asyncio.to_thread(practice.state, entry_id),
+                        "content_workspace_id": current_workspace_id(),
+                        "recommendation": {
+                            key: recommendation[key]
+                            for key in ("score", "reasons", "estimated_minutes")
+                        },
+                    }
+                )
     chosen, minutes, topics = [], 0, {}
     while rows and len(chosen) < limit:
         if all_workspaces and not course_id:
@@ -379,15 +403,19 @@ async def recommendations(
                 topic = entry.get("knowledge_point_id") or entry.get("section_title") or ""
                 return (
                     -(row["recommendation"]["score"] - 12 * topics.get(topic, 0)),
-                    row.get("content_workspace_id", ""), entry["id"],
+                    row.get("content_workspace_id", ""),
+                    entry["id"],
                 )
+
             rows.sort(key=priority)
         row = rows.pop(0)
         duration = row["recommendation"]["estimated_minutes"]
         if minutes + duration <= budget_minutes:
             chosen.append(row)
             minutes += duration
-            topic = row["entry"].get("knowledge_point_id") or row["entry"].get("section_title") or ""
+            topic = (
+                row["entry"].get("knowledge_point_id") or row["entry"].get("section_title") or ""
+            )
             topics[topic] = topics.get(topic, 0) + 1
     return {
         "items": chosen,
@@ -468,7 +496,9 @@ async def record_exposure(entry_id: int, payload: ExposureRequest):
     try:
         return await asyncio.to_thread(
             PracticeStore(get_sqlite_session_store().db_path).expose,
-            entry_id, payload.request_id, payload.kind,
+            entry_id,
+            payload.request_id,
+            payload.kind,
         )
     except LookupError as exc:
         raise HTTPException(404, str(exc)) from exc
@@ -484,7 +514,9 @@ async def update_learning(entry_id: int, payload: LearningUpdateRequest):
     try:
         return await asyncio.to_thread(
             PracticeStore(get_sqlite_session_store().db_path).update_learning,
-            entry_id, payload.version, payload.paused,
+            entry_id,
+            payload.version,
+            payload.paused,
         )
     except LookupError as exc:
         raise HTTPException(404, str(exc)) from exc
@@ -517,6 +549,7 @@ async def review(entry_id: int, payload: ReviewRequest):
             answer_revealed=payload.answer_revealed,
             attempt_kind=payload.attempt_kind,
             timezone=payload.timezone,
+            review_scope=payload.review_scope,
         )
     except LookupError as exc:
         raise HTTPException(404, str(exc)) from exc
@@ -553,7 +586,10 @@ async def confirm_variant(entry_id: int, payload: VariantConfirmRequest):
     try:
         child_id = await asyncio.to_thread(
             _variant_service().confirm,
-            entry_id, payload.draft_id, payload.expected_version, payload.question,
+            entry_id,
+            payload.draft_id,
+            payload.expected_version,
+            payload.question,
             confirmed=payload.confirmed,
         )
         return await practice_question(child_id)

@@ -7,6 +7,12 @@ labels:
   consult_subagent: "Consult agent"
   final_response: "Final response"
 
+workspace_instructions_policy: |-
+  The user configured the following preferences for this workspace. Apply them to teaching,
+  collaboration and presentation, including in this capability. They take precedence over
+  generic style defaults; an explicit request in the current task can adjust these preferences.
+  Continue to follow the capability's required workflow, output protocol and tool permissions.
+
 general: |-
   You are DeepTutor, an interactive tutor and learning companion.
   Never describe internal stages, prompt blocks, or implementation details
@@ -124,6 +130,8 @@ loop:
     Complete only protocol steps, state transitions, or user interactions already made
     necessary by the work above; tools remain available only for that required follow-up.
     Then stop calling tools and provide the final user-facing answer.
+  user_sent_while_working: |-
+    [The user sent this while you were working. Take it into account from here on: answer it, or adjust what you are doing.]
   continue_truncated: |-
     Your previous response stopped at the token limit. Continue from where it ended
     without repeating it, and complete the user-facing answer.

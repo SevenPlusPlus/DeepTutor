@@ -6,6 +6,7 @@ import { useTranslation } from 'react-i18next'
 import { useSettings } from '@/features/settings/store/SettingsStore'
 import { apiFetch, apiUrl } from '@/lib/api'
 import { modelTestFingerprint } from '@/lib/model-settings'
+import { speechRequestTimeout, SPEECH_TIMEOUT_MESSAGE } from '@/lib/voice-settings'
 import { inputClass, subPanelClass } from './shared'
 import { registryButton } from './RegistryControls'
 
@@ -69,7 +70,9 @@ function PreviewRequest({
     const request = new AbortController()
     controller.current = request
     setPending(true)
-    const timeout = setTimeout(() => request.abort(), 65000)
+    const model = draft.services.tts.profiles.find(p => p.id === profileId)?.models.find(m => m.id === modelId)
+    // Allow the configured backend deadline plus time to return its error.
+    const timeout = setTimeout(() => request.abort(), (speechRequestTimeout(model) + 5) * 1000)
     try {
       const response = await apiFetch(apiUrl('/api/settings/voice/preview'), {
         method: 'POST',
@@ -78,9 +81,14 @@ function PreviewRequest({
         body: JSON.stringify({ catalog: draft, profile_id: profileId, model_id: modelId, text }),
       })
       if (!response.ok) {
-        const payload = await response.json()
+        // A reverse proxy can replace the backend's JSON error with an HTML
+        // page; parse defensively and surface the status instead of the
+        // resulting JSON syntax error.
+        const payload = (await response.json().catch(() => ({}))) as { detail?: unknown }
         throw new Error(
-          typeof payload.detail === 'string' ? payload.detail : 'Voice preview failed.'
+          typeof payload.detail === 'string' && payload.detail.trim()
+            ? payload.detail
+            : t('Voice preview failed (HTTP {{status}}).', { status: response.status })
         )
       }
       const audio = await response.blob()
@@ -91,7 +99,7 @@ function PreviewRequest({
     } catch (err) {
       if (!request.signal.aborted)
         setError(err instanceof Error ? err.message : 'Voice preview failed.')
-      else if (controller.current === request) setError('Voice preview was cancelled or timed out.')
+      else if (controller.current === request) setError(SPEECH_TIMEOUT_MESSAGE)
     } finally {
       clearTimeout(timeout)
       if (controller.current === request) setPending(false)

@@ -23,7 +23,7 @@ from deeptutor.agents.loop.context_budget import (
     resolve_window_info,
 )
 from deeptutor.capabilities import PromptBlock
-from deeptutor.core.context import UnifiedContext
+from deeptutor.core.context import TurnRuntimeContext, UnifiedContext, WorkspaceRuntimeContext
 from deeptutor.core.stream import StreamEvent, StreamEventType
 from deeptutor.core.tool_protocol import ToolResult
 from deeptutor.runtime.stream_bus import StreamBus
@@ -118,6 +118,21 @@ def test_capability_blocks_are_summed_under_one_key() -> None:
 
     assert _tokens(budget) == {
         "capability": _chars("## solve\naaa") + _chars("## obsidian\nbb"),
+    }
+
+
+def test_learning_journal_is_not_folded_into_capability() -> None:
+    snapshot = "## Mission\n- Topic: Fourier transform"
+    budget = _budget(blocks=[PromptBlock("learning_journal", snapshot)])
+
+    assert _tokens(budget) == {"learning_journal": _chars(f"## learning_journal\n{snapshot}")}
+
+
+def test_workspace_instructions_have_their_own_context_budget_segment() -> None:
+    content = "Explain with geometric intuition"
+    budget = _budget(blocks=[PromptBlock("workspace_instructions", content)])
+    assert _tokens(budget) == {
+        "workspace_instructions": _chars(f"## workspace_instructions\n{content}")
     }
 
 
@@ -441,6 +456,7 @@ async def test_turn_result_carries_the_context_budget(monkeypatch: pytest.Monkey
             user_message="Explain gradient descent",
             language="en",
             metadata={"turn_id": "t1"},
+            runtime=TurnRuntimeContext(workspace=WorkspaceRuntimeContext()),
         ),
         bus,
     )
@@ -522,6 +538,7 @@ async def test_forced_finish_still_reports_the_tools_the_turn_carried(
             user_message="Explain gradient descent",
             language="en",
             metadata={"turn_id": "t2"},
+            runtime=TurnRuntimeContext(workspace=WorkspaceRuntimeContext()),
         ),
         bus,
     )

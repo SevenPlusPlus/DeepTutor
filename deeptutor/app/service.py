@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 import contextlib
+import hashlib
+import json
 import time
 from typing import Any
 
@@ -17,6 +19,82 @@ from .contracts import TurnRequest
 
 
 class TurnApplicationService:
+    @staticmethod
+    def _submission_digest(payload: dict[str, Any]) -> str:
+        identity = {
+            key: value
+            for key, value in payload.items()
+            if key not in {"session_id", "workspace_id"}
+        }
+        return hashlib.sha256(
+            json.dumps(identity, sort_keys=True, default=str).encode()
+        ).hexdigest()
+
+    @workspace_writer
+    async def replace_submission(
+        self, original_id: str, payload: TurnRequest | dict[str, Any], *, start: bool = False
+    ) -> dict[str, Any]:
+        request = (
+            payload if isinstance(payload, TurnRequest) else TurnRequest.model_validate(payload)
+        )
+        if (
+            not request.client_submission_id
+            or not request.persist_user_message
+            or request.regenerate
+        ):
+            raise RuntimeError("An edited submission requires a new user message identity.")
+        from deeptutor.services.workspace.context import get_workspace_scope, workspace_context
+
+        wire = request.to_payload()
+        if get_workspace_scope() is None and "workspace_id" in wire:
+            with workspace_context(wire.get("workspace_id")):
+                return await self.replace_submission(original_id, request, start=start)
+        store, _ = self._resolve()
+        replace = getattr(store, "replace_submission", None)
+        if not callable(replace):
+            raise NotImplementedError("This session store does not support submission replacement.")
+        receipt = await replace(
+            original_id,
+            request.client_submission_id,
+            self._submission_digest(wire),
+            request.session_id,
+        )
+        if (
+            receipt["status"] == "admitted"
+            and receipt["turn"]["status"] in self._ACTIVE_TURN_STATUSES
+        ):
+            if not await self.cancel_turn_and_wait(receipt["turn"]["id"]):
+                raise RuntimeError("The original turn has not stopped yet. Please retry the edit.")
+            # Re-read only after the owner finishes: user persistence and
+            # cancellation can overlap before the original row exists.
+            receipt = await replace(
+                original_id,
+                request.client_submission_id,
+                self._submission_digest(wire),
+                receipt["session_id"],
+            )
+        if not start:
+            return receipt
+        wire["session_id"] = receipt["session_id"]
+        if receipt["status"] == "admitted":
+            if receipt["user_message_id"] is not None:
+                messages = await store.get_messages(receipt["session_id"])
+                original = next(
+                    (row for row in messages if row["id"] == receipt["user_message_id"]), None
+                )
+                if original is None:
+                    raise RuntimeError("The original message changed. Refresh before editing it.")
+                wire["parent_message_id"] = original.get("parent_message_id")
+            elif receipt["turn"]["status"] not in {"failed", "cancelled"}:
+                raise RuntimeError("The admitted message is not yet available for editing.")
+        session, turn = await self.start_turn(wire)
+        return {
+            "status": "started",
+            "session_id": session["id"],
+            "submission_id": request.client_submission_id,
+            "turn": turn,
+        }
+
     def __init__(
         self,
         store_provider: Any,
@@ -48,9 +126,34 @@ class TurnApplicationService:
             with workspace_context(payload.get("workspace_id")):
                 return await self.start_turn(payload)
         store, runtime = self._resolve()
+        reserve = getattr(store, "reserve_submission", None)
+        submission_turn = getattr(store, "submission_turn", None)
+        if (
+            request.client_submission_id
+            and request.persist_user_message
+            and not request.regenerate
+            and callable(reserve)
+            and callable(submission_turn)
+        ):
+            digest = self._submission_digest(payload)
+            payload["session_id"] = await reserve(
+                request.client_submission_id, digest, request.session_id
+            )
+            prior = await submission_turn(request.client_submission_id)
+            if prior is not None and prior["status"] not in {"failed", "cancelled"}:
+                session = await store.get_session(payload["session_id"])
+                if session is None:
+                    raise RuntimeError("Conversation not found in this workspace.")
+                return session, prior
         try:
             session, turn = await runtime.start_turn(payload)
         except ActiveTurnConflict:
+            if request.client_submission_id and callable(reserve) and callable(submission_turn):
+                prior = await submission_turn(request.client_submission_id)
+                if prior is not None:
+                    session = await store.get_session(prior["session_id"])
+                    if session is not None:
+                        return session, prior
             # Retry once, and only after something was actually reclaimed, so a
             # session busy with a live turn still gets its conflict.
             session_id = str(payload.get("session_id") or "")
@@ -133,6 +236,8 @@ class TurnApplicationService:
     #
     # The cap below exists only for a leaked lease; it is not the normal path.
     _POST_DONE_MAX_SECONDS = 30.0
+    _CANCEL_WAIT_INTERVAL_SECONDS = 0.05
+    _ACTIVE_TURN_STATUSES = frozenset({"queued", "running", "waiting_input"})
 
     @staticmethod
     def _done_has_tail(event: dict[str, Any]) -> bool:
@@ -163,20 +268,20 @@ class TurnApplicationService:
                 done = True
                 tail_possible = self._done_has_tail(event)
             yield event
-        if done:
-            # The turn had already finished before this subscription opened, so
-            # the durable replay above carried its post-DONE events too. Only
-            # bail out once the terminal row confirms that; a turn still marked
-            # running with a DONE in its journal is mid-teardown and its title
-            # may not be written yet.
-            turn = await store.get_turn(turn_id)
-            if not tail_possible or turn is None or str(turn.get("status") or "") != "running":
-                return
+        if done and not tail_possible:
+            return
+        # A completed row can still have an owned title tail. Drain it below,
+        # including durable events committed after the initial replay (#1971).
 
         first_done_at: float | None = time.monotonic() if done else None
         while True:
             emitted = False
-            for event in await self.coordinator.read_events(turn_id, last_seq):
+            events = await self.coordinator.read_events(turn_id, last_seq)
+            if not events and await self.coordinator.get_lease(turn_id) is None:
+                # The completed in-memory stream may have been reclaimed
+                # while this subscriber was paused. Its durable tail remains.
+                events = await store.get_events(turn_id, last_seq)
+            for event in events:
                 seq = int(event.get("seq") or 0)
                 if seq <= last_seq:
                     continue
@@ -201,22 +306,44 @@ class TurnApplicationService:
                 if now - first_done_at >= self._POST_DONE_MAX_SECONDS:
                     return
                 if not emitted:
-                    await asyncio.sleep(0.1)
+                    await self._wait_for_turn_events(turn_id, last_seq)
                 continue
             turn = await store.get_turn(turn_id)
             if turn is None:
                 return
             status = str(turn.get("status") or "")
             if status in {"completed", "failed", "cancelled"}:
-                # A terminal row without DONE can only be legacy data. Keep the
-                # compatibility envelope stable while all new paths journal
-                # DONE before the terminal CAS.
+                # Completion can commit before the owner publishes DONE. Do
+                # not synthesize an id-less envelope in that window (#1971).
+                if await self.coordinator.get_lease(turn_id) is not None:
+                    await asyncio.sleep(0.1)
+                    continue
+                # Ownership/cleanup can change between the reads above.
+                if await store.get_events(turn_id, last_seq):
+                    continue
+                # Recovery can commit FAILED before its terminal journal is
+                # written. A client may also have seen volatile events beyond
+                # the durable cursor. In either case preserve the failure
+                # envelope: DONE alone hides errors on partial responses.
                 metadata = {
                     "status": status,
                     "synthesized": True,
                     "error_code": str(turn.get("failure_code") or ""),
                     "retryable": bool(turn.get("retryable")),
                 }
+                if status == "failed":
+                    last_seq += 1
+                    yield {
+                        "type": "error",
+                        "source": "turn_application",
+                        "stage": "",
+                        "content": str(turn.get("error") or "Turn failed; retry to continue"),
+                        "metadata": {**metadata, "turn_terminal": True},
+                        "session_id": turn.get("session_id", ""),
+                        "turn_id": turn_id,
+                        "seq": last_seq,
+                        "timestamp": time.time(),
+                    }
                 yield {
                     "type": "done",
                     "source": "turn_application",
@@ -230,7 +357,17 @@ class TurnApplicationService:
                 }
                 return
             if not emitted:
-                await asyncio.sleep(0.1)
+                await self._wait_for_turn_events(turn_id, last_seq)
+
+    async def _wait_for_turn_events(self, turn_id: str, after_seq: int) -> None:
+        # Notifications accelerate the live path; they never replace durable
+        # replay or the periodic terminal-state checks. Older/distributed
+        # coordinator adapters can keep their existing polling behavior.
+        wait = getattr(self.coordinator, "wait_for_events", None)
+        if wait is None:
+            await asyncio.sleep(0.1)
+        else:
+            await wait(turn_id, after_seq, timeout=0.5)
 
     async def subscribe_session(
         self,
@@ -281,6 +418,40 @@ class TurnApplicationService:
         return True
 
     @workspace_writer
+    async def cancel_turn_and_wait(
+        self,
+        turn_id: str,
+        *,
+        command_id: str | None = None,
+        timeout_seconds: float = 15.0,
+    ) -> bool:
+        """Stop a live turn and wait until its owner has finished teardown."""
+        if not await self.cancel_turn(turn_id, command_id=command_id):
+            return False
+        store, _runtime = self._resolve()
+        deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+        released = False
+        while True:
+            turn = await store.get_turn(turn_id)
+            status = str((turn or {}).get("status") or "")
+            lease = await self.coordinator.get_lease(turn_id)
+            if turn is not None and status not in self._ACTIVE_TURN_STATUSES and lease is None:
+                released = True
+                break
+            if turn is None and lease is None:
+                released = True
+                break
+            if time.monotonic() >= deadline:
+                break
+            await asyncio.sleep(self._CANCEL_WAIT_INTERVAL_SECONDS)
+        if released:
+            # Lease release happens just before the owner's activity guard
+            # exits. Leave one polling interval so deletion does not race that
+            # final unwind.
+            await asyncio.sleep(self._CANCEL_WAIT_INTERVAL_SECONDS)
+        return released
+
+    @workspace_writer
     async def submit_user_reply(
         self,
         turn_id: str,
@@ -327,10 +498,10 @@ class TurnApplicationService:
         seconds whether or not it is producing output, so "no lease" is the one
         signal that separates a zombie from a slow human.
 
-        Doing it here rather than on a timer is what makes it safe: the only
-        rows ever considered are ones already blocking a real request, so
-        there is no window in which a just-inserted turn can be swept before
-        its first renewal — the hazard that kept the periodic version out.
+        This synchronous path avoids waiting for the background recovery
+        pass when a new request is already blocked. Admission acquires its
+        lease before inserting a turn, so a live new row is protected even
+        before its first renewal.
 
         Returns ``True`` when something was reaped and the caller should retry.
         """
@@ -429,6 +600,7 @@ class TurnApplicationService:
         content: str,
         *,
         command_id: str | None = None,
+        withdraw: str | None = None,
     ) -> bool:
         store, _runtime = self._resolve()
         if (
@@ -439,7 +611,7 @@ class TurnApplicationService:
         await self.coordinator.submit_command(
             turn_id,
             "user_input",
-            {"content": content},
+            {"content": content, "withdraw": withdraw},
             command_id=command_id,
         )
         return True

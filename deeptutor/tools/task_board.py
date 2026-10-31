@@ -19,7 +19,9 @@ from deeptutor.services.task_board import (
     TaskCard,
     UpdateCard,
     get_task_board_store,
+    workspace_board,
 )
+from deeptutor.services.workspace.context import current_workspace_id
 
 _ACTIONS = ["create", "list", "get", "update", "complete", "archive", "restore"]
 _STATUSES = ["todo", "doing", "done"]
@@ -27,6 +29,16 @@ _STATUSES = ["todo", "doing", "done"]
 
 class TaskBoardAccessError(PermissionError):
     """The current conversation cannot safely identify a personal board."""
+
+
+def _partner_turn():
+    from deeptutor.modules.catalog import module_enabled
+
+    if not module_enabled("partners"):
+        return None
+    from deeptutor.services.partners.interaction import get_partner_turn_context
+
+    return get_partner_turn_context()
 
 
 def _store_for_turn() -> TaskBoardStore:
@@ -38,9 +50,7 @@ def _store_for_turn() -> TaskBoardStore:
     human's default workspace. An unlinked or group message has no actor and
     therefore cannot mutate anybody's personal board.
     """
-    from deeptutor.services.partners.interaction import get_partner_turn_context
-
-    turn = get_partner_turn_context()
+    turn = _partner_turn()
     if turn is None:
         return get_task_board_store()
     if turn.actor is None:
@@ -49,10 +59,11 @@ def _store_for_turn() -> TaskBoardStore:
             "Use /link in a direct message before managing personal tasks."
         )
 
-    from deeptutor.multi_user.paths import get_path_service_for_scope
+    from deeptutor.multi_user.paths import user_context
+    from deeptutor.services.workspace.context import workspace_context
 
-    paths = get_path_service_for_scope(turn.actor.scope)
-    return TaskBoardStore(paths.get_workspace_dir() / "task-board" / "cards.sqlite")
+    with user_context(turn.actor), workspace_context(""):
+        return get_task_board_store()
 
 
 def _card_payload(card: TaskCard) -> dict[str, Any]:
@@ -135,6 +146,7 @@ class TaskBoardTool(BaseTool):
             store = _store_for_turn()
         except TaskBoardAccessError as exc:
             return ToolResult(content=f"Task board unavailable: {exc}", success=False)
+        workspace_id = "" if _partner_turn() is not None else current_workspace_id()
 
         if action == "list":
             status = str(kwargs.get("status") or "").strip().lower()
@@ -143,9 +155,8 @@ class TaskBoardTool(BaseTool):
             include_archived = bool(kwargs.get("include_archived", False))
             cards = [
                 card
-                for card in store.read().cards
-                if (include_archived or not card.archived)
-                and (not status or card.status == status)
+                for card in workspace_board(store.read(), workspace_id).cards
+                if (include_archived or not card.archived) and (not status or card.status == status)
             ]
             if not cards:
                 return ToolResult(
@@ -167,7 +178,8 @@ class TaskBoardTool(BaseTool):
                     CreateCard(
                         title=kwargs.get("title", ""),
                         note=kwargs.get("note", ""),
-                    )
+                    ),
+                    workspace_id=workspace_id,
                 )
             except ValidationError as exc:
                 return ToolResult(content=f"Could not create task: {exc}", success=False)
@@ -184,7 +196,7 @@ class TaskBoardTool(BaseTool):
 
         if action == "get":
             try:
-                card = store.get(card_id)
+                card = store.get(card_id, workspace_id=workspace_id)
             except KeyError:
                 return ToolResult(content=f"Task not found: {card_id}", success=False)
             return ToolResult(
@@ -214,8 +226,8 @@ class TaskBoardTool(BaseTool):
             payload = UpdateCard(archived=False)
 
         try:
-            store.update(card_id, payload)
-            card = store.get(card_id)
+            store.update(card_id, payload, workspace_id=workspace_id)
+            card = store.get(card_id, workspace_id=workspace_id)
         except KeyError:
             return ToolResult(content=f"Task not found: {card_id}", success=False)
         return ToolResult(

@@ -40,7 +40,13 @@ _ARTICLE_FIXTURE = Path(__file__).parents[1] / "fixtures" / "web" / "vector_arti
 
 
 @pytest.fixture
-def stores(tmp_path: Path):
+def stores(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    # These tests use synthetic media bytes and injected transcription. Keep
+    # metadata probing synthetic too, independently of host ffmpeg binaries.
+    async def probe_media(_path: Path) -> tuple[float, bytes]:
+        return 0.0, b""
+
+    monkeypatch.setattr(ingestion_module, "_probe_media", probe_media)
     root = tmp_path / "reading"
     return ReadingStore(root), ReadingCatalogStore(root)
 
@@ -377,6 +383,31 @@ def test_heading_sections_keep_long_continuations_under_the_same_title() -> None
         len(units[row.locator - 1]) <= SECTION_HARD_CHARS + len("## Long section\n\n")
         for row in long_rows
     )
+
+
+@pytest.mark.parametrize(
+    "block",
+    [
+        pytest.param("````md\n```py\n# Not a heading\n```\n````", id="longer-fence-around-example"),
+        pytest.param("```bash\n```py\n# Not a heading\n```", id="fence-with-info-does-not-close"),
+        pytest.param("~~~\n# Not a heading\n~~~", id="tilde-fence"),
+    ],
+)
+def test_heading_splitter_ignores_headings_inside_fenced_code(block: str) -> None:
+    markdown = f"# Guide\n\nIntro.\n\n{block}\n\n## Next\n\nDone."
+
+    units, outline = split_markdown_by_headings(markdown)
+
+    assert [row.title for row in outline] == ["Guide", "Next"]
+    assert "# Not a heading" in units[0]
+
+
+def test_heading_splitter_does_not_open_a_fence_on_inline_backticks() -> None:
+    markdown = "# Guide\n\n```inline``` code.\n\n## Next\n\nDone."
+
+    _units, outline = split_markdown_by_headings(markdown)
+
+    assert [row.title for row in outline] == ["Guide", "Next"]
 
 
 def test_heading_splitter_falls_back_when_only_the_page_title_exists() -> None:

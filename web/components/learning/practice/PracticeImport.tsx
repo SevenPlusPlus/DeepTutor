@@ -38,7 +38,7 @@ export function PracticeImport({
     setPreview(null);
     setFilename(file.name);
     try {
-      setPreview(await previewPracticeImport(file, target, courseId));
+      setPreview(await (courseId ? previewPracticeImport(file, target, courseId) : previewPracticeImport(file, target)));
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {

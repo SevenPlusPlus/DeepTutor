@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -23,13 +24,26 @@ def _fake_skill_service() -> SimpleNamespace:
 
 
 @pytest.fixture(autouse=True)
-def _isolate_runtime_skills(monkeypatch):
+def _isolate_runtime_services(monkeypatch, tmp_path):
+    from deeptutor.services.path_service import PathService
+    from deeptutor.services.task_board import TaskBoardStore
+
+    paths = PathService(workspace_root=tmp_path / "data")
+    monkeypatch.setattr("deeptutor.services.workspace.service.get_path_service", lambda: paths)
+
+    board = TaskBoardStore(tmp_path / "tasks.sqlite")
+    monkeypatch.setattr(
+        "deeptutor.services.task_board.get_task_board_store", lambda **_kwargs: board
+    )
     # Runtime now resolves multiple skill libraries; these turn tests use an
     # empty catalog and must not inspect the developer's real skill folders.
     monkeypatch.setattr(
         "deeptutor.services.skill.runtime.skill_sources",
         lambda **kwargs: [(_fake_skill_service(), None, "account")],
     )
+    # Title generation has its own tests. Fake turn providers must not start
+    # an unrelated online LLM call after emitting their final stream event.
+    monkeypatch.setattr(TurnRuntimeManager, "_maybe_generate_session_title", _noop_async)
 
 
 def _fake_persona_service() -> SimpleNamespace:
@@ -102,6 +116,17 @@ async def test_turn_runtime_replays_events_and_materializes_messages(
 ) -> None:
     store = SQLiteSessionStore(tmp_path / "chat_history.db")
     runtime = TurnRuntimeManager(store)
+    from deeptutor.services.task_board import CreateCard, UpdateCard, get_task_board_store
+
+    board = get_task_board_store()
+    assigned = board.create(CreateCard(title="Shared workspace task")).cards[-1]
+    board.update(assigned.id, UpdateCard(workspace_id=""))
+    linked = board.create(CreateCard(title="Conversation task")).cards[-1]
+    requested = consultation.get("config", consultation)
+    consultation = {
+        **consultation,
+        "config": {**consultation.get("config", {}), "linked_task_ids": [linked.id]},
+    }
     captured: dict[str, object] = {}
     publish_order: list[str] = []
     original_publish = runtime._publish_live_event
@@ -149,6 +174,7 @@ async def test_turn_runtime_replays_events_and_materializes_messages(
             captured["partner_discussion_group_id"] = context.runtime.partner_discussion_group_id
             assert "consult_partner_id" not in context.config_overrides
             assert "partner_discussion_group_id" not in context.config_overrides
+            assert "linked_task_ids" not in context.config_overrides
             captured["user_message"] = context.user_message
             captured["metadata"] = context.metadata
             captured["source_manifest"] = context.source_manifest
@@ -224,7 +250,6 @@ async def test_turn_runtime_replays_events_and_materializes_messages(
     ]
     done_event = next(e for e in events if e["type"] == "done")
     assert done_event["metadata"]["status"] == "completed"
-    requested = consultation.get("config", consultation)
     assert captured["consult_partner_id"] == requested.get("consult_partner_id")
     assert captured["partner_discussion_group_id"] == requested.get("partner_discussion_group_id")
 
@@ -261,6 +286,9 @@ async def test_turn_runtime_replays_events_and_materializes_messages(
     # surfaces in ``context.source_manifest`` and ``metadata.source_index``.
     assert str(captured["user_message"]) == "hello, i'm frank"
     manifest = str(captured.get("source_manifest") or "")
+    assert "Shared workspace task" in manifest
+    assert "Conversation task" in manifest
+    assert board.read().session_links[0].task_ids == [linked.id]
     assert "[Attached Sources]" in manifest
     # Book source id is now per-book (``bk-{book_id}``) so multi-book
     # sessions can read_source each independently. The mocked book has id
@@ -276,6 +304,7 @@ async def test_turn_runtime_replays_events_and_materializes_messages(
     assert detail["messages"][1]["content"] == "Hello Frank"
     assert detail["preferences"] == {
         "capability": "chat",
+        "answer_by": "",
         "tools": [],
         "knowledge_bases": [],
         "language": "en",
@@ -495,8 +524,13 @@ async def test_turn_runtime_persists_llm_selection_in_turn_snapshot(
         }
     )
 
+    execution = runtime._executions[turn["id"]]
+    assert execution.task is not None
     async for _event in runtime.subscribe_turn(turn["id"], after_seq=0):
         pass
+    # A replay subscriber can observe DONE before the runner's finally block.
+    # Model-scope reset is an execution cleanup assertion, not a stream one.
+    await asyncio.wait_for(execution.task, timeout=5)
 
     detail = await store.get_session_with_messages(session["id"])
     assert detail is not None
@@ -599,6 +633,85 @@ async def test_turn_runtime_session_persona_persists_falls_back_and_clears(
     assert cleared_snapshot["enabledTools"] == []
     assert cleared_snapshot["knowledgeBases"] == []
     assert cleared_snapshot["memoryReferences"] == []
+
+
+@pytest.mark.asyncio
+async def test_turn_runtime_keeps_who_answers_on_the_session(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    """The answerer is restated every turn and the latest is stored, so a
+    reloaded conversation stays with whoever it was handed to."""
+    store = SQLiteSessionStore(tmp_path / "chat_history.db")
+    runtime = TurnRuntimeManager(store)
+    seen: list[str | None] = []
+
+    class FakeContextBuilder:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        async def build(self, **_kwargs):
+            return SimpleNamespace(
+                conversation_history=[],
+                conversation_summary="",
+                context_text="",
+                token_count=0,
+                budget=0,
+            )
+
+    class FakeOrchestrator:
+        async def handle(self, context):
+            seen.append(context.runtime.answer_by)
+            yield StreamEvent(
+                type=StreamEventType.CONTENT,
+                source="chat",
+                stage="responding",
+                content="ok",
+                metadata={"call_kind": "llm_final_response"},
+            )
+            yield StreamEvent(type=StreamEventType.DONE, source="chat")
+
+    monkeypatch.setattr("deeptutor.services.llm.config.get_llm_config", lambda: SimpleNamespace())
+    monkeypatch.setattr(
+        "deeptutor.services.session.context_builder.ContextBuilder", FakeContextBuilder
+    )
+    monkeypatch.setattr("deeptutor.runtime.orchestrator.ChatOrchestrator", FakeOrchestrator)
+    monkeypatch.setattr(
+        "deeptutor.services.memory.get_memory_store",
+        lambda: SimpleNamespace(read_l3_concat=lambda: "", emit=_noop_async),
+    )
+    monkeypatch.setattr("deeptutor.services.skill.get_skill_service", _fake_skill_service)
+    monkeypatch.setattr("deeptutor.services.persona.get_persona_service", _fake_persona_service)
+
+    async def run_turn(session_id, extra):
+        session, turn = await runtime.start_turn(
+            {
+                "type": "start_turn",
+                "content": "hi",
+                "session_id": session_id,
+                "capability": None,
+                "tools": [],
+                "knowledge_bases": [],
+                "attachments": [],
+                "language": "en",
+                "config": {},
+                **extra,
+            }
+        )
+        async for _event in runtime.subscribe_turn(turn["id"], after_seq=0):
+            pass
+        return session
+
+    session = await run_turn(None, {"answer_by": "partner:paul"})
+    detail = await store.get_session_with_messages(session["id"])
+    assert detail["preferences"]["answer_by"] == "partner:paul"
+    assert detail["messages"][0]["metadata"]["request_snapshot"]["answerBy"] == "partner:paul"
+
+    # Handed back: a turn without an answerer is DeepTutor's, and says so.
+    await run_turn(session["id"], {})
+    detail = await store.get_session_with_messages(session["id"])
+    assert detail["preferences"]["answer_by"] == ""
+    assert seen == ["partner:paul", None]
 
 
 @pytest.mark.asyncio
@@ -1040,6 +1153,7 @@ async def test_turn_runtime_injects_memory_and_refreshes_after_completion(
         async def handle(self, context):
             captured["conversation_history"] = context.conversation_history
             captured["memory_context"] = context.memory_context
+            captured["learning_journal_context"] = context.learning_journal_context
             captured["conversation_context_text"] = context.metadata.get(
                 "conversation_context_text"
             )
@@ -1070,6 +1184,12 @@ async def test_turn_runtime_injects_memory_and_refreshes_after_completion(
             emit=fake_emit,
         ),
     )
+    monkeypatch.setattr(
+        "deeptutor.services.learning_journal.get_learning_journal_store",
+        lambda: SimpleNamespace(
+            injection_markdown=lambda: "# Learning journal\n## Mission\n- Topic: FFT",
+        ),
+    )
     monkeypatch.setattr("deeptutor.services.skill.get_skill_service", _fake_skill_service)
     monkeypatch.setattr("deeptutor.services.persona.get_persona_service", _fake_persona_service)
 
@@ -1092,6 +1212,7 @@ async def test_turn_runtime_injects_memory_and_refreshes_after_completion(
         pass
 
     assert captured["memory_context"] == "## Memory\n## Preferences\n- Prefer concise answers."
+    assert captured["learning_journal_context"] == ("# Learning journal\n## Mission\n- Topic: FFT")
     assert captured["conversation_history"] == []
     assert captured["conversation_context_text"] == "Recent chat summary"
 
@@ -1338,3 +1459,317 @@ async def test_reattaching_the_same_image_does_not_duplicate_it(
     # record and the re-attached prior entry share one URL, and the URL is
     # the dedupe key.
     assert [att.url for att in captured[1]] == [image_attachment["url"]]
+
+
+@pytest.mark.asyncio
+async def test_selection_tutoring_never_mounts_the_learning_journal(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    """A selected-text question must not inherit a carried-over study mission (#740).
+
+    The journal snapshot is a standing part of the system prompt, so a sidebar
+    question about one passage would otherwise answer *as if* it knew what the
+    learner is studying. Memory avoids this by only reading what the client
+    asks for; the journal has no such client input, so it needs its own guard.
+    Asserting the store is never consulted pins that guard, rather than a
+    snapshot that merely happens to be empty.
+    """
+    store = SQLiteSessionStore(tmp_path / "chat_history.db")
+    runtime = TurnRuntimeManager(store)
+    captured: dict[str, object] = {}
+    journal_reads: list[str] = []
+
+    class FakeContextBuilder:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        async def build(self, **_kwargs):
+            return SimpleNamespace(
+                conversation_history=[],
+                conversation_summary="",
+                context_text="",
+                token_count=0,
+                budget=0,
+            )
+
+    class FakeOrchestrator:
+        async def handle(self, context):
+            captured["learning_journal_context"] = context.learning_journal_context
+            yield StreamEvent(
+                type=StreamEventType.CONTENT,
+                source="chat",
+                stage="responding",
+                content="It forks the process.",
+                metadata={"call_kind": "llm_final_response"},
+            )
+            yield StreamEvent(type=StreamEventType.DONE, source="chat")
+
+    class FakeJournalStore:
+        def injection_markdown(self) -> str:
+            journal_reads.append("consulted")
+            return "# Learning journal\n## Mission\n- Topic: FFT"
+
+    monkeypatch.setattr("deeptutor.services.llm.config.get_llm_config", lambda: SimpleNamespace())
+    monkeypatch.setattr(
+        "deeptutor.services.session.context_builder.ContextBuilder", FakeContextBuilder
+    )
+    monkeypatch.setattr("deeptutor.runtime.orchestrator.ChatOrchestrator", FakeOrchestrator)
+    monkeypatch.setattr(
+        "deeptutor.services.memory.get_memory_store",
+        lambda: SimpleNamespace(read_l3_concat=lambda: "## Preferences\n- Concise.", emit=None),
+    )
+    monkeypatch.setattr(
+        "deeptutor.services.learning_journal.get_learning_journal_store",
+        lambda: FakeJournalStore(),
+    )
+    monkeypatch.setattr("deeptutor.services.skill.get_skill_service", _fake_skill_service)
+    monkeypatch.setattr("deeptutor.services.persona.get_persona_service", _fake_persona_service)
+
+    _session, turn = await runtime.start_turn(
+        {
+            "type": "start_turn",
+            "content": "what does this line mean?",
+            "session_id": None,
+            "capability": None,
+            "tools": [],
+            "knowledge_bases": [],
+            "attachments": [],
+            # Deliberately still requested: the client opting into memory must
+            # not be what keeps the journal out of a selection turn.
+            "memory_references": ["preferences"],
+            "language": "en",
+            "config": {},
+            "selection_tutor_context": {
+                "selected_text": "fork() returns in two processes.",
+                "source_message_text": "In Unix, fork() returns in two processes.",
+                "source_message_role": "assistant",
+            },
+        }
+    )
+
+    async for _event in runtime.subscribe_turn(turn["id"], after_seq=0):
+        pass
+
+    assert captured["learning_journal_context"] == ""
+    assert journal_reads == []
+
+
+@pytest.mark.asyncio
+async def test_side_chats_never_mount_the_learning_journal(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    """A side-chat question must not inherit a carried-over study mission (#740).
+
+    The journal snapshot is a standing part of the system prompt, so a sidebar
+    question about the conversation would otherwise answer *as if* it knew what the
+    learner is studying. Memory avoids this by only reading what the client
+    asks for; the journal has no such client input, so it needs its own guard.
+    Asserting the store is never consulted pins that guard, rather than a
+    snapshot that merely happens to be empty.
+    """
+    store = SQLiteSessionStore(tmp_path / "chat_history.db")
+    runtime = TurnRuntimeManager(store)
+    captured: dict[str, object] = {}
+    journal_reads: list[str] = []
+
+    class FakeContextBuilder:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        async def build(self, **_kwargs):
+            return SimpleNamespace(
+                conversation_history=[],
+                conversation_summary="",
+                context_text="",
+                token_count=0,
+                budget=0,
+            )
+
+    class FakeOrchestrator:
+        async def handle(self, context):
+            captured["learning_journal_context"] = context.learning_journal_context
+            yield StreamEvent(
+                type=StreamEventType.CONTENT,
+                source="chat",
+                stage="responding",
+                content="It forks the process.",
+                metadata={"call_kind": "llm_final_response"},
+            )
+            yield StreamEvent(type=StreamEventType.DONE, source="chat")
+
+    class FakeJournalStore:
+        def injection_markdown(self) -> str:
+            journal_reads.append("consulted")
+            return "# Learning journal\n## Mission\n- Topic: FFT"
+
+    monkeypatch.setattr("deeptutor.services.llm.config.get_llm_config", lambda: SimpleNamespace())
+    monkeypatch.setattr(
+        "deeptutor.services.session.context_builder.ContextBuilder", FakeContextBuilder
+    )
+    monkeypatch.setattr("deeptutor.runtime.orchestrator.ChatOrchestrator", FakeOrchestrator)
+    monkeypatch.setattr(
+        "deeptutor.services.memory.get_memory_store",
+        lambda: SimpleNamespace(read_l3_concat=lambda: "## Preferences\n- Concise.", emit=None),
+    )
+    monkeypatch.setattr(
+        "deeptutor.services.learning_journal.get_learning_journal_store",
+        lambda: FakeJournalStore(),
+    )
+    monkeypatch.setattr("deeptutor.services.skill.get_skill_service", _fake_skill_service)
+    monkeypatch.setattr("deeptutor.services.persona.get_persona_service", _fake_persona_service)
+
+    parent = await store.ensure_session(None)
+    await store.add_message(parent["id"], "assistant", "In Unix, fork() returns in two processes.")
+    _session, turn = await runtime.start_turn(
+        {
+            "type": "start_turn",
+            "content": "what does this line mean?",
+            "session_id": None,
+            "capability": None,
+            "tools": [],
+            "knowledge_bases": [],
+            "attachments": [],
+            # Deliberately still requested: the client opting into memory must
+            # not be what keeps the journal out of a side chat.
+            "memory_references": ["preferences"],
+            "language": "en",
+            "config": {},
+            "selection_tutor_context": {"parent_session_id": parent["id"]},
+        }
+    )
+
+    async for _event in runtime.subscribe_turn(turn["id"], after_seq=0):
+        pass
+
+    assert captured["learning_journal_context"] == ""
+    assert journal_reads == []
+
+
+def _patch_turn_services(monkeypatch, orchestrator) -> None:
+    class FakeContextBuilder:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        async def build(self, **_kwargs):
+            return SimpleNamespace(
+                conversation_history=[],
+                conversation_summary="",
+                context_text="",
+                token_count=0,
+                budget=0,
+            )
+
+    monkeypatch.setattr("deeptutor.services.llm.config.get_llm_config", lambda: SimpleNamespace())
+    monkeypatch.setattr(
+        "deeptutor.services.session.context_builder.ContextBuilder", FakeContextBuilder
+    )
+    monkeypatch.setattr("deeptutor.runtime.orchestrator.ChatOrchestrator", orchestrator)
+    monkeypatch.setattr("deeptutor.services.skill.get_skill_service", _fake_skill_service)
+    monkeypatch.setattr("deeptutor.services.persona.get_persona_service", _fake_persona_service)
+
+
+@pytest.mark.asyncio
+async def test_a_quote_is_read_back_in_front_of_the_question(monkeypatch, tmp_path) -> None:
+    """A selection added to the composer reaches the model as quoted text —
+    not as a document to extract — and the stored attachment keeps its words."""
+    import base64
+
+    store = SQLiteSessionStore(tmp_path / "chat_history.db")
+    runtime = TurnRuntimeManager(store)
+    captured: dict[str, object] = {}
+
+    class FakeOrchestrator:
+        async def handle(self, context):
+            captured["message"] = context.user_message
+            yield StreamEvent(
+                type=StreamEventType.CONTENT,
+                source="chat",
+                stage="responding",
+                content="Because the child gets 0.",
+                metadata={"call_kind": "llm_final_response"},
+            )
+            yield StreamEvent(type=StreamEventType.DONE, source="chat")
+
+    _patch_turn_services(monkeypatch, FakeOrchestrator)
+    quote = "fork() returns twice:\nonce in each process."
+    session, turn = await runtime.start_turn(
+        {
+            "type": "start_turn",
+            "content": "Why twice?",
+            "session_id": None,
+            "capability": None,
+            "tools": [],
+            "knowledge_bases": [],
+            "attachments": [
+                {
+                    "type": "quote",
+                    "filename": "quote.md",
+                    "mime_type": "text/markdown",
+                    "base64": base64.b64encode(quote.encode()).decode(),
+                }
+            ],
+            "language": "en",
+            "config": {},
+        }
+    )
+    async for _event in runtime.subscribe_turn(turn["id"], after_seq=0):
+        pass
+
+    message = str(captured["message"])
+    assert "> fork() returns twice:\n> once in each process." in message
+    assert message.rstrip().endswith("Why twice?")
+    assert "[Attached Documents]" not in message
+    detail = await store.get_session_with_messages(session["id"])
+    user = next(m for m in detail["messages"] if m["role"] == "user")
+    assert user["content"] == "Why twice?"
+    assert user["attachments"][0]["type"] == "quote"
+    assert user["attachments"][0]["extracted_text"] == quote
+
+
+@pytest.mark.asyncio
+async def test_a_message_sent_mid_turn_waits_in_the_turn_inbox(monkeypatch, tmp_path) -> None:
+    store = SQLiteSessionStore(tmp_path / "chat_history.db")
+    runtime = TurnRuntimeManager(store)
+    read: list[list[dict]] = []
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class FakeOrchestrator:
+        async def handle(self, context):
+            started.set()
+            await release.wait()
+            read.append(context.runtime.drain_user_inputs())
+            yield StreamEvent(type=StreamEventType.DONE, source="chat")
+
+    _patch_turn_services(monkeypatch, FakeOrchestrator)
+    _session, turn = await runtime.start_turn(
+        {
+            "type": "start_turn",
+            "content": "Explain FFT",
+            "session_id": None,
+            "capability": None,
+            "tools": [],
+            "knowledge_bases": [],
+            "attachments": [],
+            "language": "en",
+            "config": {},
+        }
+    )
+    consumer = asyncio.create_task(_drain(runtime.subscribe_turn(turn["id"], after_seq=0)))
+    await asyncio.wait_for(started.wait(), 5)
+    assert runtime.deliver_user_input(turn["id"], "in-1", "Use an example")
+    assert runtime.deliver_user_input(turn["id"], "in-2", "Never mind this one")
+    assert runtime.deliver_user_input(turn["id"], "w-1", "", withdraw="in-2")
+    release.set()
+    await asyncio.wait_for(consumer, 5)
+
+    assert read == [[{"command_id": "in-1", "content": "Use an example"}]]
+    # The inbox goes with the turn; a late message is the client's to resend.
+    assert not runtime.deliver_user_input(turn["id"], "in-3", "too late")
+
+
+async def _drain(stream) -> None:
+    async for _event in stream:
+        pass

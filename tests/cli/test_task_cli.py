@@ -16,11 +16,12 @@ runner = CliRunner()
 
 @pytest.fixture
 def task_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> PathService:
-    from deeptutor.services import task_board as task_board_service
+    from deeptutor.multi_user import paths as user_paths
 
     paths = PathService(workspace_root=tmp_path / "runtime")
     paths.ensure_all_directories()
-    monkeypatch.setattr(task_board_service, "get_path_service", lambda: paths)
+    monkeypatch.setattr(user_paths, "get_account_path_service", lambda: paths)
+    monkeypatch.setattr(PathService, "_instance", paths)
     return paths
 
 
@@ -56,7 +57,7 @@ def test_task_cli_full_lifecycle(task_paths: PathService) -> None:
         ],
     )
     assert updated.exit_code == 0, updated.output
-    card = get_task_board_store().get(card.id)
+    card = get_task_board_store().get(card.id, workspace_id="")
     assert (card.title, card.note, card.status) == (
         "Review absolute values by Friday",
         "Finish mistakes 1-30",
@@ -66,7 +67,7 @@ def test_task_cli_full_lifecycle(task_paths: PathService) -> None:
     completed = runner.invoke(app, ["task", "complete", card.id])
     archived = runner.invoke(app, ["task", "archive", card.id])
     assert completed.exit_code == archived.exit_code == 0
-    card = get_task_board_store().get(card.id)
+    card = get_task_board_store().get(card.id, workspace_id="")
     assert card.status == "done"
     assert card.archived is True
     assert card.id not in runner.invoke(app, ["task", "list"]).output
@@ -74,7 +75,7 @@ def test_task_cli_full_lifecycle(task_paths: PathService) -> None:
 
     restored = runner.invoke(app, ["task", "restore", card.id])
     assert restored.exit_code == 0, restored.output
-    assert get_task_board_store().get(card.id).archived is False
+    assert get_task_board_store().get(card.id, workspace_id="").archived is False
 
 
 def test_task_cli_rejects_missing_and_invalid_updates(task_paths: PathService) -> None:
@@ -88,3 +89,25 @@ def test_task_cli_rejects_missing_and_invalid_updates(task_paths: PathService) -
     assert "Provide at least one" in empty.output
     assert invalid.exit_code == 1
     assert "Invalid status" in invalid.output
+
+
+def test_task_cli_respects_the_active_workspace(task_paths: PathService, monkeypatch) -> None:
+    from deeptutor.services.task_board import CreateCard
+    from deeptutor_cli import task
+
+    store = get_task_board_store()
+    other = store.add(CreateCard(title="Other workspace task"), workspace_id="other")
+    monkeypatch.setattr(task, "current_workspace_id", lambda: "study")
+
+    created = runner.invoke(app, ["task", "add", "Study task"])
+    assert created.exit_code == 0, created.output
+    own = next(card for card in store.read().cards if card.title == "Study task")
+    assert own.workspace_id == "study"
+    listed = runner.invoke(app, ["task", "list"])
+    assert own.id in listed.output
+    assert other.id not in listed.output
+    for arguments in (["show", other.id], ["complete", other.id]):
+        result = runner.invoke(app, ["task", *arguments])
+        assert result.exit_code == 1
+        assert "Task not found" in result.output
+    assert store.get(other.id, workspace_id="other").status == "todo"

@@ -209,13 +209,13 @@ export function SourceNavigator({
 
   return (
     <aside
-      className={`min-h-0 min-w-0 flex-col border-r border-[var(--border)] bg-[var(--card)] dark:border-[var(--border)] dark:bg-[var(--card)] ${
+      className={`dt-reading-navigator min-h-0 min-w-0 flex-col bg-[var(--background)] ${
         open
-          ? "absolute inset-y-0 left-0 z-30 flex w-[min(300px,88vw)] shadow-[18px_0_42px_rgba(0,0,0,.12)] lg:static lg:w-auto lg:shadow-none"
+          ? "absolute inset-y-0 left-0 z-30 flex w-[min(300px,88vw)] shadow-[18px_0_42px_rgba(0,0,0,.12)] lg:static lg:row-start-2 lg:w-auto lg:shadow-none"
           : "hidden"
       }`}
     >
-      <div className="flex h-11 shrink-0 items-center gap-1 border-b border-[var(--border)] px-2 dark:border-[var(--border)]">
+      <div className="flex h-11 shrink-0 items-center gap-1 px-2">
         {notesAvailable ? (
           <div role="tablist" className="flex min-w-0 flex-1 items-center gap-0.5">
             <NavigatorTab
@@ -260,7 +260,7 @@ export function SourceNavigator({
         </div>
       ) : (
         <>
-          <label className="mx-2 mt-2 flex h-8 shrink-0 items-center gap-2 rounded-lg border border-[var(--border)] bg-[var(--card)] px-2.5 dark:border-[var(--border)] dark:bg-[var(--card)]">
+          <label className="mx-2 mt-1 flex h-8 shrink-0 items-center gap-2 rounded-lg bg-[rgb(var(--dt-ink,55_53_47)/0.045)] px-2.5 focus-within:bg-[rgb(var(--dt-ink,55_53_47)/0.06)]">
             <Search size={12} className="text-[var(--muted-foreground)]" />
             <input
               value={search}
@@ -276,7 +276,7 @@ export function SourceNavigator({
                  one. Above rather than below because it is the shorter list and
                  the one they came here for — scrolling past 74 outline rows to
                  reach three saved places would defeat the point. */
-              <div className="mb-2 border-b border-[var(--border)] pb-2">
+              <div className="mb-2 pb-1">
                 <p className="flex items-center gap-1.5 px-2 py-1 text-[10.5px] font-semibold uppercase tracking-wide text-[var(--muted-foreground)]">
                   <BookmarkCheck size={11} className="text-[var(--primary)]" />
                   {t("Bookmarks")}
@@ -422,7 +422,7 @@ export function SourceNavigator({
                       </div>
 
                       {expanded && (
-                        <div className="ml-2 mt-0.5 border-l border-[var(--border)] pl-1">
+                        <div className="ml-2 mt-0.5 border-l border-[rgb(var(--dt-ink,55_53_47)/0.08)] pl-1">
                           {mediaSource ? (
                             rows.map((row) => (
                               <button
@@ -456,6 +456,8 @@ export function SourceNavigator({
                               activeRow={activeDocumentRow}
                               pageFallback={pageFallback}
                               collapsedNodes={search ? new Set() : collapsedNodes}
+                              onNavigateHeading={onNavigateHeading}
+                              showLocator={isPdf}
                               onToggle={(key) =>
                                 setCollapsedNodes((current) => {
                                   const next = new Set(current);
@@ -502,7 +504,7 @@ export function SourceNavigator({
             )}
           </div>
 
-          <div className="shrink-0 border-t border-[var(--border)] px-3 py-2 text-[11px] text-[var(--muted-foreground)] dark:border-[var(--border)]">
+          <div className="shrink-0 px-3 py-2 text-[11px] text-[var(--muted-foreground)]">
             {material && material.status === "ready"
               ? mediaSource
                 ? t("{{count}} passages available to the companion", {
@@ -574,25 +576,58 @@ export function WorkspaceOutlineBranch({
   activeRow,
   pageFallback,
   collapsedNodes,
+  onNavigateHeading,
   onToggle,
   onNavigate,
+  showLocator,
   depth = 0,
 }: {
   nodes: OutlineNode[];
   activeRow: OutlineRow | null;
   pageFallback: boolean;
   collapsedNodes: Set<string>;
+  onNavigateHeading: (heading: ReaderHeading) => void;
   onToggle: (key: string) => void;
   onNavigate: (locator: number) => void;
+  showLocator: boolean;
   depth?: number;
 }) {
   const { t } = useTranslation();
   return (
-    <ul className={depth ? "ml-2 border-l border-[var(--border)] pl-1" : ""}>
+    <ul className={depth ? "ml-2 border-l border-[rgb(var(--dt-ink,55_53_47)/0.08)] pl-1" : ""}>
       {nodes.map((node) => {
         const key = `${node.row.locator}-${node.row.title}`;
         const active = node.row === activeRow;
         const collapsed = collapsedNodes.has(key);
+        const hasAnchor = Boolean(node.row.source_href && node.row.source_anchor);
+        const outlineButton = (
+          <button
+            type="button"
+            onClick={() => {
+              if (hasAnchor) {
+                onNavigateHeading({
+                  id: node.row.source_anchor ?? "",
+                  title: node.row.title,
+                  level: node.row.level,
+                  locator: node.row.locator,
+                  sourceHref: node.row.source_href,
+                });
+                return;
+              }
+              onNavigate(node.row.locator);
+            }}
+            className="flex min-w-0 flex-1 items-baseline gap-2 px-2 py-1.5 text-left"
+          >
+            {showLocator && (
+              <span className="w-7 shrink-0 text-right text-[11px] tabular-nums text-[var(--muted-foreground)]">
+                {node.row.locator}
+              </span>
+            )}
+            <span className="line-clamp-3 min-w-0 text-[12px] leading-[1.5]">
+              {node.row.title}
+            </span>
+          </button>
+        );
         return (
           <li key={key} className="mb-0.5 min-w-0">
             <div
@@ -603,32 +638,13 @@ export function WorkspaceOutlineBranch({
               }`}
             >
               <span className="inline-flex min-w-0 flex-1 [&>span]:w-full [&>span>button]:w-full">
-                <Tooltip label={t("p. {{page}}", { page: node.row.locator })}>
-                  <button
-                    type="button"
-                    onClick={() => onNavigate(node.row.locator)}
-                    className="flex min-w-0 flex-1 items-baseline gap-2 px-2 py-1.5 text-left"
-                  >
-                    {/* A table of contents is read by its titles, so the title
-                        carries the weight and the locator is the quiet column
-                        beside it — the other way round, 74 blue page numbers
-                        out-shouted the headings they were pointing at.
-
-                        It is also just the number. "p. 12" fits the 32px this
-                        column had, but every translation of it does not: in
-                        Chinese ("第 12 页") 65 of this document's 74 rows wrapped
-                        onto a second line, so the list had two different row
-                        heights and a ragged left edge for the titles. Right-
-                        aligned tabular digits are what a printed contents page
-                        does anyway, and no translation can outgrow them. */}
-                    <span className="w-7 shrink-0 text-right text-[11px] tabular-nums text-[var(--muted-foreground)]">
-                      {node.row.locator}
-                    </span>
-                    <span className="line-clamp-3 min-w-0 text-[12px] leading-[1.5]">
-                      {node.row.title}
-                    </span>
-                  </button>
-                </Tooltip>
+                {showLocator ? (
+                  <Tooltip label={t("p. {{page}}", { page: node.row.locator })}>
+                    {outlineButton}
+                  </Tooltip>
+                ) : (
+                  outlineButton
+                )}
               </span>
               {node.children.length > 0 && (
                 <button
@@ -652,6 +668,8 @@ export function WorkspaceOutlineBranch({
                 collapsedNodes={collapsedNodes}
                 onToggle={onToggle}
                 onNavigate={onNavigate}
+                onNavigateHeading={onNavigateHeading}
+                showLocator={showLocator}
                 depth={depth + 1}
               />
             )}

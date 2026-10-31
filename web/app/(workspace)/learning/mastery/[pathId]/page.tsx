@@ -1,5 +1,7 @@
 "use client";
 
+import { PageBarSlot } from "@/components/layout/PageChrome";
+import { PageContainer, PAGE_DESCRIPTION_CLASS } from '@/components/layout/FeaturePage'
 import { scopedUrl } from "@/lib/workspace-scope";
 import { MASTERY_HOME, masterySessionRoute as existingMasterySessionRoute, masterySessionsRoute } from "@/lib/learning-routes";
 
@@ -38,6 +40,7 @@ import {
   type Translate,
 } from "@/components/space/learning/format";
 import { PathTitle } from "@/components/space/learning/PathTitle";
+import { MasteryPathCrumb } from "@/components/layout/instance-crumbs";
 import { ReviewTrail } from "@/components/space/learning/ReviewTrail";
 import { SessionCamp } from "@/components/space/learning/SessionCamp";
 import { useMasteryPathActivity } from "@/hooks/useMasteryPathActivity";
@@ -318,26 +321,28 @@ export default function MasteryTopicPage() {
     // no second column to balance, and a fixed-height stack there would just
     // be three tiny scrollers.
     <main className="mastery-shell flex h-full flex-col overflow-y-auto [scrollbar-gutter:stable]">
-      <div className="mx-auto flex w-full min-h-0 max-w-[1180px] flex-1 flex-col px-4 pb-40 pt-6 sm:px-7 sm:pb-10 lg:px-8 lg:py-8">
+      <PageContainer className="flex min-h-0 flex-1 flex-col pb-40 sm:pb-10">
+        <MasteryPathCrumb id={pathId} label={displayName} />
         <div className="flex items-center justify-between gap-3">
           <Link
             href={scopedUrl(MASTERY_HOME)}
-            className="inline-flex items-center gap-1.5 text-xs font-medium text-[var(--muted-foreground)] hover:text-[var(--foreground)]"
+            className="dt-section-back inline-flex items-center gap-1.5 text-xs font-medium text-[var(--muted-foreground)] hover:text-[var(--foreground)]"
           >
             <ArrowLeft className="h-3.5 w-3.5" />
             {t("Learning topics")}
           </Link>
-          <div className="flex items-center gap-2">
+          {/* The goal's own actions go up to the page bar, top right. */}
+          <PageBarSlot name="actions" className="ml-auto flex items-center gap-1">
             <button
               type="button"
               onClick={(event) => openEditor(event.currentTarget)}
-              className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-[var(--border)] bg-[var(--card)] px-2.5 text-[12px] font-medium text-[var(--muted-foreground)] transition hover:text-[var(--foreground)] focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--ring)]/40"
+              className="dt-quiet-button"
             >
               <PencilRuler className="h-3.5 w-3.5" />
               <span className="hidden sm:inline">{t("Edit modules")}</span>
             </button>
             <details className="relative">
-              <summary className="flex h-8 w-8 cursor-pointer list-none items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--card)] text-[var(--muted-foreground)] transition hover:text-[var(--foreground)] focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--ring)]/40">
+              <summary className="dt-quiet-button is-icon cursor-pointer list-none">
                 <MoreHorizontal className="h-4 w-4" />
                 <span className="sr-only">{t("More actions")}</span>
               </summary>
@@ -362,10 +367,10 @@ export default function MasteryTopicPage() {
                 </button>
               </div>
             </details>
-          </div>
+          </PageBarSlot>
         </div>
 
-        <header className="mt-6 flex flex-col gap-5 lg:flex-row lg:items-end lg:justify-between">
+        <header className="dt-page-header mt-2 mb-6 flex flex-col gap-4">
           <div className="min-w-0">
             <div className="flex items-center gap-3">
               <div className="min-w-0">
@@ -374,13 +379,13 @@ export default function MasteryTopicPage() {
                   storedName={topic.name}
                   onRename={handleRename}
                 />
-                <p className="mt-1 max-w-3xl text-sm text-[var(--muted-foreground)]">
+                <p className={PAGE_DESCRIPTION_CLASS}>
                   {topic.metadata.description || topic.metadata.goal}
                 </p>
               </div>
             </div>
             {sourceLabels.length > 0 && (
-              <div className="mt-4 flex flex-wrap items-center gap-2 pl-0 sm:pl-[60px]">
+              <div className="mt-4 flex flex-wrap items-center gap-2">
                 {sourceLabels.map((source) => (
                   <span
                     key={source.id}
@@ -412,7 +417,7 @@ export default function MasteryTopicPage() {
           </div>
         </header>
 
-        <section className="fixed bottom-3 left-4 right-4 z-20 flex flex-col gap-3 rounded-xl border border-[var(--border)] bg-[var(--card)]/95 p-4 backdrop-blur sm:static sm:mt-6 sm:flex-row sm:items-center sm:justify-between sm:gap-6 sm:rounded-none sm:border-0 sm:border-y sm:border-[var(--border)] sm:bg-transparent sm:px-0 sm:py-4 sm:backdrop-blur-none">
+        <section className="dt-next-up fixed bottom-3 left-4 right-4 z-20 shadow-lg sm:static sm:mt-2 sm:shadow-none">
           <div className="flex min-w-0 items-baseline gap-3">
             <span className="shrink-0 text-[12px] text-[var(--muted-foreground)]">
               {t("Next up")}
@@ -486,7 +491,7 @@ export default function MasteryTopicPage() {
             // tutor asks about the learner and designs one with them. Writing
             // modules by hand is still possible, but it is the fallback now,
             // not the instruction.
-            <section className="mastery-map-paper flex min-h-72 flex-col items-center justify-center rounded-xl border border-dashed border-[var(--border)] p-8 text-center">
+            <section className="dt-panel min-h-72 items-center justify-center p-8 text-center">
               <PencilRuler className="h-9 w-9 text-[var(--mastery-route)]" />
               <h2 className="mt-4 text-lg font-semibold">
                 {t("No outline yet")}
@@ -525,7 +530,7 @@ export default function MasteryTopicPage() {
                   so the page reads as one goal's assets rather than a map with
                   two widgets hanging off it. */}
               <div className="flex flex-wrap items-center justify-between gap-3">
-                <h2 className="text-[12px] font-semibold text-[var(--foreground)]">
+                <h2 className="px-2.5 text-[13px] font-semibold text-[var(--foreground)]">
                   {t("Mastery outline")}
                 </h2>
                 <div className="flex items-center gap-0.5 rounded-lg bg-[var(--muted)] p-0.5">
@@ -582,11 +587,11 @@ export default function MasteryTopicPage() {
                   onStartTutoring={startBoardTutoring}
                 />
               ) : boardError ? (
-                <p className="rounded-xl border border-[var(--border)] bg-[var(--card)] p-6 text-center text-sm text-[var(--muted-foreground)]">
+                <p className="dt-panel p-6 text-center text-sm text-[var(--muted-foreground)]">
                   {t("The learning board could not be loaded")}
                 </p>
               ) : (
-                <div className="flex min-h-40 items-center justify-center rounded-xl border border-[var(--border)] bg-[var(--card)]">
+                <div className="dt-panel min-h-40 items-center justify-center">
                   <Loader2 className="h-5 w-5 animate-spin text-[var(--muted-foreground)]" />
                 </div>
               )}
@@ -630,7 +635,7 @@ export default function MasteryTopicPage() {
             />
           </div>
         </div>
-      </div>
+      </PageContainer>
       {editorOpen && (
         <EditTopicRouteDialog
           topic={topic}

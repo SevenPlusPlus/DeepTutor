@@ -22,11 +22,11 @@ Two properties this owes the caller:
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import logging
 import secrets
 import threading
 import time
-from dataclasses import dataclass
 from typing import Any
 
 import httpx

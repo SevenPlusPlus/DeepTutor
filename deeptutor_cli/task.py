@@ -9,7 +9,14 @@ from pydantic import ValidationError
 from rich.table import Table
 import typer
 
-from deeptutor.services.task_board import CreateCard, TaskCard, UpdateCard, get_task_board_store
+from deeptutor.services.task_board import (
+    CreateCard,
+    TaskCard,
+    UpdateCard,
+    get_task_board_store,
+    workspace_board,
+)
+from deeptutor.services.workspace.context import current_workspace_id
 
 from .common import console
 
@@ -23,7 +30,7 @@ def _fail(message: str) -> NoReturn:
 
 def _card(card_id: str) -> TaskCard:
     try:
-        return get_task_board_store().get(card_id)
+        return get_task_board_store().get(card_id, workspace_id=current_workspace_id())
     except KeyError:
         _fail(f"Task not found: {card_id}")
 
@@ -64,8 +71,9 @@ def _update(card_id: str, changes: dict[str, Any], *, verb: str = "Updated") -> 
     try:
         payload = UpdateCard(**changes)
         store = get_task_board_store()
-        store.update(card_id, payload)
-        card = store.get(card_id)
+        workspace_id = current_workspace_id()
+        store.update(card_id, payload, workspace_id=workspace_id)
+        card = store.get(card_id, workspace_id=workspace_id)
     except ValidationError as exc:
         _fail(f"Invalid task update: {exc}")
     except KeyError:
@@ -82,19 +90,17 @@ def register(app: typer.Typer) -> None:
     ) -> None:
         """Add a task to the To do column."""
         try:
-            card = get_task_board_store().add(CreateCard(title=title, note=note))
+            card = get_task_board_store().add(
+                CreateCard(title=title, note=note), workspace_id=current_workspace_id()
+            )
         except ValidationError as exc:
             _fail(f"Invalid task: {exc}")
         console.print(f"[green]Created task[/] {card.id}: {card.title}")
 
     @app.command("list")
     def list_tasks(
-        include_archived: bool = typer.Option(
-            False, "--all", help="Include archived tasks."
-        ),
-        status: str | None = typer.Option(
-            None, "--status", help="Filter by todo, doing, or done."
-        ),
+        include_archived: bool = typer.Option(False, "--all", help="Include archived tasks."),
+        status: str | None = typer.Option(None, "--status", help="Filter by todo, doing, or done."),
         fmt: str = typer.Option("rich", "--format", "-f", help="Output: rich | json."),
     ) -> None:
         """List tasks in the active workspace."""
@@ -103,7 +109,7 @@ def register(app: typer.Typer) -> None:
             _fail(f"Invalid status: {status}")
         cards = [
             card
-            for card in get_task_board_store().read().cards
+            for card in workspace_board(get_task_board_store().read(), current_workspace_id()).cards
             if (include_archived or not card.archived)
             and (not normalized_status or card.status == normalized_status)
         ]
@@ -124,9 +130,7 @@ def register(app: typer.Typer) -> None:
         note: str | None = typer.Option(
             None, "--note", "-n", help="Replace the note; pass an empty value to clear it."
         ),
-        status: str | None = typer.Option(
-            None, "--status", help="Set todo, doing, or done."
-        ),
+        status: str | None = typer.Option(None, "--status", help="Set todo, doing, or done."),
     ) -> None:
         """Modify a task's title, note, or status."""
         changes = {

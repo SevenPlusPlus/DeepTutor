@@ -419,6 +419,40 @@ def test_web_search_filters_provider_results_before_consolidation(monkeypatch) -
     )
 
 
+def test_web_search_consolidates_every_result_the_user_asked_for(monkeypatch) -> None:
+    class _ManyResultsProvider(_FakeProvider):
+        def search(self, query: str, **kwargs):
+            return WebSearchResponse(
+                query=query,
+                answer="",
+                provider=self.name,
+                citations=[],
+                search_results=[
+                    SearchResult(title=f"Result {i}", url=f"https://site{i}.example/", snippet="s")
+                    for i in range(1, kwargs["max_results"] + 1)
+                ],
+            )
+
+    _patch_runtime(
+        monkeypatch,
+        ResolvedSearchConfig(
+            provider="brave",
+            requested_provider="brave",
+            api_key="brave-key",
+            max_results=8,
+        ),
+    )
+    monkeypatch.setattr(
+        "deeptutor.services.search.get_provider",
+        lambda name, **kwargs: _ManyResultsProvider(name),
+    )
+
+    result = web_search("education")
+
+    assert len(result["search_results"]) == 8
+    assert "**[8] Result 8**" in result["answer"]
+
+
 def test_web_search_filters_answer_provider_citations_with_renumbering(monkeypatch) -> None:
     class _AnswerProvider(_FakeProvider):
         def __init__(self, name: str):
@@ -652,6 +686,49 @@ def test_source_filter_moderation_fails_open_on_errors() -> None:
 
     assert len(filtered.citations) == 1
     assert filtered.metadata["source_filter"]["removed_citations"] == 0
+
+
+def test_source_filter_moderation_flags_long_reference_truncated_on_whitespace() -> None:
+    # A reference whose text exceeds the 4000-char moderation cap and whose cut
+    # lands on whitespace must still be dropped when Moderation flags it. The
+    # decision dict was keyed by text.strip()[:4000] while the lookup used the
+    # unstripped row text, so the flag silently missed (fail-open).
+    flagged_texts: list[str] = []
+
+    def _flag_all(texts: list[str], *, api_key: str) -> list[bool]:
+        flagged_texts.extend(texts)
+        return [True for _ in texts]
+
+    long_content = "a " * 3000  # 6000 chars; the [:4000] cut lands on a space
+
+    response = WebSearchResponse(
+        query="news",
+        answer="",
+        provider="test",
+        citations=[
+            Citation(
+                id=1,
+                reference="[1]",
+                url="https://news.example/a",
+                title="flag",
+                snippet="this",
+                content=long_content,
+            ),
+        ],
+        search_results=[],
+    )
+
+    filtered = filter_web_search_response(
+        response,
+        content_filtering=False,
+        use_moderation=True,
+        moderation_api_key="sk-test",
+        request_moderation=_flag_all,
+    )
+
+    assert flagged_texts, "moderation requester was never called"
+    assert [c.id for c in filtered.citations] == []
+    assert "moderation_flagged" in filtered.metadata["source_filter"]["rejected_reasons"]
 
 
 def test_settings_from_config_defaults_and_educational_flag(monkeypatch) -> None:

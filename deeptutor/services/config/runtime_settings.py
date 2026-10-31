@@ -10,6 +10,7 @@ from typing import Any, Callable
 from deeptutor.services.file_io import atomic_write_json as _atomic_write_json
 from deeptutor.services.path_service import get_path_service
 
+from .image_description import normalize_image_description_model
 from .origins import normalize_origins
 
 DEFAULT_SYSTEM_SETTINGS: dict[str, Any] = {
@@ -65,6 +66,26 @@ DEFAULT_SYSTEM_SETTINGS: dict[str, Any] = {
     # earlier images ride along on every later turn — a re-sent payload, so
     # it is a policy like the caps above, not an LLM budget.
     "chat_prior_image_reinject_max": 4,
+    # Opt-in fastapi-guard request screening (deeptutor/api/security_guard.py).
+    # Off by default: when disabled, the package is never imported and the
+    # middleware stack is unchanged. ``trusted_proxies`` are the only peers
+    # whose X-Forwarded-For is believed; an empty list means the socket peer is
+    # always the client. The rate limit counts every HTTP request from one
+    # client address, so it is sized for the frontend's polling, not for one
+    # call per page view.
+    "security_guard": {
+        "enabled": False,
+        "rate_limit": 300,
+        "rate_limit_window": 60,
+        "trusted_proxies": ["127.0.0.1", "::1"],
+        # Skip the rate limit only. The bundled frontend hides browser
+        # addresses, so its traffic arrives as loopback and would share one
+        # bucket; loopback requests that carry X-Forwarded-For still resolve
+        # to, and are limited as, the forwarded client.
+        "exempt_ips": ["127.0.0.1", "::1"],
+        "whitelist": [],
+        "blacklist": [],
+    },
 }
 
 # Clamp bounds for the chat attachment knobs. The MB ceilings are deliberately
@@ -185,6 +206,8 @@ _DEFAULT_MINERU_ENGINE: dict[str, Any] = {
     "enable_formula": True,
     "enable_table": True,
     "is_ocr": False,
+    "max_pages_per_part": 180,
+    "normalize_tiny_scans": False,
     "allow_local_model_download": False,
 }
 
@@ -247,6 +270,7 @@ DEFAULT_DOCUMENT_PARSING_SETTINGS: dict[str, Any] = {
     # Caption embedded figures with a vision model at ingest, so a text-only
     # model reading the material can still describe its images.
     "image_caption": False,
+    "image_description_model": None,
     "engines": {
         DOCUMENT_PARSING_ENGINE_TEXT_ONLY: _DEFAULT_TEXT_ONLY_ENGINE,
         DOCUMENT_PARSING_ENGINE_MINERU: _DEFAULT_MINERU_ENGINE,
@@ -272,6 +296,21 @@ DEFAULT_PAGEINDEX_SETTINGS: dict[str, Any] = {
     "version": 1,
     "api_key": "",
 }
+
+# Query-rewrite layer for retrieval (``RAGService.search``). Disabled by
+# default so behaviour is unchanged until an operator opts in; ``strategy``
+# reserves the ``multi_query`` slot for a follow-up PR.
+DEFAULT_QUERY_REWRITE_SETTINGS: dict[str, Any] = {
+    "version": 1,
+    "enabled": False,
+    "strategy": "standalone",
+    "model": "",
+    "timeout_seconds": 5.0,
+    "min_query_chars": 12,
+}
+
+#: Strategies the query-rewrite layer accepts.
+QUERY_REWRITE_STRATEGIES = ("off", "standalone")
 
 # Tencent IMA. The credential pair (``client_id`` + ``api_key``, issued at
 # https://ima.qq.com/agent-interface) identifies one IMA account, and every
@@ -329,6 +368,7 @@ DEFAULT_LLAMAINDEX_SETTINGS: dict[str, Any] = {
     "chunk_size": 512,
     "chunk_overlap": 50,
     "image_description_concurrency": 4,
+    "image_description_batch_size": 1,
     "image_description_timeout_seconds": 60,
 }
 
@@ -385,6 +425,16 @@ IGNORE_PROCESS_OVERRIDES_ENV = "DEEPTUTOR_IGNORE_PROCESS_ENV_OVERRIDES"
 # can never win again: toggling "check for updates" wrote system.json while the
 # live API kept answering with the value captured at startup (#1536).
 SETTINGS_DERIVED_ENV_KEYS = "DEEPTUTOR_SETTINGS_DERIVED_ENV_KEYS"
+# (process env name, security_guard key) deployment overrides.
+_SECURITY_GUARD_ENV_KEYS = (
+    ("DEEPTUTOR_GUARD_ENABLED", "enabled"),
+    ("DEEPTUTOR_GUARD_RATE_LIMIT", "rate_limit"),
+    ("DEEPTUTOR_GUARD_RATE_LIMIT_WINDOW", "rate_limit_window"),
+    ("DEEPTUTOR_GUARD_TRUSTED_PROXIES", "trusted_proxies"),
+    ("DEEPTUTOR_GUARD_EXEMPT_IPS", "exempt_ips"),
+    ("DEEPTUTOR_GUARD_WHITELIST", "whitelist"),
+    ("DEEPTUTOR_GUARD_BLACKLIST", "blacklist"),
+)
 TRUTHY = {"1", "true", "yes", "on"}
 FALSY = {"0", "false", "no", "off"}
 
@@ -616,6 +666,21 @@ class RuntimeSettingsService:
         _atomic_write_json(self.path_for("pageindex"), payload)
         return payload
 
+    def load_query_rewrite(self, *, include_process_overrides: bool = True) -> dict[str, Any]:
+        payload = self._load_or_create(
+            "query_rewrite",
+            DEFAULT_QUERY_REWRITE_SETTINGS,
+            self._normalize_query_rewrite,
+        )
+        if include_process_overrides:
+            payload = self._apply_query_rewrite_process_overrides(payload)
+        return payload
+
+    def save_query_rewrite(self, settings: dict[str, Any]) -> dict[str, Any]:
+        payload = self._normalize_query_rewrite({**DEFAULT_QUERY_REWRITE_SETTINGS, **settings})
+        _atomic_write_json(self.path_for("query_rewrite"), payload)
+        return payload
+
     def load_ima(self, *, include_process_overrides: bool = True) -> dict[str, Any]:
         payload = self._load_or_create("ima", DEFAULT_IMA_SETTINGS, self._normalize_ima)
         if include_process_overrides:
@@ -692,6 +757,7 @@ class RuntimeSettingsService:
         self.load_pageindex(include_process_overrides=False)
         self.load_ima(include_process_overrides=False)
         self.load_llamaindex(include_process_overrides=False)
+        self.load_query_rewrite(include_process_overrides=False)
         self.load_graphrag()
         self.load_lightrag()
         self.load_lightrag_server()
@@ -873,6 +939,11 @@ class RuntimeSettingsService:
             payload["chat_attachment_max_chars_total"] = value
         if value := self._process_env_value("CHAT_PRIOR_IMAGE_REINJECT_MAX"):
             payload["chat_prior_image_reinject_max"] = value
+        guard = dict(payload.get("security_guard") or {})
+        for env_name, key in _SECURITY_GUARD_ENV_KEYS:
+            if value := self._process_env_value(env_name):
+                guard[key] = value
+        payload["security_guard"] = guard
         return self._normalize_system(payload)
 
     def _apply_auth_process_overrides(self, settings: dict[str, Any]) -> dict[str, Any]:
@@ -950,6 +1021,43 @@ class RuntimeSettingsService:
             "api_key": _string(settings.get("api_key")),
         }
 
+    def _apply_query_rewrite_process_overrides(self, settings: dict[str, Any]) -> dict[str, Any]:
+        payload = dict(settings)
+        if value := self._process_env_value("DEEPTUTOR_QUERY_REWRITE_ENABLED"):
+            payload["enabled"] = value
+        if value := self._process_env_value("DEEPTUTOR_QUERY_REWRITE_STRATEGY"):
+            payload["strategy"] = value
+        if value := self._process_env_value("DEEPTUTOR_QUERY_REWRITE_MODEL"):
+            payload["model"] = value
+        if value := self._process_env_value("DEEPTUTOR_QUERY_REWRITE_TIMEOUT_SECONDS"):
+            payload["timeout_seconds"] = value
+        if value := self._process_env_value("DEEPTUTOR_QUERY_REWRITE_MIN_QUERY_CHARS"):
+            payload["min_query_chars"] = value
+        return self._normalize_query_rewrite(payload)
+
+    def _normalize_query_rewrite(self, settings: dict[str, Any]) -> dict[str, Any]:
+        strategy = str(settings.get("strategy") or "standalone").strip().lower()
+        if strategy not in QUERY_REWRITE_STRATEGIES:
+            strategy = "standalone"
+        try:
+            timeout = float(settings.get("timeout_seconds", 5.0))
+        except (TypeError, ValueError):
+            timeout = 5.0
+        timeout = min(max(timeout, 0.5), 60.0)
+        try:
+            min_chars = int(settings.get("min_query_chars", 12))
+        except (TypeError, ValueError):
+            min_chars = 12
+        min_chars = min(max(min_chars, 0), 500)
+        return {
+            "version": 1,
+            "enabled": _coerce_bool(settings.get("enabled"), False),
+            "strategy": strategy,
+            "model": str(settings.get("model") or "").strip(),
+            "timeout_seconds": timeout,
+            "min_query_chars": min_chars,
+        }
+
     def _apply_ima_process_overrides(self, settings: dict[str, Any]) -> dict[str, Any]:
         payload = dict(settings)
         if value := self._process_env_value("IMA_CLIENT_ID"):
@@ -1010,6 +1118,9 @@ class RuntimeSettingsService:
             "chunk_overlap": chunk_overlap,
             "image_description_concurrency": _coerce_clamped_int(
                 settings.get("image_description_concurrency"), 4, 1, 16
+            ),
+            "image_description_batch_size": _coerce_clamped_int(
+                settings.get("image_description_batch_size"), 1, 1, 8
             ),
             "image_description_timeout_seconds": _coerce_clamped_int(
                 settings.get("image_description_timeout_seconds"), 60, 5, 600
@@ -1127,6 +1238,9 @@ class RuntimeSettingsService:
             "version": 2,
             "engine": engine,
             "image_caption": _coerce_bool(settings.get("image_caption"), False),
+            "image_description_model": normalize_image_description_model(
+                settings.get("image_description_model")
+            ),
             "engines": engines_out,
         }
 
@@ -1154,6 +1268,10 @@ class RuntimeSettingsService:
             "enable_formula": _coerce_bool(settings.get("enable_formula"), True),
             "enable_table": _coerce_bool(settings.get("enable_table"), True),
             "is_ocr": _coerce_bool(settings.get("is_ocr"), False),
+            "max_pages_per_part": _coerce_clamped_int(
+                settings.get("max_pages_per_part"), 180, 1, 200
+            ),
+            "normalize_tiny_scans": _coerce_bool(settings.get("normalize_tiny_scans"), False),
             "allow_local_model_download": _coerce_bool(
                 settings.get("allow_local_model_download"), False
             ),
@@ -1246,6 +1364,9 @@ class RuntimeSettingsService:
         )
         # A per-message total below the per-file cap is contradictory; lift it.
         max_total_mb = max(max_total_mb, max_file_mb)
+        raw_guard = settings.get("security_guard")
+        guard = raw_guard if isinstance(raw_guard, dict) else {}
+        guard_defaults = DEFAULT_SYSTEM_SETTINGS["security_guard"]
         return {
             "version": 1,
             "version_check_enabled": _coerce_bool(settings.get("version_check_enabled"), True),
@@ -1291,6 +1412,25 @@ class RuntimeSettingsService:
                 DEFAULT_SYSTEM_SETTINGS["chat_attachment_max_chars_total"],
                 *CHAT_ATTACHMENT_CHARS_RANGE,
             ),
+            "security_guard": {
+                "enabled": _coerce_bool(guard.get("enabled"), False),
+                "rate_limit": _coerce_clamped_int(
+                    guard.get("rate_limit"), guard_defaults["rate_limit"], 1, 1_000_000
+                ),
+                "rate_limit_window": _coerce_clamped_int(
+                    guard.get("rate_limit_window"), guard_defaults["rate_limit_window"], 1, 86_400
+                ),
+                # An absent key keeps the loopback default; an explicit empty
+                # list means "trust no proxy".
+                "trusted_proxies": _host_list(guard["trusted_proxies"])
+                if "trusted_proxies" in guard
+                else list(guard_defaults["trusted_proxies"]),
+                "exempt_ips": _host_list(guard["exempt_ips"])
+                if "exempt_ips" in guard
+                else list(guard_defaults["exempt_ips"]),
+                "whitelist": _host_list(guard.get("whitelist")),
+                "blacklist": _host_list(guard.get("blacklist")),
+            },
         }
 
     def _normalize_auth(self, settings: dict[str, Any]) -> dict[str, Any]:
@@ -1473,6 +1613,10 @@ def load_graphrag_settings() -> dict[str, Any]:
     return get_runtime_settings_service().load_graphrag()
 
 
+def load_query_rewrite_settings() -> dict[str, Any]:
+    return get_runtime_settings_service().load_query_rewrite()
+
+
 def load_lightrag_settings() -> dict[str, Any]:
     return get_runtime_settings_service().load_lightrag()
 
@@ -1503,6 +1647,7 @@ __all__ = [
     "DEFAULT_LLAMAINDEX_SETTINGS",
     "DEFAULT_MINERU_SETTINGS",
     "DEFAULT_PAGEINDEX_SETTINGS",
+    "DEFAULT_QUERY_REWRITE_SETTINGS",
     "DEFAULT_SYSTEM_SETTINGS",
     "DOCUMENT_PARSING_ENGINE_DOCLING",
     "DOCUMENT_PARSING_ENGINE_LITEPARSE",
@@ -1516,6 +1661,7 @@ __all__ = [
     "LITEPARSE_IMAGE_MODES",
     "MINERU_MODE_CLOUD",
     "MINERU_MODE_LOCAL",
+    "QUERY_REWRITE_STRATEGIES",
     "SETTINGS_DERIVED_ENV_KEYS",
     "ChatAttachmentLimits",
     "RuntimeSettingsService",
@@ -1533,5 +1679,6 @@ __all__ = [
     "load_lightrag_server_settings",
     "load_llamaindex_settings",
     "load_mineru_settings",
+    "load_query_rewrite_settings",
     "load_system_settings",
 ]

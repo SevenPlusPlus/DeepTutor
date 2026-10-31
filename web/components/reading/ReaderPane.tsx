@@ -1,9 +1,11 @@
 "use client";
 
+import dynamic from "next/dynamic";
 import { browserStorage } from "@/shared/storage";
 import Tooltip from "@/shared/ui/Tooltip";
 
-import { useCallback, useEffect, useMemo, useRef, useState, type RefObject } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from "react";
+import { createPortal } from "react-dom";
 import {
   ArrowLeft,
   ArrowRight,
@@ -26,7 +28,8 @@ import {
   READER_TURN_END_EVENT,
   type ReaderActionPayload,
 } from "@/lib/reading-reader-action";
-import { citationTargetFromHref } from "@/lib/reading-citations";
+import { scopedUrl } from "@/lib/workspace-scope";
+import { citationTargetFromHref, readingPassageHref } from "@/lib/reading-citations";
 import {
   fetchExport,
   getMaterial,
@@ -40,7 +43,6 @@ import {
 import { AnnotationList } from "./AnnotationList";
 import { AnnotationPopover, type PopoverAiAction } from "./AnnotationPopover";
 import { passagePrompts } from "@/lib/reading-passage-prompts";
-import { EpubDocumentView } from "./EpubDocumentView";
 import {
   PdfDocumentView,
   type JumpRequest,
@@ -68,6 +70,20 @@ import {
   type ReadingLocationEntry,
   type ReadingLocationHistory,
 } from "@/lib/reading-location-history";
+
+function EpubLoading() {
+  const { t } = useTranslation();
+  return (
+    <div role="status" aria-label={t("Loading")} className="flex h-full items-center justify-center">
+      <Loader2 aria-hidden="true" className="h-5 w-5 animate-spin text-[var(--muted-foreground)]" />
+    </div>
+  );
+}
+
+const EpubDocumentView = dynamic(
+  () => import("./EpubDocumentView").then(module => module.EpubDocumentView),
+  { ssr: false, loading: EpubLoading },
+);
 
 /** Event the reader dispatches to prefill the composer from a selection. */
 export const READER_ASK_EVENT = "dt:reader-ask";
@@ -133,6 +149,13 @@ export interface ReaderPaneProps {
    * the narrowest thing on screen.
    */
   ownAnnotationList?: boolean;
+  /**
+   * Where the document's title row goes when the host has a bar for it. The
+   * workspace gives its own top bar, so the title, place and bookmark read on
+   * one line with the collection rather than as a second strip under it.
+   * Without one the row renders here, at the top of the pane.
+   */
+  headSlot?: HTMLElement | null;
 }
 
 /**
@@ -165,6 +188,7 @@ export function ReaderPane({
   onToggleBookmark,
   onLocatorChange,
   ownAnnotationList = true,
+  headSlot = null,
 }: ReaderPaneProps) {
   const { t, i18n } = useTranslation();
   // Document + annotations live in the provider (workspace layout), so they
@@ -219,6 +243,12 @@ export function ReaderPane({
   const [autoJump, setAutoJump] = useState(true);
   const [exporting, setExporting] = useState(false);
   const [currentLocator, setCurrentLocator] = useState(1);
+  const [epubPosition, setEpubPosition] = useState<{
+    materialId: string; percentage: number | null;
+  } | null>(null);
+  const handleEpubProgress = useCallback((percentage: number | null) => {
+    if (material) setEpubPosition({ materialId: material.material_id, percentage });
+  }, [material]);
   const nonceRef = useRef(0);
   const headingLocatorRef = useRef(1);
   const jumpMaterialIdRef = useRef<string | null>(null);
@@ -609,6 +639,19 @@ export function ReaderPane({
     ],
   );
 
+  const followedSource = useRef('');
+  useEffect(() => {
+    const follow = () => {
+      const href = window.location.hash;
+      if (!material || !citationTargetFromHref(href) || followedSource.current === href) return;
+      followedSource.current = href;
+      void navigateCitation(href);
+    };
+    follow();
+    window.addEventListener('hashchange', follow);
+    return () => window.removeEventListener('hashchange', follow);
+  }, [material, navigateCitation]);
+
   useEffect(() => {
     if (!externalJump) return;
     if (externalJumpNonceRef.current === externalJump.nonce) return;
@@ -858,6 +901,13 @@ export function ReaderPane({
 
   const showAnnotations = annotationPanel ?? annotations.length > 0;
   const unitWord = material ? t(unitLabel(material.unit)) : "";
+  const isEpub = material?.render_mode === "epub";
+  const currentUnitTitle = isEpub
+    ? material?.unit_refs.find((row) => row.locator === currentLocator)?.title
+    : undefined;
+  const epubProgress = epubPosition?.materialId === material?.material_id
+    && epubPosition?.percentage != null
+    ? Math.round(epubPosition.percentage * 100) : null;
   const bookmarkedHere = bookmarks.some(
     (row) => row.locator === currentLocator,
   );
@@ -878,6 +928,18 @@ export function ReaderPane({
         icon: History,
         label: t("History"),
         onSelect: () => setShowHistory(true),
+      });
+      // The header's Forward button is desktop-only; on a phone the menu is
+      // where a learner comes back to it after following a citation.
+      items.push({
+        key: "forward",
+        icon: ArrowRight,
+        label: t("Forward"),
+        disabled:
+          locationHistory.index < 0 ||
+          locationHistory.index >= locationHistory.entries.length - 1,
+        onSelect: () => stepHistory(1),
+        mobileOnly: true,
       });
     }
     items.push({
@@ -912,40 +974,53 @@ export function ReaderPane({
     autoJump,
     exporting,
     hasHistory,
+    locationHistory,
     material,
     ownAnnotationList,
     runExport,
     showAnnotations,
+    stepHistory,
     t,
     toggleAutoJump,
   ]);
   const menuHosted = useWorkspaceMenuSection("material", menuItems);
 
   return (
-    <div className="relative flex h-full min-w-0 flex-col border-r border-[var(--border)] bg-[var(--background)]">
-      <header className="flex h-11 shrink-0 items-center gap-1 border-b border-[var(--border)] px-2.5">
-        <FileText
-          size={14}
-          className="shrink-0 text-[var(--muted-foreground)]"
-        />
-        {/* The title, not the filename. A material saved from the web is
-            stored under its content hash, so this line read
-            "65228f9f372d6e9b.md" for every page the learner opened — the one
-            place in the reader that names what they are reading, spelling it
-            as a checksum. The filename is worth keeping for uploads, where it
-            is what the learner recognises, so it stays as the tooltip. */}
-        <span
-          className="min-w-0 flex-1 truncate text-[12.5px] font-medium text-[var(--foreground)]"
-          title={material?.filename || material?.title}
-        >
-          {material?.title || material?.filename || t("Immersive reading")}
-        </span>
+    <div className="dt-reader-pane relative flex h-full min-w-0 flex-col bg-[var(--background)]">
+      <ReaderHead slot={headSlot}>
+        {/* Under the workspace's bar the document is a crumb of that bar
+            (it switches between the collection's files), so the head only
+            brings its place, history and bookmark. */}
+        {!headSlot && (
+          <>
+            <FileText
+              size={14}
+              className="hidden shrink-0 text-[var(--muted-foreground)] md:block"
+            />
+            {/* The title, not the filename. A material saved from the web is
+                stored under its content hash, so this line read
+                "65228f9f372d6e9b.md" for every page the learner opened — the one
+                place in the reader that names what they are reading, spelling it
+                as a checksum. The filename is worth keeping for uploads, where it
+                is what the learner recognises, so it stays as the tooltip. */}
+            <span
+              className="min-w-0 flex-1 truncate text-[12.5px] font-medium text-[var(--foreground)]"
+              title={material?.filename || material?.title}
+            >
+              {material?.title || material?.filename || t("Immersive reading")}
+            </span>
+          </>
+        )}
 
         {/* Back and Forward stay in the bar because they are how a learner
             returns from a citation the assistant jumped to. Everything else
             that used to sit here — history, auto-jump, export, the notes
             panel — is a setting or a once-a-session action, and seven small
-            grey icons beside the title read as noise. They live under ⋯. */}
+            grey icons beside the title read as noise. They live under ⋯.
+            Below 768px the bar converges further (#916): back, title +
+            chapter, bookmark, ⋯. Forward is a secondary command there and
+            moves into the menu, and the file icon gives its width to the
+            chapter indicator. */}
         {locationHistory.entries.length > 0 && (
           <>
             <HeaderButton
@@ -961,6 +1036,7 @@ export function ReaderPane({
                 locationHistory.index < 0 ||
                 locationHistory.index >= locationHistory.entries.length - 1
               }
+              className="hidden md:inline-flex"
               onClick={() => stepHistory(1)}
             />
           </>
@@ -970,13 +1046,25 @@ export function ReaderPane({
           <>
             {/* The one place the reader's position is stated. Monospace is for
                 code, not for a line of UI copy; tabular figures alone stop the
-                number from jittering as the learner scrolls. */}
-            <span className="hidden shrink-0 whitespace-nowrap px-1 text-[11.5px] tabular-nums text-[var(--muted-foreground)] md:inline">
-              {t("{{unit}} {{n}} / {{total}}", {
-                unit: unitWord,
-                n: currentLocator,
-                total: material.unit_count,
-              })}
+                number from jittering as the learner scrolls. Below md it is the
+                "chapter" half of the converged title — title and indicator each
+                truncate inside their own share of the row, so together they
+                can never push the buttons past the edge. */}
+            <span className="min-w-0 max-w-[45%] shrink truncate whitespace-nowrap px-1 text-[11.5px] tabular-nums text-[var(--muted-foreground)] md:max-w-none md:shrink-0">
+              {isEpub ? (
+                <>
+                  <span className="max-w-[180px] truncate">
+                    {currentUnitTitle || material.title}
+                  </span>
+                  {epubProgress !== null && <span>{` · ${epubProgress}%`}</span>}
+                </>
+              ) : (
+                t("{{unit}} {{n}} / {{total}}", {
+                  unit: unitWord,
+                  n: currentLocator,
+                  total: material.unit_count,
+                })
+              )}
             </span>
             {onToggleBookmark && (
               <HeaderButton
@@ -1009,14 +1097,14 @@ export function ReaderPane({
             )}
           </>
         )}
-      </header>
+      </ReaderHead>
 
       {showMoreTools && material && !menuHosted && (
         <div
           ref={moreToolsMenuRef}
           role="menu"
           aria-label={t("More")}
-          className="absolute top-11 right-2 z-40 w-64 rounded-xl border border-[var(--border)] bg-[var(--background)] p-1.5 shadow-xl"
+          className={`absolute ${headSlot ? "top-2" : "top-11"} right-2 z-40 w-64 rounded-xl border border-[var(--border)] bg-[var(--background)] p-1.5 shadow-xl`}
         >
           {locationHistory.entries.length > 0 && (
             <MenuToolButton
@@ -1024,6 +1112,21 @@ export function ReaderPane({
               label={t("History")}
               onClick={() => {
                 setShowHistory(true);
+                setShowMoreTools(false);
+              }}
+            />
+          )}
+          {locationHistory.entries.length > 0 && (
+            <MenuToolButton
+              icon={ArrowRight}
+              label={t("Forward")}
+              disabled={
+                locationHistory.index < 0 ||
+                locationHistory.index >= locationHistory.entries.length - 1
+              }
+              className="md:hidden"
+              onClick={() => {
+                stepHistory(1);
                 setShowMoreTools(false);
               }}
             />
@@ -1066,7 +1169,7 @@ export function ReaderPane({
       {showHistory && locationHistory.entries.length > 0 && (
         <div
           ref={historyPanelRef}
-          className="absolute top-11 right-2 z-30 max-h-72 w-72 overflow-y-auto rounded-xl border border-[var(--border)] bg-[var(--background)] p-1.5 shadow-xl">
+          className={`absolute ${headSlot ? "top-2" : "top-11"} right-2 z-30 max-h-72 w-72 overflow-y-auto rounded-xl border border-[var(--border)] bg-[var(--background)] p-1.5 shadow-xl`}>
           {[...locationHistory.entries]
             .map((entry, index) => ({ entry, index }))
             .reverse()
@@ -1166,6 +1269,7 @@ export function ReaderPane({
                 setActiveAnnotationId(annotation.annotation_id)
               }
               onVisibleLocatorChange={handleVisibleLocator}
+              onProgressChange={handleEpubProgress}
               onHeadingsChange={onHeadingsChange}
               headingJump={headingJump}
               onError={setError}
@@ -1207,7 +1311,7 @@ export function ReaderPane({
         </div>
 
         {material && ownAnnotationList && showAnnotations && (
-          <aside className="hidden w-[248px] shrink-0 border-l border-[var(--border)] bg-[var(--background)] lg:block">
+          <aside className="hidden w-[248px] shrink-0 bg-[var(--background)] lg:block">
             <AnnotationList
               annotations={annotations}
               unit={material.unit}
@@ -1229,6 +1333,7 @@ export function ReaderPane({
         <AnnotationPopover
           anchor={selection.anchor}
           quote={selection.quote}
+          noteSource={{title: `${material.title} · ${unitLabel(material.unit)} ${selection.locator}`, url: scopedUrl(window.location.pathname + window.location.search) + readingPassageHref(material.material_id, selection.locator, material.revision), id: `${material.material_id}:${selection.locator}`}}
           onHighlight={(color) => commitSelection("highlight", color)}
           onUnderline={(color) => commitSelection("underline", color)}
           onNote={(note, color) => commitSelection("note", color, note)}
@@ -1298,6 +1403,7 @@ function MenuToolButton({
   spinning,
   disabled,
   hint,
+  className = "",
 }: {
   icon: typeof FileText;
   label: string;
@@ -1307,6 +1413,7 @@ function MenuToolButton({
   disabled?: boolean;
   /** A second line saying what the setting currently does. */
   hint?: string;
+  className?: string;
 }) {
   return (
     <button
@@ -1316,7 +1423,7 @@ function MenuToolButton({
       aria-checked={active}
       disabled={spinning || disabled}
       onClick={onClick}
-      className={`flex w-full items-center gap-2 rounded-lg px-2.5 text-left text-[12px] transition disabled:cursor-default ${hint ? "py-1.5" : "h-9"} ${
+      className={`${className} flex w-full items-center gap-2 rounded-lg px-2.5 text-left text-[12px] transition disabled:cursor-default ${hint ? "py-1.5" : "h-9"} ${
         active
           ? "bg-[color-mix(in_srgb,var(--primary)_12%,transparent)] text-[var(--primary)]"
           : "text-[var(--foreground)] hover:bg-[var(--muted)] disabled:opacity-35 disabled:hover:bg-transparent"
@@ -1339,5 +1446,15 @@ function MenuToolButton({
         ) : null}
       </span>
     </button>
+  );
+}
+
+/** The title row: in the host's bar when it offers one, else atop the pane. */
+function ReaderHead({ slot, children }: { slot: HTMLElement | null; children: ReactNode }) {
+  if (slot) return createPortal(children, slot);
+  return (
+    <header className="dt-reader-head flex h-11 shrink-0 items-center gap-1 px-3">
+      {children}
+    </header>
   );
 }

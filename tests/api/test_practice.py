@@ -111,6 +111,29 @@ def test_source_key_change_invalidates_open_question(bank):
         repo.review(entry["id"], "stale", 0, "good", "A")
 
 
+@pytest.mark.parametrize("endpoint", ["summary", "queue"])
+def test_review_scope_is_validated_before_reading_a_queue(bank, endpoint):
+    _, _, client = bank
+    assert client.get(f"/practice/{endpoint}?review_scope=invalid").status_code == 422
+
+
+def test_review_rejects_an_unknown_scope_without_saving_an_attempt(bank):
+    store, repo, client = bank
+    entry = seed(store)
+    response = client.post(
+        f"/practice/questions/{entry['id']}/review",
+        json={
+            "request_id": "invalid_scope_0001",
+            "version": 0,
+            "answer": "B",
+            "rating": "good",
+            "review_scope": "invalid",
+        },
+    )
+    assert response.status_code == 422
+    assert repo.state(entry["id"])["review_count"] == 0
+
+
 def test_timezone_due_order_resolved_and_empty_course_scope(bank):
     store, repo, client = bank
     old = seed(store)
@@ -386,12 +409,7 @@ def test_import_receipts_and_questions_are_isolated_between_stores(bank, tmp_pat
         other_repo.review(1, "other-user-attempt", 0, "again", "")
 
 
-def test_course_imports_keep_their_course_and_file_provenance(bank, monkeypatch):
-    from types import SimpleNamespace
-
-    monkeypatch.setattr(
-        "deeptutor.services.courses.get_course_service", lambda: SimpleNamespace(get=lambda _: {})
-    )
+def test_course_imports_keep_their_course_and_file_provenance(bank):
     store, repo, client = bank
     question = normalize_question({"question": "Q", "answer": "A"})
     repo.commit_import(repo.stage_import("lesson.csv", "mistakes", [question], "course-a"))
@@ -410,6 +428,45 @@ def test_course_imports_keep_their_course_and_file_provenance(bank, monkeypatch)
     assert client.get("/bank/entries?course_id=course-a").json()["total"] == 1
     assert client.get("/practice/summary?course_id=course-a").json()["mistakes"] == 1
     assert client.get("/bank/entries?course_id=course-b").json()["total"] == 0
+
+
+def test_legacy_course_filters_keep_recycled_questions_out_of_every_view(bank):
+    store, repo, client = bank
+    entry = seed(store, material_id="legacy-textbook", material_title="Legacy textbook")
+    asyncio.run(store.update_session_preferences("lesson", {"course_id": "legacy-course"}))
+    category = asyncio.run(store.create_category("Legacy algebra"))
+    asyncio.run(store.add_entry_to_category(entry["id"], category["id"]))
+    with repo.connect() as conn:
+        conn.execute(
+            "UPDATE notebook_entries SET course_id=? WHERE id=?",
+            ("legacy-course", entry["id"]),
+        )
+        conn.execute("UPDATE practice_review_state SET due_at=1 WHERE entry_id=?", (entry["id"],))
+
+    for endpoint in ("entries", "stats"):
+        assert client.get(f"/bank/{endpoint}?course_id=legacy-course").json()["total"] == 1
+        assert client.get(f"/bank/{endpoint}?course_id=unknown-course").json()["total"] == 0
+    assert [
+        row["entry"]["id"] for row in client.get("/practice/queue?course_id=legacy-course").json()
+    ] == [entry["id"]]
+    assert client.get("/practice/summary?course_id=legacy-course").json()["mistakes"] == 1
+
+    asyncio.run(store.soft_delete_session("lesson"))
+    assert client.get("/bank/entries?course_id=legacy-course").json()["total"] == 0
+    assert client.get("/bank/stats?course_id=legacy-course").json()["total"] == 0
+    assert client.get("/bank/materials?course_id=legacy-course").json() == []
+    assert client.get("/bank/categories?course_id=legacy-course").json()[0]["entry_count"] == 0
+    assert client.get("/practice/summary?course_id=legacy-course").json()["total"] == 0
+    assert client.get("/practice/queue?course_id=legacy-course").json() == []
+    assert client.get("/practice/analytics?course_id=legacy-course").json()["totals"] == {
+        "questions": 0,
+        "mistakes": 0,
+        "reviews": 0,
+    }
+    # Even an old caller retaining the session id cannot count a recycled entry.
+    assert asyncio.run(store.question_bank_stats(["lesson"], "legacy-course"))["total"] == 0
+    asyncio.run(store.restore_session("lesson"))
+    assert client.get("/bank/stats?course_id=legacy-course").json()["total"] == 1
 
 
 def test_analytics_separates_creation_first_mistake_and_repeat_reviews(bank):

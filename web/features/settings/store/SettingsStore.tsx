@@ -27,6 +27,7 @@ import {
 } from "@/context/app-shell-storage";
 import { useAppShell } from "@/context/AppShellContext";
 import { apiFetch, apiUrl } from "@/lib/api";
+import { asJsonOrThrow } from "@/shared/api/client";
 import { invalidateLLMOptionsCache } from "@/lib/llm-options";
 import { setModelReasoningEffort } from "@/lib/reasoning-effort";
 import { applyExtensionPayload } from "@/lib/settings-extensions";
@@ -738,8 +739,17 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     [],
   );
 
-  const clearPending = useCallback(() => {
-    pendingRef.current.clear();
+  const clearPending = useCallback((applied?: Map<string, unknown>) => {
+    for (const [key, payload] of pendingRef.current) {
+      if (!applied || (applied.has(key) && applied.get(key) === payload)) {
+        pendingRef.current.delete(key);
+      }
+    }
+    for (const [key, ext] of extensionsRef.current) {
+      if (!applied || (applied.has(key) && applied.get(key) === ext.payload)) {
+        ext.dirty = false;
+      }
+    }
     syncPendingKeys();
   }, [syncPendingKeys]);
 
@@ -998,7 +1008,7 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
               : {}),
             ...(service === "tts"
               ? {
-                  voice: providerOption?.default_voice ?? "",
+                  voice: "",
                   response_format: "",
                 }
               : {}),
@@ -1063,7 +1073,7 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
             : {}),
           ...(service === "tts"
             ? {
-                voice: providerOption?.default_voice ?? "",
+                voice: "",
                 response_format: "",
               }
             : {}),
@@ -1238,7 +1248,7 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
                   : {}),
                 ...(item.service === "tts"
                   ? {
-                      voice: item.spec.default_voice || "",
+                      voice: "",
                       response_format: "",
                     }
                   : {}),
@@ -1727,6 +1737,12 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
   /** Apply — move everything into the live files and clear the draft. */
   const applyCatalog = useCallback(async () => {
     setApplying(true);
+    // Save the payloads and callbacks represented by this Apply. Edits made
+    // during a request remain a new draft, including on the same page.
+    const applyingExtensions = Array.from(pendingRef.current, ([key, payload]) => {
+      const ext = extensionsRef.current.get(key);
+      return { key, payload, save: ext?.dirty ? ext.save : null };
+    });
     try {
       if (catalogEditable) {
         for (const [service, bucket] of Object.entries(draft.services)) {
@@ -1751,15 +1767,13 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
         body: JSON.stringify(draftEnvelope()),
       });
 
-      if (!draftResponse.ok) throw new Error(`HTTP ${draftResponse.status}`);
+      await asJsonOrThrow(draftResponse);
 
       // Pages still on screen save themselves — they refresh their own local
       // state and surface their own errors. Everything else pending is
       // written straight to the endpoint that owns it.
-      const mounted = extensionsRef.current;
-      for (const [key, payload] of Array.from(pendingRef.current.entries())) {
-        const ext = mounted.get(key);
-        if (ext?.dirty) await ext.save();
+      for (const { key, payload, save } of applyingExtensions) {
+        if (save) await save();
         else await applyExtensionPayload(key, payload);
         if (key === "ui") applyUi(payload as UiSettings);
       }
@@ -1769,8 +1783,7 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
           method: "POST",
           headers: { "Content-Type": "application/json" },
         });
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        const payload = await response.json();
+        const payload = await asJsonOrThrow(response);
         if (!payload.catalog)
           throw new Error("Missing catalog in apply response");
         setCatalog(payload.catalog);
@@ -1789,7 +1802,9 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
         });
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
       }
-      clearPending();
+      clearPending(
+        new Map(applyingExtensions.map(({ key, payload }) => [key, payload])),
+      );
       setStoredDraft(null);
       setSavedSignature(null);
       setDraftRevision((value) => value + 1);

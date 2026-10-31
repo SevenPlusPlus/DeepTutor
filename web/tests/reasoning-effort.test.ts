@@ -10,6 +10,16 @@ import {
 const values = (binding: string, model: string, current = ""): string[] =>
   reasoningEffortOptions(binding, model, current).map((option) => option.value);
 
+test("MiniMax Flash exposes adaptive effort levels and preserves saved values", () => {
+  for (const binding of ["minimax", "minimax_anthropic"]) {
+    assert.deepEqual(values(binding, "MiniMax-M3.1-Flash"), [
+      "", "low", "medium", "high", "xhigh", "max",
+    ]);
+    assert.deepEqual(values(binding, "MiniMax-M3"), ["", "none", "adaptive"]);
+    assert.equal(values(binding, "MiniMax-M3.1-Flash", "none").includes("none"), true);
+  }
+});
+
 test("Gemini 3 and 2.5 Pro do not list the invalid none effort", () => {
   assert.deepEqual(values("gemini", "gemini-3.6-flash"), [
     "",
@@ -191,4 +201,16 @@ test("Auto removes the catalog field instead of persisting an empty string", () 
 
   setModelReasoningEffort(model, " medium ");
   assert.equal(model.reasoning_effort, "medium");
+});
+
+
+test("GLM effort choices follow the documented model family and retain invalid values for recovery", () => {
+  assert.deepEqual(values("openai", "glm-5.3"), ["", "low", "high", "max"]);
+  assert.deepEqual(values("zhipu", "glm-5.3"), ["", "low", "high", "max"]);
+  assert.deepEqual(values("custom", "z-ai/glm-5.3"), ["", "low", "high", "max"]);
+  assert.deepEqual(values("azure", "GLM-5.3"), ["", "low", "high", "max"]);
+  assert.deepEqual(values("openai", "glm-4.7"), []);
+  assert.deepEqual(values("openai", "glm-5.3-unknown"), []);
+  assert.deepEqual(values("openai", "glm-5.3", "medium"), ["", "low", "high", "max", "medium"]);
+  assert.deepEqual(values("openai", "glm-4.7", "vendor-level"), ["", "vendor-level"]);
 });

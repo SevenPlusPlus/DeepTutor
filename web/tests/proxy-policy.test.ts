@@ -45,6 +45,7 @@ test("large knowledge uploads bypass the buffering proxy", () => {
     unstable_doesMiddlewareMatch({ config: proxyConfig, url });
 
   assert.equal(matches("http://localhost/api/knowledge-bases"), false);
+  assert.equal(matches("http://localhost/api/knowledge-bases/list"), true);
   assert.equal(
     matches("http://localhost/api/knowledge-bases/my%20kb/upload"),
     false,
@@ -106,6 +107,10 @@ test("isAuthExempt allows public static assets through the auth gate (issue #599
   assert.equal(isAuthExempt("/logo.png"), true);
   assert.equal(isAuthExempt("/banner.png"), true);
   assert.equal(isAuthExempt("/logo_black.png"), true);
+  assert.equal(isAuthExempt("/brand/color-logo.png"), true);
+  assert.equal(isAuthExempt("/brand/color-word.png"), true);
+  assert.equal(isAuthExempt("/brand/black-logo.png"), true);
+  assert.equal(isAuthExempt("/brand/favicon-32x32.png"), true);
   assert.equal(isAuthExempt("/apple-touch-icon.png"), true);
   assert.equal(isAuthExempt("/provider-icons/openai.svg"), true);
   assert.equal(isAuthExempt("/pdfjs/wasm/openjpeg.wasm"), true);

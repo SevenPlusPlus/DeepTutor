@@ -3,7 +3,6 @@ import userEvent from '@testing-library/user-event'
 import { describe, expect, it, vi } from 'vitest'
 import { ChatMessageList } from '@/features/chat/messages'
 import type { StreamEvent } from '@/features/chat/model/protocol'
-import { WatchingProvider } from '@/context/WatchingContext'
 import { initI18n } from '@/i18n/init'
 
 initI18n('en')
@@ -36,6 +35,70 @@ describe('chat message feature', () => {
     expect(screen.getByRole('alert')).toHaveTextContent('Worker lost during this turn')
     await userEvent.setup().click(screen.getByRole('button', { name: 'Retry' }))
     expect(retry).toHaveBeenCalledOnce()
+  })
+
+  // Regenerate and Resend used to sit side by side as two identical icons on a
+  // turn that had failed. A surface that can take the turn back offers one
+  // Retry instead, and hands over the learner's message to edit.
+  it('offers one Retry that hands the turn back instead of two identical icons', async () => {
+    const retry = vi.fn()
+    const user = { id: 7, role: 'user' as const, content: 'Explain DFT', parentMessageId: 3,
+      requestSnapshot: { content: 'Explain DFT', enabledTools: [], knowledgeBases: [], language: 'en' } }
+    render(
+      <ChatMessageList
+        messages={[user, { id: 8, role: 'assistant', content: 'The DFT is…', parentMessageId: 7 }]}
+        isStreaming={false}
+        canResendLastTurn
+        onResendLastTurn={vi.fn()}
+        onRetryTurn={retry}
+        onCopyAssistantMessage={vi.fn()}
+        onRegenerateMessage={vi.fn()}
+      />,
+    )
+
+    expect(screen.queryByRole('button', { name: 'Regenerate' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Resend' })).toBeNull()
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Retry' }))
+    expect(retry).toHaveBeenCalledWith(expect.objectContaining({ id: 7, content: 'Explain DFT' }))
+  })
+
+  // The snapshot stores the qualified KB ref, but the reference chip under a
+  // sent message used to print that ref verbatim — while the composer chip
+  // for the same resource showed its readable name. The label now resolves
+  // through the selection catalog, falling back to the ref when unmapped.
+  it('labels sent-message KB references with the catalog name, not the raw ref', () => {
+    const renderWithKb = (kb: string[], kbDisplayNames?: Record<string, string>) =>
+      render(
+        <ChatMessageList
+          messages={[{
+            id: 7,
+            role: 'user',
+            content: 'Summarize the papers',
+            parentMessageId: null,
+            requestSnapshot: {
+              content: 'Summarize the papers',
+              enabledTools: [],
+              knowledgeBases: kb,
+              language: 'en',
+            },
+          }]}
+          isStreaming={false}
+          onCopyAssistantMessage={vi.fn(async () => undefined)}
+          onRegenerateMessage={() => undefined}
+          kbDisplayNames={kbDisplayNames}
+        />,
+      )
+    // Identity is preserved: an unmapped ref still renders, as itself.
+    renderWithKb(['account:kb:legacy_kb'])
+    expect(screen.getByText('account:kb:legacy_kb')).toBeVisible()
+
+    const { unmount } = renderWithKb(
+      ['workspace:ws-1:kb:example_kb'],
+      { 'workspace:ws-1:kb:example_kb': 'example_kb' },
+    )
+    expect(screen.getByText('example_kb')).toBeVisible()
+    expect(screen.queryByText('workspace:ws-1:kb:example_kb')).toBeNull()
+    unmount()
   })
 
   it('renders a user row with keyboard-accessible message actions', async () => {
@@ -116,7 +179,7 @@ describe('chat message feature', () => {
     })
 
     const { container } = render(
-      <WatchingProvider>
+
         <ChatMessageList
           messages={[
             {
@@ -154,7 +217,7 @@ describe('chat message feature', () => {
           onCopyAssistantMessage={async () => undefined}
           onRegenerateMessage={() => undefined}
         />
-      </WatchingProvider>
+
     )
 
     const fold = container.querySelector('div.grid')
@@ -202,14 +265,54 @@ describe('empty reply outcomes', () => {
       type: 'error', source: 'chat', stage: '', content, timestamp: 0,
       metadata: status === 'legacy' ? {} : { turn_terminal: true, status },
     }];
-    render(<WatchingProvider><ChatMessageList
+    render(<ChatMessageList
       messages={[{ id: 1, role: 'user', content: 'hi' }, { id: 2, role: 'assistant', content: '', events }]}
       isStreaming={false}
       onCopyAssistantMessage={async () => undefined}
       onRegenerateMessage={() => undefined}
       onDeleteTurn={() => undefined}
-    /></WatchingProvider>);
+    />);
     expect(screen.getByText(expected)).toBeVisible();
     if (status === 'cancelled') expect(screen.queryByRole('alert')).toBeNull();
+  });
+});
+
+
+describe('unsent message recovery actions', () => {
+  const pending = [
+    { id: -1, role: 'user' as const, content: 'same outline request', parentMessageId: null, failedSubmission: true },
+    { id: -2, role: 'user' as const, content: 'same outline request', parentMessageId: -1, failedSubmission: true },
+  ];
+
+  it('offers discard and causal retry for each pending record', async () => {
+    const discard = vi.fn(() => true);
+    const retry = vi.fn(async () => true);
+    const edit = vi.fn();
+    render(<ChatMessageList messages={pending} isStreaming={false}
+      onCopyAssistantMessage={vi.fn()} onRegenerateMessage={vi.fn()}
+      onRetryFailedSubmission={retry}
+      onDiscardFailedSubmission={discard} onEditMessage={edit} />);
+    expect(screen.getAllByText('Not sent')).toHaveLength(2);
+    expect(screen.queryByRole('button', { name: 'Edit' })).toBeNull();
+    const user = userEvent.setup();
+    await user.click(screen.getAllByRole('button', { name: 'Discard unsent draft' })[0]);
+    expect(discard).toHaveBeenCalledWith(-1);
+    await user.click(screen.getAllByRole('button', { name: 'Retry' })[0]);
+    await user.click(screen.getAllByRole('button', { name: 'Retry' })[1]);
+    expect(retry.mock.calls).toEqual([[-1], [-2]]);
+  });
+
+  it('blocks recovery mutations while streaming and unsafe retries of incomplete snapshots', () => {
+    const { rerender } = render(<ChatMessageList messages={pending} isStreaming
+      onCopyAssistantMessage={vi.fn()} onRegenerateMessage={vi.fn()}
+      onRetryFailedSubmission={vi.fn()} onDiscardFailedSubmission={vi.fn()} />);
+    for (const button of screen.getAllByRole('button', { name: /^(Retry|Discard unsent draft)$/ })) {
+      expect(button).toBeDisabled();
+    }
+    rerender(<ChatMessageList messages={[{ ...pending[0], failedSubmissionNeedsReview: true }]}
+      isStreaming={false} onCopyAssistantMessage={vi.fn()} onRegenerateMessage={vi.fn()}
+      onRetryFailedSubmission={vi.fn()} onDiscardFailedSubmission={vi.fn()} />);
+    expect(screen.queryByRole('button', { name: 'Retry' })).toBeNull();
+    expect(screen.getByRole('button', { name: 'Discard unsent draft' })).toBeEnabled();
   });
 });

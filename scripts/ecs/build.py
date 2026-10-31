@@ -21,7 +21,16 @@ import tempfile
 from typing import Any
 
 SOURCE_DIRS = ("deeptutor", "deeptutor_cli", "requirements", "scripts", "web")
-SOURCE_FILES = ("pyproject.toml", "requirements.txt", "README.md", "LICENSE", "MANIFEST.in")
+SOURCE_FILES = (
+    "pyproject.toml",
+    "setup.py",
+    "build_metadata.py",
+    "build_support.py",
+    "requirements.txt",
+    "README.md",
+    "LICENSE",
+    "MANIFEST.in",
+)
 NATIVE_PACKAGES = ("@img/sharp-linux-x64", "@img/sharp-libvips-linux-x64")
 _SKIP_DIRS = {
     "data",

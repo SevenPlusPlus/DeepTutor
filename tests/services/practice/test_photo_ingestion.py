@@ -593,15 +593,26 @@ async def test_confirm_transaction_rechecks_deletion_after_detail_snapshot(setup
 @pytest.mark.asyncio
 async def test_confirm_preserves_review_metadata_and_records_answer_exposure(setup):
     service, extractor, session_store, _, _ = setup
-    extractor.drafts = [{
-        "question": "2 + 2 = ?", "question_type": "fill_blank",
-        "correct_answer": "4", "answer_origin": "document", "subject": "math",
-    }]
+    extractor.drafts = [
+        {
+            "question": "2 + 2 = ?",
+            "question_type": "fill_blank",
+            "correct_answer": "4",
+            "answer_origin": "document",
+            "subject": "math",
+        }
+    ]
     item = await ingest(service)
     await service.process_pending()
     item = service.detail(item["id"])
-    drafts = [{**item["drafts"][0], "grade": "五年级", "knowledge_point": "整数加法",
-               "tags": ["计算失误", "期中重点"]}]
+    drafts = [
+        {
+            **item["drafts"][0],
+            "grade": "五年级",
+            "knowledge_point": "整数加法",
+            "tags": ["计算失误", "期中重点"],
+        }
+    ]
     result = service.confirm(
         item["id"], expected_version=item["version"], confirmed=True, drafts=drafts
     )
@@ -612,11 +623,14 @@ async def test_confirm_preserves_review_metadata_and_records_answer_exposure(set
     assert entry["recognition_meta"]["photo_partner_id"] == "partner-1"
     assert entry["knowledge_point_id"] == "整数加法"
     assert {tag["name"] for tag in entry["categories"]} == {"计算失误", "期中重点"}
-    assert (await session_store.list_notebook_entries(
-        mistakes_only=True, subject="math", grade="五年级", search="整数 计算失误"
-    ))["total"] == 1
+    assert (
+        await session_store.list_notebook_entries(
+            mistakes_only=True, subject="math", grade="五年级", search="整数 计算失误"
+        )
+    )["total"] == 1
     state = service.store.state(entry_id)
-    outcome = service.store.review(entry_id, "after_photo_confirmation", state["version"],
-                                   "good", "4", auto_grade=True)
+    outcome = service.store.review(
+        entry_id, "after_photo_confirmation", state["version"], "good", "4", auto_grade=True
+    )
     assert outcome["correct"] is True
     assert not outcome["independent"]

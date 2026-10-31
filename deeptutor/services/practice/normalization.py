@@ -105,14 +105,15 @@ def normalize_question(raw: dict, *, require_answer: bool = True) -> dict:
         if kind == "multi_choice" and len(keys) == 1 and keys[0] not in options:
             keys = list(keys[0])
         if answer and (
-            any(key not in options for key in keys)
-            or (kind == "single_choice" and len(keys) != 1)
+            any(key not in options for key in keys) or (kind == "single_choice" and len(keys) != 1)
         ):
             raise ValueError("The answer must name existing option keys (multi-choice: A,C)")
         if answer:
             answer = ",".join(sorted(set(keys)))
     tags_value = fields["tags"]
-    tags = tags_value if isinstance(tags_value, list) else re.split(r"[,;，；]", cell_text(tags_value))
+    tags = (
+        tags_value if isinstance(tags_value, list) else re.split(r"[,;，；]", cell_text(tags_value))
+    )
     tags = list(dict.fromkeys(cell_text(tag) for tag in tags if cell_text(tag)))
     if len(tags) > 20 or any(len(tag) > 100 for tag in tags):
         raise ValueError("Use at most 20 tags, each up to 100 characters")

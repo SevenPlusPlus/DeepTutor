@@ -19,7 +19,7 @@ from deeptutor.response_languages import SUPPORTED_RESPONSE_LANGUAGES
 from deeptutor.services.path_service import get_path_service
 from deeptutor.tools.builtin import USER_TOGGLEABLE_TOOL_NAMES
 
-UiLanguage = Literal["en", "zh", "fr", "de", "uk"]
+UiLanguage = Literal["en", "zh", "fr", "de", "uk", "pl"]
 
 DEFAULT_UI_SETTINGS: dict[str, Any] = {
     # "snow" is the pure-white neutral theme, shown as "Default" in the UI.
@@ -62,7 +62,16 @@ def _settings_lock(path: Path) -> threading.Lock:
     multi-user deployment each account has its own ``interface.json``; making
     them contend would serialise unrelated users' preference writes.
     """
-    key = str(path.resolve() if path.is_absolute() else path)
+    # Resolve the directory only: resolving the file can open it on Windows
+    # before its lock is acquired, preventing another writer from replacing it.
+    key = os.path.normcase(str(path.parent.resolve() / path.name))
+    # Windows may return an extended path while a directory is being created.
+    # Both spellings must identify the same lock.
+    if os.name == "nt":
+        if key.startswith("\\\\?\\unc\\"):
+            key = "\\\\" + key[8:]
+        elif key.startswith("\\\\?\\"):
+            key = key[4:]
     with _LOCKS_GUARD:
         lock = _LOCKS.get(key)
         if lock is None:
@@ -86,6 +95,7 @@ def _normalize_language(language: Any, default: str = "en") -> str:
     - fr/french -> fr
     - de/german/deutsch -> de
     - uk/ukrainian/ua -> uk
+    - pl/polish/polski -> pl
 
     An unknown code falls back to ``default`` rather than raising, so this is
     also the gate that decides which languages exist at all: a locale shipped
@@ -107,6 +117,8 @@ def _normalize_language(language: Any, default: str = "en") -> str:
             return "de"
         if s == "ukrainian" or base in {"uk", "ua"}:
             return "uk"
+        if s in {"polish", "polski"} or base == "pl":
+            return "pl"
 
     # Fall back to default
     if isinstance(default, str):

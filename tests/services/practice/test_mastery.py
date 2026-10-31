@@ -219,9 +219,36 @@ def test_queue_and_summary_exclude_nonmistakes_closed_paused_and_resolved(bank):
     assert summary["due"] == 1 and summary["closed"] == 1 and summary["paused"] == 2
     assert bank_only not in repo.queue("UTC", now=NOW + 100 * DAY)
     assert closed not in repo.queue("UTC", now=NOW + 100 * DAY)
+    general = repo.queue("UTC", now=NOW + 100 * DAY, review_scope="all")
+    assert bank_only in general
+    assert not {closed, paused, resolved}.intersection(general)
+    assert repo.overview("UTC", now=NOW + 100 * DAY, review_scope="all")["due"] == len(general)
     repo.update_learning(paused, repo.state(paused)["version"], paused=False)
     assert paused in repo.queue("UTC", now=NOW + 100 * DAY)
     assert repo.queue("UTC", session_ids=[], now=NOW + 100 * DAY) == []
+
+
+def test_general_review_keeps_srs_retries_without_bypassing_mastery_evidence(bank):
+    store, repo = bank
+    general = seed(store, "general-review")
+    daily = seed(store, "daily-review")
+    failed = repo.review(general, "general-failed", 0, "again", "A", now=NOW, review_scope="all")
+    assert 0 < failed["due_at"] - NOW < 15 * 60
+    default_failure = repo.review(daily, "daily-failed", 0, "again", "A", now=NOW)
+    assert default_failure["due_at"] == NOW + DAY
+    with pytest.raises(ReviewConflict):
+        repo.review(general, "general-failed", 0, "again", "A", now=NOW)
+    with pytest.raises(ValueError):
+        repo.review(general, "general-invalid", 1, "good", "A", now=NOW, review_scope="all")
+    # Feedback shown after the first attempt remains exposure in the all scope.
+    corrected = repo.review(
+        general, "general-corrected", 1, "good", "B", now=NOW + 900, review_scope="all"
+    )
+    assert corrected["correct"] is True
+    assert not corrected["independent"] and not corrected["closed"]
+    assert corrected["due_at"] == NOW + 900 + 3 * DAY
+    assert corrected["evidence"]["independent_successes"] == 0
+    assert repo.mastery_details(general)["decisions"] == []
 
 
 def test_recommendation_budget_filters_and_explicit_early_recall(bank):
@@ -328,6 +355,7 @@ def test_question_edit_reopens_and_invalidates_approved_variants(bank):
 
 def test_existing_review_schema_migrates_without_promoting_old_evidence(tmp_path):
     import sqlite3
+
     from deeptutor.services.practice.storage import initialize_practice
 
     path = tmp_path / "legacy.db"
@@ -362,6 +390,52 @@ def test_existing_review_schema_migrates_without_promoting_old_evidence(tmp_path
         == '{"mastered":true}'
     )
     conn.close()
+
+
+def test_runtime_schema_upgrade_preserves_recognition_and_mastery_history(bank):
+    store, repo = bank
+    parent, _ = close_mistake(store, repo)
+    paused = seed(store, "paused-during-upgrade")
+    repo.update_learning(paused, repo.state(paused)["version"], paused=True)
+    repo.expose(parent, "upgrade-answer-exposure", "answer", now=NOW + 11 * DAY)
+    with repo.connect() as conn:
+        conn.execute(
+            "UPDATE notebook_entries SET course_id=?,question_images_json=?,"
+            "source_locator_json=?,answer_origin=?,recognition_meta_json=? WHERE id=?",
+            (
+                "legacy-course",
+                json.dumps([{"id": "original-photo", "url": "/attachments/original.png"}]),
+                json.dumps({"page_numbers": [2]}),
+                "document",
+                json.dumps({"subject": "math", "grade": "5"}),
+                parent,
+            ),
+        )
+        # These tables were introduced by the newer session/reading runtime.
+        conn.execute("DROP TABLE turn_submissions")
+        conn.execute("DROP TABLE reading_quiz_rewards")
+    before_entry = asyncio.run(store.get_notebook_entry(parent))
+    before_mastery = repo.mastery_details(parent)
+    before_paused = repo.state(paused)
+
+    upgraded = SQLiteSessionStore(store.db_path)
+    restored = PracticeStore(upgraded.db_path)
+    assert asyncio.run(upgraded.get_notebook_entry(parent)) == before_entry
+    assert restored.mastery_details(parent) == before_mastery
+    assert restored.state(paused) == before_paused
+    assert restored.state(parent)["learning_status"] == "closed"
+    session_id = asyncio.run(upgraded.reserve_submission("upgrade-submission", "digest"))
+    assert asyncio.run(upgraded.get_session(session_id)) is not None
+    with restored.connect() as conn:
+        assert conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='reading_quiz_rewards'"
+        ).fetchone()
+        assert (
+            conn.execute(
+                "SELECT kind FROM practice_exposures WHERE request_id='upgrade-answer-exposure'"
+            ).fetchone()[0]
+            == "answer"
+        )
 
 
 def test_new_skill_mistake_can_complete_its_own_mastery_loop(bank):

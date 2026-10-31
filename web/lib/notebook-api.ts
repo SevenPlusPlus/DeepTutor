@@ -3,7 +3,7 @@ import { activeWorkspaceId, scopedUrl } from "@/lib/workspace-scope";
 
 // ── Notebooks (file-backed under data/user/workspace/notebook) ──
 //
-// Notebooks live at /notebook in the product and under /api/notebooks in the
+// Favorites live at /notebooks in the product and under /api/notebooks in the
 // transport. They collect saved output from chat, research
 // and Co-Writer (written by SaveToNotebookModal, read back by
 // NotebookRecordPicker). They are a different feature from the Question
@@ -120,7 +120,9 @@ export async function deleteNotebookRecord(
 ): Promise<void> {
   const response = await apiFetch(
     apiUrl(`/api/notebooks/${notebookId}/records/${recordId}`),
-    { method: "DELETE" },
+    {
+      method: "DELETE",
+    },
   );
   if (!response.ok) throw new Error(`Request failed: ${response.status}`);
 }
@@ -183,7 +185,9 @@ export async function exportNotebookMarkdown(
 ): Promise<string> {
   const response = await apiFetch(
     apiUrl(`/api/notebooks/${notebookId}/export`),
-    { cache: "no-store" },
+    {
+      cache: "no-store",
+    },
   );
   if (!response.ok) throw new Error(`Request failed: ${response.status}`);
   return await response.text();
@@ -280,17 +284,11 @@ export type AssessmentSource =
   | "import";
 
 export type QuestionOriginType =
-  | "conversation"
-  | "external_import"
-  | "document_analysis";
+  "conversation" | "external_import" | "document_analysis";
 
 export type AssessmentType = "quiz" | "focus_check" | "qualitative" | "review";
 
-export type AssessmentResult =
-  | "correct"
-  | "incorrect"
-  | "partial"
-  | "ungraded";
+export type AssessmentResult = "correct" | "incorrect" | "partial" | "ungraded";
 
 export type ScoreTrend = "new" | "improved" | "declined" | "unchanged";
 
@@ -327,6 +325,7 @@ async function expectJson<T>(response: Response): Promise<T> {
 
 export interface NotebookEntryFilter {
   mistakes_only?: boolean;
+  course_id?: string;
   category_id?: number;
   /** Only entries in no category at all — the triage inbox. */
   uncategorized?: boolean;
@@ -348,15 +347,6 @@ export interface NotebookEntryFilter {
   sort?: "recent" | "oldest";
   limit?: number;
   offset?: number;
-  /**
-   * Restrict to questions produced by one course's conversations.
-   *
-   * The server resolves course membership through real conversation sessions;
-   * independent document/import origins stay outside that scope until they
-   * gain an explicit course association. A course with no sessions correctly
-   * yields nothing rather than falling back to everything.
-   */
-  course_id?: string;
 }
 
 export async function listNotebookEntries(
@@ -364,6 +354,7 @@ export async function listNotebookEntries(
   workspaceId = activeWorkspaceId(),
 ): Promise<NotebookEntryListResponse> {
   const params = new URLSearchParams();
+  if (filter.course_id) params.set("course_id", filter.course_id);
   if (filter.mistakes_only) params.set("mistakes_only", "true");
   if (filter.category_id !== undefined)
     params.set("category_id", String(filter.category_id));
@@ -375,7 +366,8 @@ export async function listNotebookEntries(
   if (filter.source) params.set("source", filter.source);
   if (filter.material_id) params.set("material_id", filter.material_id);
   if (filter.section_id) params.set("section_id", filter.section_id);
-  if (filter.assessment_type) params.set("assessment_type", filter.assessment_type);
+  if (filter.assessment_type)
+    params.set("assessment_type", filter.assessment_type);
   if (filter.result) params.set("result", filter.result);
   if (filter.mastery_path_id)
     params.set("mastery_path_id", filter.mastery_path_id);
@@ -391,7 +383,6 @@ export async function listNotebookEntries(
   if (filter.sort) params.set("sort", filter.sort);
   if (filter.limit !== undefined) params.set("limit", String(filter.limit));
   if (filter.offset !== undefined) params.set("offset", String(filter.offset));
-  if (filter.course_id) params.set("course_id", filter.course_id);
   const query = params.toString();
   const response = await apiFetch(
     apiUrl(scopedUrl(`/api/question-notebook/entries${query ? `?${query}` : ""}`, workspaceId)),
@@ -602,20 +593,15 @@ export interface QuestionBankStats {
   uncategorized: number;
 }
 
-/**
- * Counts behind the scope rail.
- *
- * Takes the same course scope as the entry list: showing this course's
- * questions next to whole-library counts would make the rail lie about how
- * much is there.
- */
+/** Counts behind the scope rail. */
 export async function getQuestionBankStats(
   courseId = "",
 ): Promise<QuestionBankStats> {
-  const query = courseId ? `?course_id=${encodeURIComponent(courseId)}` : "";
   const response = await apiFetch(
-    apiUrl(`/api/question-notebook/stats${query}`),
-    { cache: "no-store" },
+    apiUrl(`/api/question-notebook/stats${courseId ? `?course_id=${encodeURIComponent(courseId)}` : ""}`),
+    {
+      cache: "no-store",
+    },
   );
   return expectJson<QuestionBankStats>(response);
 }
@@ -623,10 +609,11 @@ export async function getQuestionBankStats(
 export async function listQuestionBankMaterials(
   courseId = "",
 ): Promise<QuestionBankMaterial[]> {
-  const query = courseId ? `?course_id=${encodeURIComponent(courseId)}` : "";
   const response = await apiFetch(
-    apiUrl(`/api/question-notebook/materials${query}`),
-    { cache: "no-store" },
+    apiUrl(`/api/question-notebook/materials${courseId ? `?course_id=${encodeURIComponent(courseId)}` : ""}`),
+    {
+      cache: "no-store",
+    },
   );
   return expectJson<QuestionBankMaterial[]>(response);
 }
@@ -649,10 +636,11 @@ export async function removeEntryFromCategory(
 export async function listCategories(
   courseId = "",
 ): Promise<NotebookCategory[]> {
-  const query = courseId ? `?course_id=${encodeURIComponent(courseId)}` : "";
   const response = await apiFetch(
-    apiUrl(`/api/question-notebook/categories${query}`),
-    { cache: "no-store" },
+    apiUrl(`/api/question-notebook/categories${courseId ? `?course_id=${encodeURIComponent(courseId)}` : ""}`),
+    {
+      cache: "no-store",
+    },
   );
   return expectJson<NotebookCategory[]>(response);
 }
@@ -689,4 +677,21 @@ export async function deleteCategory(categoryId: number): Promise<void> {
     },
   );
   await expectJson<{ deleted: boolean }>(response);
+}
+
+/** Resolve a favorite after it has moved to another collection. */
+export async function locateFavoriteRecord(
+  recordId: string,
+  collectionId: string,
+): Promise<string | null> {
+  const response = await apiFetch(
+    apiUrl(
+      `/api/notebooks/records/${encodeURIComponent(recordId)}/location?notebook_id=${encodeURIComponent(collectionId)}`,
+    ),
+    { cache: "no-store" },
+  );
+  if (response.status === 404) return null;
+  if (!response.ok) throw new Error(`Request failed: ${response.status}`);
+  const data = (await response.json()) as { notebook_id: string };
+  return data.notebook_id;
 }

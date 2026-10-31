@@ -8,9 +8,11 @@ in an account-private recovery directory after a successful transfer.
 
 from __future__ import annotations
 
+from contextlib import closing
 from datetime import datetime, timezone
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import shutil
@@ -25,6 +27,8 @@ from deeptutor.services.workspace.activity import data_activity
 from deeptutor.services.workspace.context import workspace_context
 from deeptutor.services.workspace.models import WorkspaceError
 
+logger = logging.getLogger(__name__)
+
 FEATURES = {
     "chat": "Conversations",
     "book": "Books",
@@ -32,9 +36,9 @@ FEATURES = {
     "reading": "Immersive Reading",
     "timed_media": "Immersive Watching",
     "notebook": "Notebooks",
-    "task-board": "Task Board",
     "co-writer": "Writing",
     "courses": "Courses",
+    "learning_journal": "Learning journal",
     "files": "File library",
     "knowledge_bases": "Knowledge bases",
     "parse_cache": "Document cache",
@@ -51,7 +55,7 @@ FEATURES = {
 def _feature_path(paths, feature: str) -> Path:
     if feature == "attachments":
         if hasattr(paths, "scope"):
-            return paths.get_chat_workspace_root() / "attachments"
+            return paths.scope.content_root / "chat" / "attachments"
         from deeptutor.services.storage.attachment_store import _attachment_root
 
         with workspace_context():
@@ -74,6 +78,8 @@ def _feature_path(paths, feature: str) -> Path:
         return paths.get_knowledge_bases_root()
     if feature == "parse_cache":
         return paths.get_parse_cache_root()
+    if feature == "learning_journal":
+        return paths.get_learning_journal_dir()
     if feature == "files":
         return paths.get_workspace_dir() / "library"
     if feature == "outputs":
@@ -130,7 +136,7 @@ def _empty_scaffold(root: Path) -> bool:
             database = handle.read(16) == b"SQLite format 3\x00"
         if not database:
             return False
-        with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as conn:
+        with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as conn, conn:
             for (name,) in conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
             ).fetchall():
@@ -157,8 +163,9 @@ def _snapshot(source: Path, target: Path, *, included: set[str] | None = None) -
             database = handle.read(16) == b"SQLite format 3\x00"
         if database:
             with (
-                sqlite3.connect(f"file:{path}?mode=ro", uri=True) as original,
-                sqlite3.connect(destination) as copy,
+                closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as original,
+                closing(sqlite3.connect(destination)) as copy,
+                copy,
             ):
                 original.backup(copy)
                 if copy.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
@@ -178,7 +185,7 @@ def _sqlite_sessions(paths) -> list[dict]:
     db = paths.get_chat_history_db()
     if not db.exists():
         return []
-    with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as conn:
+    with closing(sqlite3.connect(f"file:{db}?mode=ro", uri=True)) as conn, conn:
         conn.row_factory = sqlite3.Row
         return [dict(row) for row in conn.execute("SELECT id,title,preferences_json FROM sessions")]
 
@@ -315,8 +322,9 @@ def preview(
         sessions = _sessions(source)
         from deeptutor.services.workspace.dependencies import dependency_closure
 
+        closure_warnings: list[str] = []
         selected, session_ids = dependency_closure(
-            source, sessions, features, session_ids=session_ids
+            source, sessions, features, session_ids=session_ids, warnings=closure_warnings
         )
         # Legacy capability artifacts may be keyed by turn IDs. Preserve a
         # copy of the chat/output trees while transferring only selected rows.
@@ -342,7 +350,7 @@ def preview(
             blockers.append("Choose a custom workspace to retain historical archives.")
         for paths in (source, target):
             if paths.get_chat_history_db().exists():
-                with sqlite3.connect(paths.get_chat_history_db()) as conn:
+                with closing(sqlite3.connect(paths.get_chat_history_db())) as conn, conn:
                     if conn.execute(
                         "SELECT 1 FROM turns WHERE status IN ('queued','running','waiting_input') LIMIT 1"
                     ).fetchone():
@@ -370,7 +378,7 @@ def preview(
             root = _feature_path(source, feature)
             artifacts[feature] = [path.relative_to(root).as_posix() for path in _files(root)]
         if _backend() == "sqlite" and session_ids and target.get_chat_history_db().exists():
-            with sqlite3.connect(source.get_chat_history_db()) as conn:
+            with closing(sqlite3.connect(source.get_chat_history_db())) as conn, conn:
                 conn.execute("ATTACH DATABASE ? AS target", (str(target.get_chat_history_db()),))
                 placeholders = ",".join("?" for _ in session_ids)
                 for table, owner in (
@@ -419,6 +427,7 @@ def preview(
             "files": sum(row["files"] for row in rows),
             "bytes": sum(row["bytes"] for row in rows),
             "blockers": blockers,
+            "warnings": closure_warnings,
             "rows": rows,
             "artifact_files": artifacts,
         }
@@ -443,7 +452,7 @@ def _selected_artifact_files(paths, session_ids: set[str]) -> dict[str, list[str
                 )
     db = paths.get_chat_history_db()
     if db.exists():
-        with sqlite3.connect(db) as conn:
+        with closing(sqlite3.connect(db)) as conn, conn:
             identifiers.update(
                 row[0]
                 for row in conn.execute("SELECT id,session_id FROM turns")
@@ -504,7 +513,7 @@ def export_data(source_id: str, features: list[str], *, include_historical: bool
     root = _journal_root() / operation_id
     root.mkdir()
     with data_activity(exclusive=True), workspace_context(source_id):
-        assert_no_pending_recovery()
+        assert_no_pending_recovery(reject_unreadable=True)
         plan = preview(source_id, "", features)
         paths = get_path_service()
         manifests = {}
@@ -555,7 +564,17 @@ def migrate_data(
     from deeptutor.services.workspace.session_transfer import transfer_sessions
 
     with data_activity(exclusive=True):
-        assert_no_pending_recovery()
+        assert_no_pending_recovery(reject_unreadable=True)
+        if "chat" in features or "attachments" in features:
+            from deeptutor.services.storage.attachment_store import (
+                LocalDiskAttachmentStore,
+                get_attachment_store,
+            )
+
+            with workspace_context(source_id):
+                attachment_store = get_attachment_store()
+                if isinstance(attachment_store, LocalDiskAttachmentStore):
+                    attachment_store.materialize_all_sessions()
         plan = preview(source_id, target_id, features, session_ids=session_ids)
         if plan["blockers"]:
             raise WorkspaceError(" ".join(plan["blockers"]))
@@ -665,6 +684,11 @@ def migrate_data(
                         original.unlink()
                     else:
                         shutil.rmtree(original)
+            from deeptutor.services.task_board import get_task_board_store
+
+            get_task_board_store(migrate_legacy=False).move_session_links(
+                plan["session_ids"], source_id, target_id
+            )
             result["status"] = "completed"
             atomic_write_json(journal, result)
             _clear_store_caches()
@@ -800,7 +824,7 @@ def _rebind_feature_urls(root: Path, target_id: str, *, included: set[str] | Non
             if original != updated:
                 atomic_write_text(path, updated)
         elif path.suffix in {".sqlite3", ".sqlite", ".db"}:
-            with sqlite3.connect(path) as conn:
+            with closing(sqlite3.connect(path)) as conn, conn:
                 tables = conn.execute(
                     "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
                 ).fetchall()
@@ -826,7 +850,11 @@ def _restore_database(snapshot: Path, destination: Path) -> None:
     if not snapshot.exists():
         return
     destination.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(snapshot) as original, sqlite3.connect(destination) as restored:
+    with (
+        closing(sqlite3.connect(snapshot)) as original,
+        closing(sqlite3.connect(destination)) as restored,
+        restored,
+    ):
         original.backup(restored)
 
 
@@ -852,7 +880,7 @@ def _remove_installed(result: dict, target) -> None:
 
 
 def _prune_session_snapshot(database: Path, session_ids: set[str]) -> None:
-    with sqlite3.connect(database) as conn:
+    with closing(sqlite3.connect(database)) as conn, conn:
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("CREATE TEMP TABLE retained_sessions (id TEXT PRIMARY KEY)")
         conn.executemany(
@@ -883,17 +911,10 @@ def _restore_sessions(root: Path, source, target) -> None:
             Path(str(target.get_chat_history_db()) + suffix).unlink(missing_ok=True)
 
 
-def operations() -> list[dict]:
-    rows = []
-    for path in _journal_root().glob("*/operation.json"):
-        try:
-            rows.append(json.loads(path.read_text()))
-        except (OSError, ValueError):
-            continue
-    return sorted(rows, key=lambda row: row.get("created_at", ""), reverse=True)
-
-
-def assert_no_pending_recovery() -> None:
+def _read_journal(path: Path) -> dict:
+    """Validate recovery control data before it can authorize filesystem changes."""
+    row = json.loads(path.read_text())
+    terminal = {"completed", "exported", "recovered"}
     pending = {
         "preparing",
         "copying",
@@ -902,7 +923,97 @@ def assert_no_pending_recovery() -> None:
         "cleanup_required",
         "recovery_required",
     }
-    for row in operations():
+    if not isinstance(row, dict) or row.get("id") != path.parent.name:
+        raise ValueError("journal identity is missing or invalid")
+    status = row.get("status")
+    if not isinstance(status, str) or status not in terminal | pending | {"failed"}:
+        raise ValueError("journal status is missing or invalid")
+    if not isinstance(row.get("created_at", ""), str):
+        raise ValueError("journal timestamp is invalid")
+    if status not in terminal:
+        plan = row.get("plan")
+        if not isinstance(plan, dict) or any(
+            not isinstance(plan.get(key), str)
+            for key in ("source_workspace_id", "target_workspace_id")
+        ):
+            raise ValueError("journal recovery plan is missing or invalid")
+        features = plan.get("features")
+        if (
+            not isinstance(features, list)
+            or not features
+            or any(not isinstance(feature, str) or feature not in FEATURES for feature in features)
+        ):
+            raise ValueError("journal recovery features are missing or invalid")
+    return row
+
+
+def _journal_rows() -> list[tuple[Path, dict | None]]:
+    """Read every migration journal. Corrupt entries yield ``(path, None)``.
+
+    Journals are only written through :func:`atomic_write_json`, so an
+    unreadable journal means real corruption rather than a torn write. This
+    helper runs inside the per-request recovery precheck, so it stays silent;
+    ``operations`` and the strict prechecks do the reporting.
+    """
+    rows: list[tuple[Path, dict | None]] = []
+    for path in _journal_root().glob("*/operation.json"):
+        try:
+            row = _read_journal(path)
+        except (OSError, ValueError):
+            row = None
+        rows.append((path, row))
+    return rows
+
+
+def operations() -> list[dict]:
+    rows = []
+    for path, row in _journal_rows():
+        if row is None:
+            logger.warning("Listing unreadable migration journal %s for recovery.", path)
+            try:
+                created_at = datetime.fromtimestamp(
+                    path.stat().st_mtime, tz=timezone.utc
+                ).isoformat()
+            except OSError:
+                created_at = ""
+            rows.append(
+                {
+                    "id": path.parent.name,
+                    "status": "unreadable",
+                    "created_at": created_at,
+                    "error": f"Migration journal is unreadable: {path}",
+                }
+            )
+        else:
+            rows.append(row)
+    return sorted(rows, key=lambda row: row.get("created_at", ""), reverse=True)
+
+
+def assert_no_pending_recovery(*, reject_unreadable: bool = False) -> None:
+    """Fail when a recovery may be pending.
+
+    Readable journals with a pending status always fail. An unreadable
+    journal cannot prove a pending recovery, and this precheck runs on every
+    request, so only migration-class callers pass ``reject_unreadable``;
+    failing every request would lock the whole app behind one corrupt file.
+    """
+    pending = {
+        "preparing",
+        "copying",
+        "transferring",
+        "committed",
+        "cleanup_required",
+        "recovery_required",
+    }
+    for path, row in _journal_rows():
+        if row is None:
+            if reject_unreadable:
+                raise WorkspaceError(
+                    "A migration journal is unreadable, so a pending recovery cannot be "
+                    f"ruled out: {path}. Automatic recovery is unavailable; preserve the "
+                    "journal and snapshots for manual repair before migrating data."
+                )
+            continue
         if row.get("status") in pending:
             raise WorkspaceError(
                 "A data migration needs recovery. Open Settings → Data migration before changing learning data."
@@ -918,7 +1029,16 @@ def recover_operation(operation_id: str) -> dict:
     if not journal.exists():
         raise WorkspaceError("Migration not found.")
     with data_activity(exclusive=True):
-        result = json.loads(journal.read_text())
+        try:
+            result = _read_journal(journal)
+        except (OSError, ValueError) as exc:
+            # Neither rollback nor cleanup is safe without the original plan.
+            # Keep the journal discoverable so subsequent migrations stay blocked.
+            logger.warning("Cannot automatically recover unreadable migration journal %s", journal)
+            raise WorkspaceError(
+                f"Migration journal is unreadable: {journal}. Automatic recovery is "
+                "unavailable; the journal and snapshots have been preserved for manual repair."
+            ) from exc
         if result["status"] in {"completed", "exported", "recovered"}:
             return result
         plan = result["plan"]
@@ -956,6 +1076,11 @@ def recover_operation(operation_id: str) -> dict:
                         original.unlink()
                     else:
                         shutil.rmtree(original)
+            from deeptutor.services.task_board import get_task_board_store
+
+            get_task_board_store(migrate_legacy=False).move_session_links(
+                plan["session_ids"], plan["source_workspace_id"], plan["target_workspace_id"]
+            )
             result["status"] = "completed"
         else:
             if result["status"] in {"transferring", "recovery_required"}:

@@ -3,14 +3,14 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useTranslation } from "react-i18next";
-import { Check, ClipboardList, FileUp, X } from "lucide-react";
+import { Check, FileUp, X } from "lucide-react";
 import { QuestionBankSection } from "@/components/space/question-bank";
 import SpaceSectionHeader from "@/components/space/SpaceSectionHeader";
 import { practiceRoute, questionBankRoute } from "@/lib/learning-routes";
 import { getPracticeSummary, type PracticeRef, type PracticeSummary } from "@/lib/practice-api";
 import { LearningErrorState, LearningShell } from "../LearningShell";
 import { ReviewHome } from "./ReviewHome";
-import { WorkspaceLabel } from "../LibraryWorkspace";
+import { WorkspaceLabel } from "@/components/workspaces/WorkspaceLabel";
 import { activeWorkspaceId } from "@/lib/workspace-scope";
 import { PracticeImport } from "./PracticeImport";
 import { PracticeSession } from "./PracticeSession";
@@ -119,7 +119,7 @@ function ScopedPracticePage({ mode, initialImport }: { mode: "practice" | "libra
     >
       {!libraryOnly && <div className="mb-4 flex items-center gap-3 text-xs"><a href="/learning/practice" className="underline">{t("All workspaces")}</a><WorkspaceLabel row={{ content_workspace_id: activeWorkspaceId() }} /></div>}
       {session ? (
-        <PracticeSession questions={session} onClose={closeSession} />
+        <PracticeSession questions={session} onClose={closeSession} backLabel={libraryOnly ? t("Back to library") : undefined} />
       ) : (
         <>
           {notice && (
@@ -185,12 +185,11 @@ function ScopedPracticePage({ mode, initialImport }: { mode: "practice" | "libra
             {tab === "photos" ? <PhotoInbox key={activeWorkspaceId()} onConfirmed={() => { setRevision(value => value + 1); void refresh(); }} /> : <QuestionBankSection
               key={`${tab}:${courseId}:${revision}`}
               embedded
+              courseId={courseId}
               onChanged={refresh}
               mistakesOnly={tab === "mistakes"}
               onPractice={
-                libraryOnly
-                  ? undefined
-                  : ids => {
+                ids => {
                       setSession(ids.map(id => ({ id })));
                       setNotice("");
                     }
@@ -220,7 +219,6 @@ function PracticePageShell({
     return (
       <>
         <SpaceSectionHeader
-          icon={ClipboardList}
           title={t("Question Bank")}
           description={t("Questions from every source, together with your own imports.")}
           action={action}
@@ -235,8 +233,8 @@ function PracticePageShell({
       title={t("Practice")}
       subtitle={t("Collect what you learn. Practice what matters. Remember it for longer.")}
       action={action}
-      scopeChip={scopeChip}
     >
+      {scopeChip && <div className="mb-4">{scopeChip}</div>}
       {children}
     </LearningShell>
   );

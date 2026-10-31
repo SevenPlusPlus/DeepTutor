@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx
 import pytest
 
+from deeptutor.modules import catalog as module_catalog
 from deeptutor.partners.bus.queue import MessageBus
 from deeptutor.partners.channels.weixin import WeixinChannel, WeixinConfig
 from deeptutor.partners.channels.weixin_inbox import WeixinInbox
@@ -57,6 +58,129 @@ def make_retry_due(inbox):
     with sqlite3.connect(inbox.path) as conn:
         conn.execute("UPDATE channel_inbox SET next_retry_at=0")
         conn.execute("UPDATE photo_outbox SET next_retry_at=0")
+
+
+@pytest.fixture(params=["disabled", "not_installed"])
+def questions_availability(request, monkeypatch):
+    state = {"enabled": False}
+    installed = module_catalog.installed
+    monkeypatch.setattr(
+        module_catalog,
+        "selection",
+        lambda: {"questions": state["enabled"]} if request.param == "disabled" else {},
+    )
+    monkeypatch.setattr(
+        module_catalog,
+        "installed",
+        lambda name: (
+            state["enabled"]
+            if name == "questions" and request.param == "not_installed"
+            else installed(name)
+        ),
+    )
+    return state
+
+
+@pytest.mark.asyncio
+async def test_unavailable_questions_keeps_new_photos_in_normal_chat(
+    tmp_path, monkeypatch, questions_availability
+):
+    ch = channel(tmp_path)
+    ch._process_message = AsyncMock()
+    ch._download_media_item = AsyncMock()
+    linked_user = MagicMock(side_effect=AssertionError("Photo ownership must not be resolved"))
+    monkeypatch.setattr(photo_collection, "linked_user_id", linked_user)
+    messages = [
+        photo_message("automatic"),
+        photo_message(
+            "explicit",
+            item_list=[
+                {"type": 1, "text_item": {"text": "/错题"}},
+                *photo_message()["item_list"],
+            ],
+        ),
+    ]
+    inbox = ch._durable_inbox()
+    inbox.capture_batch(
+        messages,
+        partner_id=ch.partner_id,
+        account_id="bot",
+        freeze_target=lambda message: photo_collection.freeze_photo_target(
+            ch.partner_id, ch.config, message
+        ),
+    )
+    assert all(not event["target"]["collect"] for event in inbox.pending())
+
+    await ch._drain_inbox()
+
+    assert ch._process_message.await_count == 2
+    ch._download_media_item.assert_not_awaited()
+    linked_user.assert_not_called()
+    ch.send.assert_not_awaited()
+    assert inbox.pending() == []
+
+
+@pytest.mark.asyncio
+async def test_frozen_photo_waits_for_questions_without_consuming_retries(
+    tmp_path, monkeypatch, questions_availability
+):
+    ch = channel(tmp_path)
+    ch._download_media_item = AsyncMock(return_value="/private/photo.jpg")
+    ingested = AsyncMock(return_value={"id": "saved-photo"})
+    monkeypatch.setattr(photo_collection, "ingest_photo", ingested)
+    inbox = ch._durable_inbox()
+    inbox.capture_batch(
+        [photo_message()],
+        partner_id=ch.partner_id,
+        account_id="bot",
+        freeze_target=frozen,
+        received_at=42,
+    )
+    original = inbox.pending()[0]
+
+    for _ in range(10):
+        make_retry_due(inbox)
+        await ch._drain_inbox()
+
+    pending = inbox.pending()[0]
+    assert pending["target"] == original["target"]
+    assert pending["payload"] == original["payload"]
+    assert pending["received_at"] == 42
+    assert pending["attempts"] == 0
+    ch._download_media_item.assert_not_awaited()
+    ingested.assert_not_awaited()
+    ch.send.assert_not_awaited()
+
+    questions_availability["enabled"] = True
+    restarted = channel(tmp_path)
+    restarted.config.photo_collection_enabled = False
+    restarted.config.photo_workspace_id = "new-workspace"
+    restarted._download_media_item = AsyncMock(return_value="/private/photo.jpg")
+    await restarted._drain_inbox()
+
+    assert ingested.call_args.kwargs["target"] == original["target"]
+    assert ingested.call_args.kwargs["received_at"] == 42
+    assert inbox.pending() == []
+    restarted.send.assert_awaited_once()
+    assert "已保存1张" in restarted.send.call_args[0][0].content
+
+
+@pytest.mark.asyncio
+async def test_unavailable_questions_rejects_direct_ingest_before_ownership_or_file_access(
+    monkeypatch, questions_availability
+):
+    owner_context = MagicMock(side_effect=AssertionError("Must not enter a photo owner's scope"))
+    monkeypatch.setattr(photo_collection, "photo_target_context", owner_context)
+
+    with pytest.raises(module_catalog.ModuleUnavailable, match="questions"):
+        await photo_collection.ingest_photo(
+            target=frozen(None),
+            path="/nonexistent/photo.jpg",
+            source={"event_key": "one"},
+            received_at=1,
+            source_sent_at=None,
+        )
+    owner_context.assert_not_called()
 
 
 def test_whole_batch_is_atomic_and_first_target_time_is_immutable(tmp_path):
