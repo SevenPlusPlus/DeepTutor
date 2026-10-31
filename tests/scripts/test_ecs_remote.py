@@ -6,9 +6,11 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tarfile
+from types import SimpleNamespace
 
 import pytest
 
@@ -71,6 +73,117 @@ def make_installer(module, tmp_path: Path):
         frontend_port=3782,
     )
     return module.Installer(args), old
+
+
+@pytest.fixture
+def source_candidate(tmp_path: Path) -> Path:
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    shutil.copyfile(
+        Path(__file__).resolve().parents[2] / "build_metadata.py", candidate / "build_metadata.py"
+    )
+    (candidate / "deeptutor/modules/manifests").mkdir(parents=True)
+    (candidate / "deeptutor/__version__.py").write_text("__version__ = '0.0.99'\n")
+    (candidate / "pyproject.toml").write_text(
+        "[tool.deeptutor.optional-dependencies]\n"
+        'parse-markitdown = ["deeptutor-parser-markitdown=={version}"]\n'
+        'partners = ["deeptutor-partners=={version}"]\n'
+        'tutorbot = ["deeptutor[partners]=={version}"]\n'
+    )
+    (candidate / "requirements.txt").write_text("-r requirements/full.txt\n")
+    for name, distribution, requirements, dependencies in (
+        ("parsing", "deeptutor-parsing", ["pypdf>=4.0.0"], []),
+        (
+            "parser-markitdown",
+            "deeptutor-parser-markitdown",
+            ["markitdown[all]>=0.1.7"],
+            ["parsing"],
+        ),
+        ("partners", "deeptutor-partners", ["candidate-partner-sdk>=1.0.0"], []),
+    ):
+        (candidate / f"deeptutor/modules/manifests/{name}.json").write_text(
+            json.dumps(
+                {
+                    "distribution": distribution,
+                    "requirements": requirements,
+                    "requires": dependencies,
+                }
+            )
+        )
+    return candidate
+
+
+def test_source_extras_expand_candidate_module_dependencies_and_legacy_aliases(
+    tmp_path, monkeypatch, source_candidate
+):
+    module = load_remote()
+    installer, _ = make_installer(module, tmp_path)
+
+    def as_user(command, cwd, **kwargs):
+        assert cwd == source_candidate
+        return subprocess.run(command, cwd=cwd, check=True, **kwargs)
+
+    monkeypatch.setattr(installer, "as_user", as_user)
+    requirements = installer.source_extra_requirements(
+        source_candidate, Path(sys.executable), ["parse-markitdown", "tutorbot", "partners"]
+    )
+    assert requirements == [
+        "markitdown[all]>=0.1.7",
+        "pypdf>=4.0.0",
+        "candidate-partner-sdk>=1.0.0",
+    ]
+    assert not any(requirement.startswith("deeptutor") for requirement in requirements)
+    with pytest.raises(module.DeploymentError, match="Unknown source extra.*misspelled"):
+        installer.source_extra_requirements(source_candidate, Path(sys.executable), ["misspelled"])
+
+
+@pytest.mark.parametrize(
+    ("extras", "requirements"),
+    [
+        (None, ["markitdown[all]>=0.1.7", "pypdf>=4.0.0"]),
+        (["tutorbot"], ["candidate-partner-sdk>=1.0.0"]),
+        ([], []),
+    ],
+)
+def test_prepare_installs_source_dependencies_before_editable_base_without_module_wheels(
+    tmp_path, monkeypatch, source_candidate, extras, requirements
+):
+    module = load_remote()
+    installer, _ = make_installer(module, tmp_path)
+    installer.args.extra = extras
+    commands = []
+
+    def as_user(command, cwd, **kwargs):
+        commands.append(command)
+        if "source_optional_dependencies" in command[-1]:
+            return subprocess.run([sys.executable, *command[1:]], cwd=cwd, check=True, **kwargs)
+        return subprocess.CompletedProcess(command, 0, stdout="fixture==1.0\n")
+
+    monkeypatch.setattr(module.pwd, "getpwnam", lambda _: SimpleNamespace(pw_uid=123, pw_gid=123))
+    monkeypatch.setattr(module.os, "chown", lambda *_: None)
+    monkeypatch.setattr(installer, "as_user", as_user)
+    monkeypatch.setattr(installer, "install_native", lambda *_: None)
+    installer.prepare(source_candidate, {"version": "0.0.99"})
+
+    installs = [command for command in commands if command[1:3] == ["pip", "install"]]
+    assert len(installs) == 2
+    assert installs[0] == [
+        installer.args.uv,
+        "pip",
+        "install",
+        "--python",
+        str(source_candidate / ".venv/bin/python"),
+        "--index-url",
+        installer.args.pip_index,
+        "-r",
+        str(source_candidate / "requirements.txt"),
+        *requirements,
+    ]
+    assert "--no-deps" in installs[1]
+    assert installs[1][-2:] == ["-e", str(source_candidate)]
+    assert not any(arg.startswith(str(source_candidate) + "[") for cmd in installs for arg in cmd)
+    assert not any(arg.startswith("deeptutor-") for cmd in installs for arg in cmd)
+    assert (source_candidate / "requirements-resolved.txt").read_text() == "fixture==1.0\n"
 
 
 @pytest.mark.parametrize(

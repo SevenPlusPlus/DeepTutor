@@ -220,6 +220,29 @@ class Installer:
         invocation += [f"{key}={value}" for key, value in environment.items()]
         return subprocess.run(invocation + command, cwd=cwd, check=True, **kwargs)
 
+    def source_extra_requirements(
+        self, candidate: Path, python: Path, extras: list[str]
+    ) -> list[str]:
+        # Evaluate release-owned build metadata as the deployment user, before
+        # installing dependencies. Source extras must never pull feature wheels
+        # over the module code already present in this candidate.
+        result = self.as_user(
+            [
+                str(python),
+                "-c",
+                "import json; from build_metadata import source_optional_dependencies; "
+                "print(json.dumps(source_optional_dependencies()))",
+            ],
+            candidate,
+            capture_output=True,
+            text=True,
+        )
+        available = json.loads(result.stdout)
+        unknown = sorted(set(extras) - available.keys())
+        if unknown:
+            raise DeploymentError(f"Unknown source extra(s): {', '.join(unknown)}")
+        return list(dict.fromkeys(raw for name in extras for raw in available[name]))
+
     def prepare(self, candidate: Path, manifest: dict) -> None:
         user = pwd.getpwnam(self.args.user)
         for path in [candidate, *candidate.rglob("*")]:
@@ -230,7 +253,7 @@ class Installer:
             candidate,
         )
         extras = self.args.extra if self.args.extra is not None else ["parse-markitdown"]
-        requirement = str(candidate) + (f"[{','.join(extras)}]" if extras else "")
+        extra_requirements = self.source_extra_requirements(candidate, python, extras)
         self.as_user(
             [
                 self.args.uv,
@@ -242,8 +265,22 @@ class Installer:
                 self.args.pip_index,
                 "-r",
                 str(candidate / "requirements.txt"),
+                *extra_requirements,
+            ],
+            candidate,
+        )
+        self.as_user(
+            [
+                self.args.uv,
+                "pip",
+                "install",
+                "--python",
+                str(python),
+                "--no-deps",
+                "--index-url",
+                self.args.pip_index,
                 "-e",
-                requirement,
+                str(candidate),
             ],
             candidate,
         )
